@@ -1,0 +1,227 @@
+import { useState, useCallback, useEffect } from 'react';
+import {
+  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
+} from 'recharts';
+import { api } from '../utils/api';
+import type { TickData, BarData } from '../types';
+
+const SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD'];
+const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
+
+interface Props {
+  connected: boolean;
+}
+
+export default function Market({ connected }: Props) {
+  const [selectedSymbols, setSelectedSymbols] = useState<string[]>(['EURUSD']);
+  const [activeSymbol, setActiveSymbol] = useState('EURUSD');
+  const [timeframe, setTimeframe] = useState('H1');
+  const [ticks, setTicks] = useState<Record<string, TickData>>({});
+  const [bars, setBars] = useState<BarData[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const enableSymbols = async (syms: string[]) => {
+    try {
+      await api.selectSymbols(syms);
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
+
+  const refreshTicks = useCallback(async () => {
+    if (!connected || selectedSymbols.length === 0) return;
+    const newTicks: Record<string, TickData> = {};
+    for (const sym of selectedSymbols) {
+      try {
+        const tick = await api.getTick(sym);
+        newTicks[sym] = tick;
+      } catch {
+        // skip
+      }
+    }
+    setTicks(newTicks);
+  }, [connected, selectedSymbols]);
+
+  const fetchBars = useCallback(async () => {
+    if (!connected || !activeSymbol) return;
+    setLoading(true);
+    try {
+      const data = await api.getBars(activeSymbol, timeframe, 100);
+      setBars(data);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [connected, activeSymbol, timeframe]);
+
+  const toggleSymbol = async (sym: string) => {
+    if (selectedSymbols.includes(sym)) {
+      setSelectedSymbols((prev) => prev.filter((s) => s !== sym));
+    } else {
+      setSelectedSymbols((prev) => [...prev, sym]);
+      await enableSymbols([sym]);
+    }
+  };
+
+  useEffect(() => {
+    if (connected && selectedSymbols.length > 0) {
+      enableSymbols(selectedSymbols);
+    }
+  }, [connected]);
+
+  useEffect(() => {
+    refreshTicks();
+    const t = setInterval(refreshTicks, 2000);
+    return () => clearInterval(t);
+  }, [refreshTicks]);
+
+  useEffect(() => {
+    fetchBars();
+  }, [fetchBars]);
+
+  if (!connected) {
+    return (
+      <div>
+        <div className="page-header">
+          <h2>Market</h2>
+        </div>
+        <div className="empty-state">Connect to MT5 to view market data</div>
+      </div>
+    );
+  }
+
+  const chartData = bars.map((b) => ({
+    time: new Date(b.time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    close: b.close,
+    high: b.high,
+    low: b.low,
+  }));
+
+  return (
+    <div>
+      <div className="page-header">
+        <h2>Market</h2>
+        <p>Symbol watchlist and price data</p>
+      </div>
+
+      {error && <div className="error-banner">{error}</div>}
+
+      <div className="card mb-4">
+        <div className="card-header">
+          <h3>Symbol Selection</h3>
+        </div>
+        <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+          {SYMBOLS.map((sym) => (
+            <button
+              key={sym}
+              className={`btn btn-sm ${selectedSymbols.includes(sym) ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => toggleSymbol(sym)}
+            >
+              {sym}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="card mb-4">
+        <div className="card-header">
+          <h3>Live Quotes</h3>
+        </div>
+        {selectedSymbols.length === 0 ? (
+          <div className="empty-state">Select symbols to watch</div>
+        ) : (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Bid</th>
+                <th>Ask</th>
+                <th>Spread</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {selectedSymbols.map((sym) => {
+                const tick = ticks[sym];
+                return (
+                  <tr key={sym}>
+                    <td className="font-mono" style={{ fontWeight: 600 }}>{sym}</td>
+                    <td className="font-mono text-red">{tick?.bid?.toFixed(5) ?? '---'}</td>
+                    <td className="font-mono text-green">{tick?.ask?.toFixed(5) ?? '---'}</td>
+                    <td className="font-mono">{tick?.spread ?? '---'}</td>
+                    <td>
+                      <button
+                        className={`btn btn-sm ${activeSymbol === sym ? 'btn-primary' : 'btn-secondary'}`}
+                        onClick={() => setActiveSymbol(sym)}
+                      >
+                        Chart
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <h3>{activeSymbol} - {timeframe}</h3>
+          <div className="flex gap-2">
+            {TIMEFRAMES.map((tf) => (
+              <button
+                key={tf}
+                className={`btn btn-sm ${timeframe === tf ? 'btn-primary' : 'btn-secondary'}`}
+                onClick={() => setTimeframe(tf)}
+              >
+                {tf}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {loading ? (
+          <div className="empty-state"><span className="loading-spinner" /></div>
+        ) : chartData.length === 0 ? (
+          <div className="empty-state">No data available</div>
+        ) : (
+          <ResponsiveContainer width="100%" height={350}>
+            <LineChart data={chartData}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+              <XAxis
+                dataKey="time"
+                stroke="var(--text-muted)"
+                fontSize={11}
+                interval="preserveStartEnd"
+              />
+              <YAxis
+                stroke="var(--text-muted)"
+                fontSize={11}
+                domain={['auto', 'auto']}
+                tickFormatter={(v: number) => v.toFixed(activeSymbol.includes('JPY') || activeSymbol.includes('XAU') ? 2 : 4)}
+              />
+              <Tooltip
+                contentStyle={{
+                  background: 'var(--bg-tertiary)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6,
+                  fontSize: 12,
+                }}
+              />
+              <Line
+                type="monotone"
+                dataKey="close"
+                stroke="var(--accent-blue)"
+                dot={false}
+                strokeWidth={1.5}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+    </div>
+  );
+}
