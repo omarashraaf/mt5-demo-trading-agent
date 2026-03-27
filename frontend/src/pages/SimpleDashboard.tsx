@@ -10,6 +10,16 @@ interface Props {
   onRefresh: () => void;
 }
 
+function formatPct(value?: number | null) {
+  if (value == null || Number.isNaN(value)) return '-';
+  return `${value.toFixed(1)}%`;
+}
+
+function compactReasons(reasons?: string[], fallback?: string) {
+  if (reasons && reasons.length > 0) return reasons.slice(0, 3);
+  return fallback ? [fallback] : [];
+}
+
 // Beginner-friendly recommendation card
 function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecuted: () => void; currency: string }) {
   const [loading, setLoading] = useState(false);
@@ -106,6 +116,16 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
   const strength = getSignalStrength(rec.signal.confidence);
   const symbolName = getSymbolName(rec.symbol);
   const emoji = getSymbolEmoji(rec.symbol);
+  const qualityScore = rec.trade_quality?.final_trade_quality_score ?? 0;
+  const qualityThreshold = rec.trade_quality?.threshold ?? 0;
+  const blockReasons = compactReasons(
+    [
+      ...(rec.trade_quality?.no_trade_reasons || []),
+      ...(rec.portfolio_risk?.blocking_reasons || []),
+      ...(rec.anti_churn?.reasons || []),
+    ],
+    rec.execution_reason,
+  );
 
   if (isHold) {
     return (
@@ -117,6 +137,14 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
             <div className="text-muted" style={{ fontSize: 12 }}>
               {rec.explanation || 'No good opportunity right now - waiting'}
             </div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
+              Quality {Math.round(qualityScore * 100)}% / need {Math.round(qualityThreshold * 100)}%
+            </div>
+            {blockReasons.slice(0, 2).map((reason, index) => (
+              <div key={index} style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                {reason}
+              </div>
+            ))}
           </div>
         </div>
       </div>
@@ -206,6 +234,32 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
         )}
       </div>
 
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 12 }}>
+        <div style={{ background: 'var(--bg-primary)', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Trade Quality</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: qualityScore >= qualityThreshold ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+            {Math.round(qualityScore * 100)}%
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Need {Math.round(qualityThreshold * 100)}%</div>
+        </div>
+        <div style={{ background: 'var(--bg-primary)', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Projected Margin</div>
+          <div style={{ fontSize: 16, fontWeight: 700 }}>
+            {formatPct(rec.portfolio_risk?.projected_margin_utilization_pct)}
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>after fill</div>
+        </div>
+        <div style={{ background: 'var(--bg-primary)', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Gemini</div>
+          <div style={{ fontSize: 14, fontWeight: 700 }}>
+            {rec.gemini_confirmation?.degraded ? 'Degraded' : rec.gemini_confirmation?.used ? 'Advisory' : 'Off'}
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+            {rec.gemini_confirmation?.news_bias || 'technical only'}
+          </div>
+        </div>
+      </div>
+
       {/* Expandable details */}
       <button
         className="btn btn-secondary btn-sm mb-3"
@@ -229,6 +283,24 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
             <span className="text-muted">Take Profit </span>
             <span className="font-mono text-green">{rec.signal.take_profit?.toFixed(rec.entry_price_estimate < 50 ? 5 : 2) ?? '-'}</span>
           </div>
+        </div>
+      )}
+
+      {blockReasons.length > 0 && (
+        <div style={{
+          background: 'rgba(59, 130, 246, 0.08)',
+          border: '1px solid rgba(59, 130, 246, 0.18)',
+          borderRadius: 6,
+          padding: '10px 14px',
+          fontSize: 12,
+          color: 'var(--text-secondary)',
+          marginBottom: 12,
+        }}>
+          {blockReasons.map((reason, index) => (
+            <div key={index} style={{ marginBottom: index < blockReasons.length - 1 ? 4 : 0 }}>
+              Decision note: {reason}
+            </div>
+          ))}
         </div>
       )}
 
@@ -662,6 +734,16 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
   const emoji = getSymbolEmoji(rec.symbol);
   const conf = Math.round(rec.signal.confidence * 100);
   const strength = getSignalStrength(rec.signal.confidence);
+  const qualityScore = Math.round((rec.trade_quality?.final_trade_quality_score || 0) * 100);
+  const qualityThreshold = Math.round((rec.trade_quality?.threshold || 0) * 100);
+  const holdReasons = compactReasons(
+    [
+      ...(rec.trade_quality?.no_trade_reasons || []),
+      ...(rec.portfolio_risk?.blocking_reasons || []),
+      ...(rec.anti_churn?.reasons || []),
+    ],
+    rec.execution_reason,
+  );
 
   // Convert dollar SL/TP to price levels for execution
   const isBuyAction = manualAction === 'BUY';
@@ -762,6 +844,10 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
           <span style={{ fontSize: 10, color: strength.color, fontWeight: 600 }}>{conf}%</span>
         </div>
 
+        <div style={{ width: 72, textAlign: 'right', fontSize: 10, fontWeight: 700, color: qualityScore >= qualityThreshold ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+          Q {qualityScore}%
+        </div>
+
         {result ? (
           <span style={{ fontSize: 11, color: result.success ? 'var(--accent-green)' : 'var(--accent-red)', marginLeft: 12 }}>
             {result.success ? `${manualAction === 'SELL' ? 'Sold' : 'Bought'}! #${result.ticket}` : result.retcode_desc}
@@ -779,6 +865,45 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
 
       {expanded && !result && (
         <div style={{ padding: '0 16px 12px 16px' }}>
+          {holdReasons.length > 0 && (
+            <div style={{
+              background: 'rgba(59, 130, 246, 0.08)',
+              border: '1px solid rgba(59, 130, 246, 0.16)',
+              borderRadius: 8,
+              padding: '10px 12px',
+              fontSize: 11,
+              color: 'var(--text-secondary)',
+              marginBottom: 10,
+            }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Why this is filtered</div>
+              {holdReasons.map((reason, index) => (
+                <div key={index} style={{ marginBottom: index < holdReasons.length - 1 ? 4 : 0 }}>
+                  {reason}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 10 }}>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '8px 10px' }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Trade Quality</div>
+              <div style={{ fontWeight: 700 }}>{qualityScore}%</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Need {qualityThreshold}%</div>
+            </div>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '8px 10px' }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Projected Margin</div>
+              <div style={{ fontWeight: 700 }}>{formatPct(rec.portfolio_risk?.projected_margin_utilization_pct)}</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>after fill</div>
+            </div>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '8px 10px' }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Gemini</div>
+              <div style={{ fontWeight: 700 }}>
+                {rec.gemini_confirmation?.degraded ? 'Degraded' : rec.gemini_confirmation?.used ? 'Advisory' : 'Off'}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{rec.gemini_confirmation?.news_bias || 'technical only'}</div>
+            </div>
+          </div>
+
           {/* Buy/Sell Toggle */}
           <div className="flex items-center gap-1 mb-2">
             <button
@@ -896,17 +1021,32 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   const [autoTradeLoading, setAutoTradeLoading] = useState(false);
   const [autoTradeLogs, setAutoTradeLogs] = useState<Array<{
     timestamp: number; symbol: string; action: string;
-    confidence: number; detail: string; success: boolean;
+    confidence: number; quality_score?: number; detail: string; success: boolean;
   }>>([]);
   const [aiActivity, setAiActivity] = useState<Array<{
     timestamp: number; action: string; symbol: string;
     ticket: number; detail: string; profit: number; source?: string;
   }>>([]);
   const [posManagerRunning, setPosManagerRunning] = useState(false);
+  const [portfolioSnapshot, setPortfolioSnapshot] = useState(status?.portfolio || null);
+  const [geminiState, setGeminiState] = useState({
+    available: status?.gemini_available ?? false,
+    degraded: status?.gemini_degraded ?? false,
+    last_error: status?.gemini_last_error ?? null,
+  });
 
   const connected = status?.connected ?? false;
   const account = status?.account;
   const currency = account?.currency || 'USD';
+
+  useEffect(() => {
+    if (status?.portfolio) setPortfolioSnapshot(status.portfolio);
+    setGeminiState({
+      available: status?.gemini_available ?? false,
+      degraded: status?.gemini_degraded ?? false,
+      last_error: status?.gemini_last_error ?? null,
+    });
+  }, [status]);
 
   const refreshPositions = useCallback(async () => {
     if (!connected) return;
@@ -953,6 +1093,8 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       setAutoTradeRunning(st.running);
       setAutoTradeLogs(st.recent_trades);
       setPosManagerRunning(st.position_manager_running ?? false);
+      setPortfolioSnapshot(st.portfolio || null);
+      setGeminiState(st.gemini || { available: false, degraded: false, last_error: null });
     } catch {}
   }, [connected]);
 
@@ -1214,6 +1356,78 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
         </div>
       )}
 
+      {portfolioSnapshot && (
+        <div className="card mt-4" style={{ padding: '16px 20px' }}>
+          <div className="flex justify-between items-start" style={{ marginBottom: 12 }}>
+            <div>
+              <div style={{ fontSize: 15, fontWeight: 700 }}>Portfolio Guard</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                Margin, exposure, and Gemini advisory health for the current book.
+              </div>
+            </div>
+            <div style={{ textAlign: 'right' }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Gemini</div>
+              <div style={{ fontWeight: 700, color: geminiState.degraded ? 'var(--accent-yellow)' : geminiState.available ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                {geminiState.degraded ? 'Degraded' : geminiState.available ? 'Online' : 'Offline'}
+              </div>
+              {geminiState.last_error && (
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', maxWidth: 220 }}>
+                  {geminiState.last_error}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 12 }}>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Margin Utilization</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: (portfolioSnapshot.margin_utilization_pct || 0) > 18 ? 'var(--accent-red)' : 'var(--text-primary)' }}>
+                {formatPct(portfolioSnapshot.margin_utilization_pct)}
+              </div>
+            </div>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Free Margin</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: (portfolioSnapshot.free_margin_pct || 0) < 60 ? 'var(--accent-red)' : 'var(--text-primary)' }}>
+                {formatPct(portfolioSnapshot.free_margin_pct)}
+              </div>
+            </div>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>USD Beta</div>
+              <div style={{ fontSize: 18, fontWeight: 700 }}>{formatPct(portfolioSnapshot.usd_beta_exposure_pct)}</div>
+            </div>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Stock Exposure</div>
+              <div style={{ fontSize: 18, fontWeight: 700 }}>{formatPct(portfolioSnapshot.stocks_equity_exposure_pct)}</div>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>Exposure By Category</div>
+              {Object.keys(portfolioSnapshot.exposure_by_category || {}).length === 0 ? (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No active exposure.</div>
+              ) : Object.entries(portfolioSnapshot.exposure_by_category).map(([key, value]) => (
+                <div key={key} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
+                  <span>{key}</span>
+                  <span style={{ fontWeight: 600 }}>{formatPct(value)}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>Exposure By Symbol</div>
+              {Object.keys(portfolioSnapshot.exposure_by_symbol || {}).length === 0 ? (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No active exposure.</div>
+              ) : Object.entries(portfolioSnapshot.exposure_by_symbol).slice(0, 6).map(([key, value]) => (
+                <div key={key} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
+                  <span>{key}</span>
+                  <span style={{ fontWeight: 600 }}>{formatPct(value)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Panic Stop */}
       {status?.panic_stop && (
         <div style={{
@@ -1295,6 +1509,11 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                   <span className="text-muted">
                     ({Math.round(log.confidence * 100)}%)
                   </span>
+                  {log.quality_score != null && (
+                    <span className="text-muted">
+                      Q {Math.round(log.quality_score * 100)}%
+                    </span>
+                  )}
                   <span style={{ color: log.success ? 'var(--accent-green)' : 'var(--accent-red)' }}>
                     {log.detail.length > 40 ? log.detail.substring(0, 40) + '...' : log.detail}
                   </span>

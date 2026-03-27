@@ -17,10 +17,12 @@ from typing import Optional
 from mt5.connector import MT5Connector
 from mt5.market_data import MarketDataService
 from mt5.execution import ExecutionEngine, OrderRequest
-from agent.interface import AgentInput, TradeSignal
+from agent.interface import TradeSignal
 from risk.rules import RiskEngine
 from storage.db import Database
 from position_manager import PositionManager
+from services.background_state import BackgroundServiceState
+from services.execution_service import ExecutionService
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +35,26 @@ class AutoTrader:
         execution: ExecutionEngine,
         risk_engine: RiskEngine,
         agents: dict,
+        signal_pipeline,
+        execution_service: ExecutionService | None = None,
     ):
         self.connector = connector
         self.market_data = market_data
         self.execution = execution
         self.risk_engine = risk_engine
         self.agents = agents
+        self.signal_pipeline = signal_pipeline
+        self.execution_service = execution_service or ExecutionService(
+            execution_engine=execution,
+            risk_service=signal_pipeline.risk_service,
+            signal_pipeline=signal_pipeline,
+        )
         self.db: Optional[Database] = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._last_scan: float = 0
         self._trade_log: list[dict] = []  # Recent auto-trade log for UI
+        self._state = BackgroundServiceState(name="auto_trader")
 
         # Position Manager — autonomous management of open positions
         self.position_manager = PositionManager(
@@ -56,20 +67,12 @@ class AutoTrader:
 
     def set_database(self, db: Database):
         self.db = db
+        self.signal_pipeline.set_database(db)
+        self.execution_service.db = db
         self.position_manager.set_database(db)
 
     @property
     def is_running(self) -> bool:
-        if self._running and self._task is not None and self._task.done():
-            # Task crashed — auto-restart it
-            logger.warning("Auto-trade task died unexpectedly, restarting...")
-            try:
-                exc = self._task.exception()
-                logger.error(f"Auto-trade crash reason: {exc}")
-            except Exception:
-                pass
-            self._task = asyncio.create_task(self._run_loop())
-            self.position_manager.start()
         return self._running and self._task is not None and not self._task.done()
 
     @property
@@ -93,11 +96,18 @@ class AutoTrader:
         combined.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
         return combined[:50]
 
+    def status_snapshot(self) -> dict:
+        state = self._state.model_dump()
+        state["last_scan"] = self._last_scan
+        state["recent_trades"] = self.recent_trades
+        return state
+
     def start(self):
         if self.is_running:
             logger.info("Auto-trader already running")
             return
         self._running = True
+        self._state.mark_started()
         self._task = asyncio.create_task(self._run_loop())
         self.position_manager.start()
         logger.info("Auto-trader STARTED (with Position Manager)")
@@ -108,6 +118,7 @@ class AutoTrader:
             self._task.cancel()
         self._task = None
         self.position_manager.stop()
+        self._state.mark_stopped()
         logger.info("Auto-trader STOPPED (with Position Manager)")
 
     async def _run_loop(self):
@@ -117,6 +128,7 @@ class AutoTrader:
             try:
                 interval = self.risk_engine.settings.auto_trade_scan_interval_seconds
                 await asyncio.sleep(interval)
+                self._state.mark_heartbeat()
 
                 if not self._running:
                     break
@@ -130,58 +142,55 @@ class AutoTrader:
                     logger.debug("Auto-trader: panic stop active, skipping")
                     continue
 
-                if not self.risk_engine.settings.auto_trade_enabled:
+                if not self.risk_engine.auto_trade_enabled:
                     logger.debug("Auto-trader: auto-trade disabled, skipping")
                     continue
 
                 await self._scan_and_trade()
+                self._state.mark_cycle()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                self._state.mark_error(e)
                 logger.error(f"Auto-trader error: {e}", exc_info=True)
                 await asyncio.sleep(10)  # Back off on error
 
         logger.info("Auto-trade loop ended")
+        self._state.mark_stopped()
 
     async def _scan_and_trade(self):
         """Scan all allowed symbols and auto-execute strong signals."""
         settings = self.risk_engine.settings
-        min_conf = settings.auto_trade_min_confidence
-        symbols = settings.allowed_symbols
+        tradeable_market = self.market_data.get_tradeable_symbols()
+        symbols = self.signal_pipeline.universe_service.resolve_requested_symbols(
+            settings.allowed_symbols,
+            self.signal_pipeline.universe_service.filter_market_symbols(tradeable_market),
+        )
 
         # Auto-detect symbols if list is empty — prefer liquid, well-known instruments
         if not symbols:
             logger.info("Auto-trader: no symbols configured, auto-detecting...")
-            # Preferred symbols — stocks (swing) + forex (day) + commodities (swing)
-            preferred = [
-                # Top Stocks — swing trade
-                "NVDA", "AMD", "MSFT", "INTC", "AAPL", "GOOG", "AMZN", "TSLA", "META", "NFLX",
-                "AVGO", "CRM", "ORCL", "ADBE", "QCOM",
-                # Major Forex — day trade
-                "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
-                # Metals — swing trade (gold, silver, platinum, palladium)
-                "XAUUSD", "XAGUSD", "XAUEUR", "XAGEUR", "XPTUSD", "XPDUSD",
-                # Commodity ETFs — swing trade (oil, gold, silver, broad commodities)
-                "GLD", "SLV", "USO", "DBC",
-            ]
-            tradeable = self.market_data.get_tradeable_symbols()
-            tradeable_names = {s["name"] for s in tradeable}
-
-            # First: pick preferred symbols that are available
-            symbols = [s for s in preferred if s in tradeable_names]
-
-            # If not enough, add non-forex tradeable (commodities, indices, crypto)
-            if len(symbols) < 5:
-                non_forex = [s["name"] for s in tradeable if s["category"] != "Forex" and s["name"] not in symbols]
-                symbols.extend(non_forex[:10])
-
-            # Limit to 15 symbols max
-            symbols = symbols[:15]
-
+            filtered_tradeable = self.signal_pipeline.universe_service.filter_market_symbols(tradeable_market)
+            symbols = await self.signal_pipeline.auto_trade_candidate_symbols(
+                filtered_tradeable,
+                limit=12,
+            )
             if symbols:
-                settings.allowed_symbols = symbols
-                logger.info(f"Auto-detected {len(symbols)} preferred symbols: {symbols}")
+                logger.info("Auto-trader: using event-driven/curated symbol list: %s", symbols)
+            else:
+                logger.info("Auto-trader: no event-backed candidates available this cycle")
+
+        # De-duplicate by canonical symbol to avoid repeated same-symbol gating in one scan.
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for sym in symbols:
+            canonical = self.signal_pipeline.universe_service.canonical_symbol(sym)
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            deduped.append(sym)
+        symbols = deduped
 
         account = self.connector.refresh_account()
         if not account:
@@ -189,198 +198,162 @@ class AutoTrader:
 
         all_positions = self.execution.get_positions()
         self._last_scan = time.time()
+        scan_window_id = f"auto:{int(self._last_scan)}"
+        self.signal_pipeline.anti_churn_service.begin_scan_window(scan_window_id)
 
-        logger.info(f"Auto-trader scanning {len(symbols)} symbols (min confidence: {min_conf})")
+        logger.info(f"Auto-trader scanning {len(symbols)} symbols")
+        if not symbols:
+            self._trade_log.append({
+                "timestamp": time.time(),
+                "symbol": "SYSTEM",
+                "action": "HOLD",
+                "confidence": 0.0,
+                "quality_score": 0.0,
+                "detail": "No eligible auto-trade symbols this cycle. Stocks are session-filtered; only indices/commodities with valid availability will be scanned.",
+                "success": False,
+            })
+            self._trade_log = self._trade_log[-50:]
+            return
 
         for sym in symbols:
             try:
                 # Check if we can still trade
                 if self.risk_engine.panic_stopped:
                     break
-                if len(all_positions) >= settings.max_concurrent_positions:
+                max_positions = settings.max_open_positions_total or settings.max_concurrent_positions
+                if len(all_positions) >= max_positions:
                     logger.info("Auto-trader: max positions reached, stopping scan")
                     break
 
-                self.market_data.enable_symbol(sym)
-                tick = self.market_data.get_tick(sym)
-                if tick is None:
-                    logger.debug(f"Auto-trader: {sym} no tick data (market closed?), skipping")
-                    continue
-
-                # Skip if no valid price (market might be closed for stocks)
-                if tick.bid <= 0 or tick.ask <= 0:
-                    logger.debug(f"Auto-trader: {sym} no price data, skipping")
-                    continue
-
-                # Skip symbols with excessive spreads (exotic pairs)
-                # But allow spread=0 for newly-enabled symbols that haven't loaded yet
-                if tick.spread > settings.max_spread_threshold and tick.spread > 0:
-                    logger.debug(f"Auto-trader: {sym} spread {tick.spread} > {settings.max_spread_threshold}, skipping")
-                    continue
-
-                # Multi-timeframe analysis
-                m15_bars = self.market_data.get_bars(sym, "M15", 100)
-                h1_bars = self.market_data.get_bars(sym, "H1", 100)
-                h4_bars = self.market_data.get_bars(sym, "H4", 100)
-
-                sym_positions = [p for p in all_positions if p.symbol == sym]
-
-                input_data = AgentInput(
+                decision = await self.signal_pipeline.evaluate(
                     symbol=sym,
-                    timeframe="H1",
-                    bars=[b.model_dump() for b in h1_bars],
-                    spread=tick.spread,
-                    account_equity=account.equity,
-                    open_positions=[p.model_dump() for p in sym_positions],
-                    multi_tf_bars={
-                        "M15": [b.model_dump() for b in m15_bars],
-                        "H1": [b.model_dump() for b in h1_bars],
-                        "H4": [b.model_dump() for b in h4_bars],
-                    },
+                    requested_agent_name="GeminiAgent",
+                    requested_timeframe="H1",
+                    evaluation_mode="auto",
+                    bar_count=100,
+                    scan_window_id=scan_window_id,
                 )
+                signal_id = await self.signal_pipeline.persist_evaluation(decision, "multi")
 
-                smart_agent = self.agents.get("SmartAgent")
-                if not smart_agent:
-                    continue
+                signal = decision.signal_decision.final_signal.to_trade_signal()
+                context = decision.signal_decision.market_context
+                risk_evaluation = decision.risk_evaluation
+                quality = decision.trade_quality_assessment
 
-                # Pass 1: Fast local SmartAgent scan
-                signal = smart_agent.evaluate(input_data)
-
-                # Skip HOLD signals and low confidence
                 if signal.action == "HOLD":
+                    hold_detail = signal.reason or decision.reason
+                    self._log_auto_trade(sym, signal, hold_detail, False, quality.final_trade_quality_score)
                     continue
-                if signal.confidence < min_conf:
-                    logger.debug(f"Auto-trader: {sym} {signal.action} confidence {signal.confidence:.2f} < {min_conf}, skipping")
+
+                if not decision.allow_execute:
+                    logger.info("Auto-trader: %s %s rejected: %s", sym, signal.action, decision.reason)
+                    self._log_auto_trade(sym, signal, decision.reason, False, quality.final_trade_quality_score)
                     continue
 
-                # Pass 2: Gemini deep analysis for confirmation (if available)
-                # Gemini adds news awareness and can override or boost the signal
-                gemini_agent = self.agents.get("GeminiAgent")
-                agent_used = "SmartAgent"
-                # Save SmartAgent's SL/TP before Gemini potentially overrides
-                smart_sl = signal.stop_loss
-                smart_tp = signal.take_profit
-                smart_confidence = signal.confidence
-
-                if gemini_agent:
-                    try:
-                        gemini_signal = gemini_agent.evaluate(input_data)
-                        if gemini_signal.action != "HOLD" and gemini_signal.confidence > 0:
-                            if gemini_signal.action == signal.action:
-                                # Both agree — boost confidence but KEEP SmartAgent's SL/TP
-                                # (SmartAgent has proper ATR-based R:R, Gemini's SL/TP are unreliable)
-                                signal.confidence = min(0.95, max(signal.confidence, gemini_signal.confidence) + 0.05)
-                                agent_used = "SmartAgent+Gemini"
-                                logger.info(f"Auto-trader: Gemini CONFIRMS {signal.action} {sym} (boosted to {signal.confidence:.0%})")
-                            elif gemini_signal.confidence > signal.confidence:
-                                # Gemini disagrees but more confident — use Gemini's direction
-                                # but keep SmartAgent's SL/TP for proper R:R
-                                signal.action = gemini_signal.action
-                                signal.confidence = gemini_signal.confidence
-                                signal.reason = gemini_signal.reason
-                                # Recalculate SL/TP using SmartAgent logic for new direction
-                                recalc = smart_agent.evaluate(AgentInput(
-                                    symbol=sym, timeframe="multi", bars=input_data.bars,
-                                    spread=input_data.spread, account_equity=input_data.account_equity,
-                                    open_positions=input_data.open_positions, multi_tf_bars=input_data.multi_tf_bars,
-                                ))
-                                if recalc.stop_loss and recalc.take_profit:
-                                    signal.stop_loss = recalc.stop_loss
-                                    signal.take_profit = recalc.take_profit
-                                agent_used = "GeminiAgent+SmartSLTP"
-                                logger.info(f"Auto-trader: Gemini OVERRIDES to {signal.action} {sym} ({signal.confidence:.0%})")
-                            else:
-                                logger.info(f"Auto-trader: Gemini disagrees ({gemini_signal.action}) but lower confidence, keeping SmartAgent signal")
-                        else:
-                            logger.debug(f"Auto-trader: Gemini returned HOLD for {sym}, using SmartAgent signal")
-                    except Exception as e:
-                        logger.warning(f"Auto-trader: Gemini analysis failed for {sym}: {e}, proceeding with SmartAgent")
-
-                # Log signal
-                signal_id = None
-                if self.db:
-                    signal_id = await self.db.log_signal(
-                        agent_name=agent_used, symbol=sym, timeframe="multi",
-                        action=signal.action, confidence=signal.confidence,
-                        stop_loss=signal.stop_loss, take_profit=signal.take_profit,
-                        max_holding_minutes=signal.max_holding_minutes, reason=signal.reason,
-                    )
-
-                # Risk check (auto-trade mode = hard blocks on limits)
-                # Use the actual price for accurate R:R calculation
-                current_price = tick.ask if signal.action == "BUY" else tick.bid
-                risk_decision = self.risk_engine.evaluate(
-                    signal=signal, symbol=sym,
-                    spread=tick.spread, equity=account.equity,
-                    open_positions=all_positions,
-                    is_auto_trade=True,
-                    entry_price=current_price,
+                logger.info(
+                    "AUTO-TRADE: %s %s confidence=%.2f quality=%.2f volume=%.4f",
+                    signal.action,
+                    sym,
+                    signal.confidence,
+                    quality.final_trade_quality_score,
+                    risk_evaluation.adjusted_volume,
                 )
 
-                if self.db and signal_id:
-                    await self.db.log_risk_decision(
-                        signal_id=signal_id, approved=risk_decision.approved,
-                        reason=risk_decision.reason, adjusted_volume=risk_decision.adjusted_volume,
-                    )
-
-                if not risk_decision.approved:
-                    logger.info(f"Auto-trader: {sym} {signal.action} rejected by risk: {risk_decision.reason}")
-                    self._log_auto_trade(sym, signal, risk_decision.reason, False)
+                tick = self.market_data.get_tick(sym)
+                if not tick:
+                    self._log_auto_trade(sym, signal, "Live tick unavailable at execution time", False, quality.final_trade_quality_score)
+                    continue
+                if self.signal_pipeline.anti_churn_service.spread_deteriorated(
+                    decision.signal_decision.market_context.tick.get("spread", 0.0) if decision.signal_decision.market_context.tick else 0.0,
+                    tick.spread,
+                    context.profile.max_spread if context.profile else settings.max_spread_threshold,
+                ):
+                    self._log_auto_trade(sym, signal, "Spread deteriorated before execution", False, quality.final_trade_quality_score)
                     continue
 
-                # EXECUTE THE TRADE
-                logger.info(f"AUTO-TRADE: {signal.action} {sym} confidence={signal.confidence:.2f} volume={risk_decision.adjusted_volume}")
-
-                # Calculate investment amount for display (volume × price × contract_size / leverage)
                 entry_price = tick.ask if signal.action == "BUY" else tick.bid
-                sym_info = self.market_data.get_symbol_info(sym)
-                contract_size = sym_info.get("trade_contract_size", 100000) if sym_info else 100000
-                leverage = account.leverage or 100
-                investment = round(risk_decision.adjusted_volume * entry_price * contract_size / leverage, 0)
+                symbol_info = context.symbol_info
+                contract_size = symbol_info.trade_contract_size if symbol_info else 100000
+                leverage = context.account_leverage or 100
+                investment = round(risk_evaluation.adjusted_volume * entry_price * contract_size / leverage, 0)
                 comment = f"TA:${int(investment)}"
 
                 order_req = OrderRequest(
                     symbol=sym,
                     action=signal.action,
-                    volume=risk_decision.adjusted_volume,
+                    volume=risk_evaluation.adjusted_volume,
                     stop_loss=signal.stop_loss or 0,
                     take_profit=signal.take_profit or 0,
                     comment=comment,
                 )
-                result = self.execution.place_order(order_req)
+                preflight = await self.execution_service.preflight(
+                    symbol=sym,
+                    action=signal.action,
+                    volume=risk_evaluation.adjusted_volume,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit,
+                    reference_spread=decision.signal_decision.market_context.tick.get("spread", 0.0)
+                    if decision.signal_decision.market_context.tick
+                    else 0.0,
+                    requested_agent_name="GeminiAgent",
+                    requested_timeframe="H1",
+                    evaluation_mode="auto",
+                    scan_window_id=scan_window_id,
+                )
+                if not preflight.approved:
+                    self._log_auto_trade(sym, signal, preflight.reason, False, quality.final_trade_quality_score)
+                    continue
+                result = self.execution_service.place_order_if_approved(order_req, preflight)
 
                 if self.db and signal_id:
                     await self.db.log_order(
-                        signal_id=signal_id, symbol=sym, action=signal.action,
-                        volume=order_req.volume, price=result.price,
-                        stop_loss=signal.stop_loss, take_profit=signal.take_profit,
-                        ticket=result.ticket, retcode=result.retcode,
-                        retcode_desc=result.retcode_desc, success=result.success,
+                        signal_id=signal_id,
+                        symbol=sym,
+                        action=signal.action,
+                        volume=order_req.volume,
+                        price=result.price,
+                        stop_loss=signal.stop_loss,
+                        take_profit=signal.take_profit,
+                        ticket=result.ticket,
+                        retcode=result.retcode,
+                        retcode_desc=result.retcode_desc,
+                        success=result.success,
                     )
                     if result.success and result.ticket:
                         await self.db.log_position_change(
-                            result.ticket, "auto_opened", sym,
-                            f"AUTO {signal.action} {order_req.volume} lots at {result.price} (conf={signal.confidence:.0%})"
+                            result.ticket,
+                            "auto_opened",
+                            sym,
+                            f"AUTO {signal.action} {order_req.volume} lots at {result.price} (conf={signal.confidence:.0%})",
                         )
+                        await self.db.save_position_management_plan(
+                            ticket=result.ticket,
+                            signal_id=signal_id,
+                            symbol=sym,
+                            action=signal.action,
+                            plan=decision.position_management_plan.model_dump(),
+                        )
+                        await self.db.mark_evaluation_outcome(signal_id, "opened")
 
                 if result.success:
-                    logger.info(f"AUTO-TRADE SUCCESS: {sym} ticket={result.ticket} price={result.price}")
-                    self._log_auto_trade(sym, signal, f"Order #{result.ticket} filled at {result.price}", True)
-                    # Update position list for next symbol
+                    logger.info("AUTO-TRADE SUCCESS: %s ticket=%s price=%s", sym, result.ticket, result.price)
+                    self._log_auto_trade(sym, signal, f"Order #{result.ticket} filled at {result.price}", True, quality.final_trade_quality_score)
+                    self.signal_pipeline.anti_churn_service.mark_symbol_opened(scan_window_id, sym)
                     all_positions = self.execution.get_positions()
                 else:
-                    logger.warning(f"AUTO-TRADE FAILED: {sym} {result.retcode_desc}")
-                    self._log_auto_trade(sym, signal, result.retcode_desc, False)
+                    logger.warning("AUTO-TRADE FAILED: %s %s", sym, result.retcode_desc)
+                    self._log_auto_trade(sym, signal, result.retcode_desc, False, quality.final_trade_quality_score)
 
             except Exception as e:
                 logger.error(f"Auto-trader error for {sym}: {e}", exc_info=True)
 
-    def _log_auto_trade(self, symbol: str, signal: TradeSignal, detail: str, success: bool):
+    def _log_auto_trade(self, symbol: str, signal: TradeSignal, detail: str, success: bool, quality_score: float = 0.0):
         self._trade_log.append({
             "timestamp": time.time(),
             "symbol": symbol,
             "action": signal.action,
             "confidence": signal.confidence,
+            "quality_score": quality_score,
             "detail": detail,
             "success": success,
         })

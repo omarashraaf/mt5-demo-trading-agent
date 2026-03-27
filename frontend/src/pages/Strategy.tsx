@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
-import { Brain, Play, RefreshCw } from 'lucide-react';
+import { Play } from 'lucide-react';
 import { api } from '../utils/api';
+import { FALLBACK_SYMBOL_LIST, ACTIVE_SYMBOL_MODE_LABEL } from '../utils/symbolUniverse';
 import type { AgentInfo, EvaluateResponse } from '../types';
 
 interface Props {
@@ -10,7 +11,8 @@ interface Props {
 export default function Strategy({ connected }: Props) {
   const [agents, setAgents] = useState<Record<string, AgentInfo>>({});
   const [activeAgent, setActiveAgent] = useState('');
-  const [symbol, setSymbol] = useState('EURUSD');
+  const [availableSymbols, setAvailableSymbols] = useState<string[]>(FALLBACK_SYMBOL_LIST);
+  const [symbol, setSymbol] = useState(FALLBACK_SYMBOL_LIST[0]);
   const [timeframe, setTimeframe] = useState('H1');
   const [barCount, setBarCount] = useState(100);
   const [result, setResult] = useState<EvaluateResponse | null>(null);
@@ -22,6 +24,21 @@ export default function Strategy({ connected }: Props) {
     api.getAgents().then(setAgents).catch(() => {});
     api.getStatus().then((s) => setActiveAgent(s.active_agent)).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!connected) return;
+    api.getAvailableSymbols()
+      .then((response) => {
+        const symbols = Object.values(response.categories)
+          .flat()
+          .map((item) => item.name)
+          .sort((a, b) => a.localeCompare(b));
+        if (!symbols.length) return;
+        setAvailableSymbols(symbols);
+        setSymbol((prev) => (symbols.includes(prev) ? prev : symbols[0]));
+      })
+      .catch(() => {});
+  }, [connected]);
 
   const handleSetAgent = async (name: string) => {
     try {
@@ -59,7 +76,7 @@ export default function Strategy({ connected }: Props) {
     <div>
       <div className="page-header">
         <h2>Strategy / Agent</h2>
-        <p>Configure and run your trading agent</p>
+        <p>Configure and run your trading agent. Current mode: {ACTIVE_SYMBOL_MODE_LABEL}.</p>
       </div>
 
       {error && <div className="error-banner">{error}</div>}
@@ -100,7 +117,7 @@ export default function Strategy({ connected }: Props) {
             <div className="form-group">
               <label>Symbol</label>
               <select className="form-input" value={symbol} onChange={(e) => setSymbol(e.target.value)}>
-                {['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'AUDUSD'].map((s) => (
+                {availableSymbols.map((s) => (
                   <option key={s}>{s}</option>
                 ))}
               </select>
@@ -165,6 +182,23 @@ export default function Strategy({ connected }: Props) {
             </div>
           </div>
 
+          {result.trade_quality && (
+            <div className="grid-3 gap-4 mb-4">
+              <div>
+                <div className="stat-label">Trade Quality</div>
+                <div className="stat-value">{(result.trade_quality.final_trade_quality_score * 100).toFixed(0)}%</div>
+              </div>
+              <div>
+                <div className="stat-label">Quality Threshold</div>
+                <div className="stat-value">{(result.trade_quality.threshold * 100).toFixed(0)}%</div>
+              </div>
+              <div>
+                <div className="stat-label">Gemini</div>
+                <div className="font-mono">{result.gemini_confirmation?.degraded ? 'Degraded' : result.gemini_confirmation?.used ? 'Advisory' : 'Off'}</div>
+              </div>
+            </div>
+          )}
+
           <div className="grid-4 gap-4 mb-4">
             <div>
               <div className="stat-label">Stop Loss</div>
@@ -194,6 +228,12 @@ export default function Strategy({ connected }: Props) {
             <div className="mt-2">
               <div className="stat-label">Rejection Reason</div>
               <div className="text-sm text-red mt-2">{result.risk_decision.reason}</div>
+            </div>
+          )}
+          {result.execution_reason && (
+            <div className="mt-2">
+              <div className="stat-label">Execution Reason</div>
+              <div className="text-sm mt-2">{result.execution_reason}</div>
             </div>
           )}
         </div>

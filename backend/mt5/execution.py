@@ -85,6 +85,28 @@ RETCODE_DESCRIPTIONS = {
 
 
 class ExecutionEngine:
+    def estimate_margin(self, symbol: str, action: str, volume: float, price: Optional[float] = None) -> Optional[float]:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None
+        if price is None:
+            price = tick.ask if action == "BUY" else tick.bid
+        order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+        margin = mt5.order_calc_margin(order_type, symbol, volume, price)
+        return None if margin is None else float(margin)
+
+    def get_tradeability(self, symbol: str) -> dict:
+        info = mt5.symbol_info(symbol)
+        tick = mt5.symbol_info_tick(symbol)
+        return {
+            "symbol": symbol,
+            "exists": info is not None,
+            "visible": bool(info.visible) if info is not None else False,
+            "trade_mode": getattr(info, "trade_mode", 0) if info is not None else 0,
+            "trade_enabled": getattr(info, "trade_mode", 0) != 0 if info is not None else False,
+            "has_tick": tick is not None,
+        }
+
     def place_order(self, req: OrderRequest) -> OrderResult:
         tick = mt5.symbol_info_tick(req.symbol)
         if tick is None:

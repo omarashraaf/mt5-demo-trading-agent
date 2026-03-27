@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 
@@ -21,6 +21,7 @@ class TradeSignal(BaseModel):
     max_holding_minutes: Optional[int] = None
     reason: str = ""
     strategy: Optional[str] = None  # "trend_follow", "mean_reversion", etc.
+    metadata: dict = Field(default_factory=dict)
 
 
 class TradingAgent(ABC):

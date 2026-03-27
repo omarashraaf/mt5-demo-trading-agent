@@ -169,14 +169,24 @@ class MarketDataService:
         index_keywords = ["index", "indices", "us30", "us500", "nas", "dax", "ftse", "nikkei", "sp500", "dowjones", "dow"]
         if any(k in path for k in index_keywords) or any(k in desc for k in index_keywords):
             return "Indices"
-        if name in ["US30", "US500", "NAS100", "US100", "GER40", "UK100", "JPN225", "AUS200"]:
+        if name in ["US30", "US500", "NAS100", "US100", "SPX500", "GER40", "UK100", "JPN225", "AUS200"]:
             return "Indices"
 
         # Commodities detection
         commodity_keywords = ["commodity", "gold", "silver", "oil", "natural", "copper", "platinum"]
         if any(k in path for k in commodity_keywords) or any(k in desc for k in commodity_keywords):
             return "Commodities"
-        if name.startswith("XAU") or name.startswith("XAG") or name.startswith("XPT") or name.startswith("XPD") or "OIL" in name or "BRENT" in name or "WTI" in name:
+        if (
+            name.startswith("XAU")
+            or name.startswith("XAG")
+            or name.startswith("XPT")
+            or name.startswith("XPD")
+            or name in {"GOLD", "WTI", "BRENT", "NATGAS"}
+            or "OIL" in name
+            or "BRENT" in name
+            or "WTI" in name
+            or "GAS" in name
+        ):
             return "Commodities"
         # Commodity ETFs
         if name in ("GLD", "SLV", "USO", "DBC", "GLDM", "IAU", "PPLT", "PALL", "PDBC", "GSG"):

@@ -6,7 +6,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import router, set_database, connector
+from api.routes import router, set_database, restore_runtime_state, connector, finnhub_adapter
 from storage.db import Database
 from config import config
 
@@ -27,6 +27,10 @@ db = Database(config.DB_PATH)
 async def lifespan(app: FastAPI):
     await db.initialize()
     set_database(db)
+    await restore_runtime_state()
+    finnhub_health = finnhub_adapter.healthcheck()
+    if finnhub_health.get("degraded"):
+        logger.warning("Finnhub integration started in degraded mode: %s", finnhub_health.get("reason"))
     logger.info("MT5 Demo Trading Agent backend started")
     yield
     # Shutdown: disconnect MT5 and close DB

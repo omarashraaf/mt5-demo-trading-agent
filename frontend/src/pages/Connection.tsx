@@ -13,6 +13,7 @@ export default function Connection({ status, onRefresh }: Props) {
   const [password, setPassword] = useState('');
   const [server, setServer] = useState('');
   const [terminalPath, setTerminalPath] = useState('');
+  const [rememberCredentials, setRememberCredentials] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -27,7 +28,6 @@ export default function Connection({ status, onRefresh }: Props) {
       if (creds.length > 0 && !account) {
         const c = creds[0];
         setAccount(String(c.account));
-        setPassword(c.password);
         setServer(c.server);
         setTerminalPath(c.terminal_path || '');
       }
@@ -45,12 +45,16 @@ export default function Connection({ status, onRefresh }: Props) {
     setLoading(true);
     setError('');
     try {
-      await api.connect({
+      const result = await api.connect({
         account: parseInt(account),
         password,
         server,
         terminal_path: terminalPath || undefined,
+        save_credentials: rememberCredentials,
       });
+      if (rememberCredentials && result?.credential_status?.saved === false) {
+        setError(result.credential_status.reason || 'Connected, but credentials could not be saved securely.');
+      }
       onRefresh();
     } catch (e: any) {
       setError(e.message);
@@ -79,6 +83,23 @@ export default function Connection({ status, onRefresh }: Props) {
       setVerifyResult(result);
     } catch (e: any) {
       setVerifyResult({ ok: false, error: e.message });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAutoConnect = async (acct?: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      const result = await api.autoConnect(acct);
+      if (!result.connected) {
+        setError(result.reason || 'Auto-connect failed');
+      } else {
+        onRefresh();
+      }
+    } catch (e: any) {
+      setError(e.message);
     } finally {
       setLoading(false);
     }
@@ -211,6 +232,22 @@ export default function Connection({ status, onRefresh }: Props) {
             />
           </div>
 
+          <label className="flex items-center gap-2" style={{ fontSize: 13, marginBottom: 16 }}>
+            <input
+              type="checkbox"
+              checked={rememberCredentials}
+              onChange={(e) => setRememberCredentials(e.target.checked)}
+              disabled={status?.credential_storage_available === false}
+            />
+            Remember this account on this device
+          </label>
+          {status?.credential_storage_available === false && (
+            <div className="warning-banner" style={{ fontSize: 11, padding: '8px 12px', marginBottom: 12 }}>
+              <AlertTriangle size={12} />
+              Secure credential storage is unavailable, so saved login is disabled.
+            </div>
+          )}
+
           {/* Advanced settings - hidden by default */}
           <button
             onClick={() => setShowAdvanced(!showAdvanced)}
@@ -274,8 +311,8 @@ export default function Connection({ status, onRefresh }: Props) {
         <div className="card mt-4">
           <h3 style={{ fontSize: 13, fontWeight: 600, marginBottom: 12 }}>Saved Accounts</h3>
           <div className="warning-banner" style={{ fontSize: 11, padding: '8px 12px' }}>
-            <AlertTriangle size={12} />
-            Passwords stored locally. Only use with demo accounts.
+            <CheckCircle size={12} />
+            Passwords are stored outside SQLite and are never returned to the UI.
           </div>
           {savedCreds.map((c) => (
             <div key={c.account} className="flex justify-between items-center" style={{
@@ -292,12 +329,14 @@ export default function Connection({ status, onRefresh }: Props) {
                   className="btn btn-primary btn-sm"
                   onClick={() => {
                     setAccount(String(c.account));
-                    setPassword(c.password);
                     setServer(c.server);
                     setTerminalPath(c.terminal_path || '');
                   }}
                 >
-                  Use
+                  Load
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={() => handleAutoConnect(c.account)}>
+                  Auto Connect
                 </button>
                 <button className="btn btn-secondary btn-sm" onClick={() => handleDeleteCredentials(c.account)}>
                   <Trash2 size={10} />

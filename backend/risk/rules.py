@@ -1,35 +1,125 @@
 import logging
-from pydantic import BaseModel
+from typing import Literal
+from pydantic import BaseModel, Field
 from agent.interface import TradeSignal
 from mt5.execution import PositionInfo
 
 logger = logging.getLogger(__name__)
 
 
+PolicyMode = Literal["safe", "balanced", "aggressive"]
+GeminiRole = Literal["off", "advisory", "confirmation-required"]
+
+
+DEFAULT_ALLOWED_SYMBOLS: list[str] = []
+
+
+class UserPolicySettings(BaseModel):
+    mode: PolicyMode = "safe"
+    allowed_symbols: list[str] = Field(default_factory=lambda: DEFAULT_ALLOWED_SYMBOLS.copy())
+    max_risk_per_trade: float = 0.25
+    max_daily_drawdown: float = 2.5
+    max_open_trades: int = 3
+    max_trades_per_symbol: int = 1
+    max_margin_utilization: float = 12.0
+    min_free_margin: float = 70.0
+    min_reward_risk: float = 2.2
+    allow_counter_trend_trades: bool = False
+    allow_overnight_holding: bool = False
+    gemini_role: GeminiRole = "confirmation-required"
+    session_filters: list[str] = Field(default_factory=lambda: ["Europe", "US Open", "New York"])
+    demo_only_default: bool = True
+
+
+def build_policy_preset(mode: PolicyMode) -> UserPolicySettings:
+    presets: dict[PolicyMode, UserPolicySettings] = {
+        "safe": UserPolicySettings(
+            mode="safe",
+            max_risk_per_trade=0.25,
+            max_daily_drawdown=2.5,
+            max_open_trades=3,
+            max_trades_per_symbol=1,
+            max_margin_utilization=12.0,
+            min_free_margin=70.0,
+            min_reward_risk=2.2,
+            allow_counter_trend_trades=False,
+            allow_overnight_holding=False,
+            gemini_role="confirmation-required",
+            session_filters=["Europe", "US Open", "New York"],
+            demo_only_default=True,
+        ),
+        "balanced": UserPolicySettings(
+            mode="balanced",
+            max_risk_per_trade=0.5,
+            max_daily_drawdown=4.0,
+            max_open_trades=5,
+            max_trades_per_symbol=2,
+            max_margin_utilization=18.0,
+            min_free_margin=60.0,
+            min_reward_risk=1.8,
+            allow_counter_trend_trades=False,
+            allow_overnight_holding=False,
+            gemini_role="advisory",
+            session_filters=["Europe", "US Open", "New York"],
+            demo_only_default=True,
+        ),
+        "aggressive": UserPolicySettings(
+            mode="aggressive",
+            max_risk_per_trade=0.40,
+            max_daily_drawdown=4.5,
+            max_open_trades=4,
+            max_trades_per_symbol=2,
+            max_margin_utilization=16.0,
+            min_free_margin=60.0,
+            min_reward_risk=1.6,
+            allow_counter_trend_trades=True,
+            allow_overnight_holding=False,
+            gemini_role="advisory",
+            session_filters=["24/7"],
+            demo_only_default=True,
+        ),
+    }
+    return presets[mode].model_copy(deep=True)
+
+
+def available_policy_presets() -> dict[str, dict]:
+    return {
+        mode: build_policy_preset(mode).model_dump()
+        for mode in ("safe", "balanced", "aggressive")
+    }
+
+
 class RiskSettings(BaseModel):
-    risk_percent_per_trade: float = 0.3  # 0.3% per trade = ~$270 risk → smaller positions, more diversification
+    policy_mode: PolicyMode = "safe"
+    gemini_role: GeminiRole = "confirmation-required"
+    allow_counter_trend_trades: bool = False
+    allow_overnight_holding: bool = False
+    session_filters: list[str] = Field(default_factory=list)
+    demo_only_default: bool = True
+    risk_percent_per_trade: float = 0.25
     max_daily_loss_percent: float = 3.0
-    max_concurrent_positions: int = 15  # Allow more trades with smaller sizes for better diversification
-    min_confidence_threshold: float = 0.55
+    max_concurrent_positions: int = 6
+    max_open_positions_total: int = 6
+    max_positions_per_symbol: int = 1
+    max_trades_per_symbol: int = 1
+    cooldown_minutes_per_symbol: int = 120
+    min_confidence_threshold: float = 0.60
     max_spread_threshold: float = 15.0
+    min_reward_risk_ratio: float = 1.8
+    max_margin_utilization_pct: float = 18.0
+    min_free_margin_pct: float = 60.0
+    max_sector_exposure_pct: float = 20.0
+    max_usd_beta_exposure_pct: float = 18.0
+    max_equity_exposure_pct_for_stocks: float = 25.0
+    max_correlated_positions: int = 2
     # Preferred symbols: stocks (swing) + major forex (day) + commodities (swing)
-    allowed_symbols: list[str] = [
-        # Top Stocks — swing trade (hold days)
-        "NVDA", "AMD", "MSFT", "INTC", "AAPL", "GOOG", "AMZN", "TSLA", "META", "NFLX",
-        "AVGO", "CRM", "ORCL", "ADBE", "QCOM",
-        # Major Forex — day trade (hold hours)
-        "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
-        # Metals — swing trade (gold, silver, platinum, palladium)
-        "XAUUSD", "XAGUSD", "XAUEUR", "XAGEUR", "XPTUSD", "XPDUSD",
-        # Commodity ETFs — swing trade (oil, gold, silver, broad commodities)
-        "GLD", "SLV", "USO", "DBC",
-    ]
+    allowed_symbols: list[str] = Field(default_factory=lambda: DEFAULT_ALLOWED_SYMBOLS.copy())
     require_stop_loss: bool = True
-    use_fixed_lot: bool = False  # Dynamic sizing based on equity
+    use_fixed_lot: bool = False
     fixed_lot_size: float = 0.01
     # Auto-trading settings
     auto_trade_enabled: bool = False
-    auto_trade_min_confidence: float = 0.55
+    auto_trade_min_confidence: float = 0.65
     auto_trade_scan_interval_seconds: int = 60
 
 
@@ -37,19 +127,50 @@ class RiskDecision(BaseModel):
     approved: bool
     reason: str
     adjusted_volume: float = 0.0
-    warnings: list[str] = []  # Warnings shown to user but don't block
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RiskEngine:
     def __init__(self):
-        self.settings = RiskSettings()
+        self.user_policy = build_policy_preset("safe")
+        self.auto_trade_enabled: bool = False
+        self.auto_trade_scan_interval_seconds: int = 60
         self._daily_loss: float = 0.0
         self._daily_start_equity: float = 0.0
         self._panic_stop: bool = False
 
     def update_settings(self, settings: RiskSettings):
-        self.settings = settings
-        logger.info(f"Risk settings updated: {settings.model_dump()}")
+        self.user_policy = UserPolicySettings(
+            mode=settings.policy_mode,
+            allowed_symbols=list(settings.allowed_symbols),
+            max_risk_per_trade=settings.risk_percent_per_trade,
+            max_daily_drawdown=settings.max_daily_loss_percent,
+            max_open_trades=settings.max_open_positions_total or settings.max_concurrent_positions,
+            max_trades_per_symbol=settings.max_trades_per_symbol,
+            max_margin_utilization=settings.max_margin_utilization_pct,
+            min_free_margin=settings.min_free_margin_pct,
+            min_reward_risk=settings.min_reward_risk_ratio,
+            allow_counter_trend_trades=settings.allow_counter_trend_trades,
+            allow_overnight_holding=settings.allow_overnight_holding,
+            gemini_role=settings.gemini_role,
+            session_filters=list(settings.session_filters),
+            demo_only_default=settings.demo_only_default,
+        )
+        self.auto_trade_enabled = settings.auto_trade_enabled
+        self.auto_trade_scan_interval_seconds = settings.auto_trade_scan_interval_seconds
+        logger.info(f"Risk settings updated from runtime snapshot: {settings.model_dump()}")
+
+    def update_user_policy(self, policy: UserPolicySettings):
+        self.user_policy = self._normalize_policy(policy)
+        logger.info(f"User policy updated: {self.user_policy.model_dump()}")
+
+    def apply_policy_preset(self, mode: PolicyMode):
+        self.user_policy = build_policy_preset(mode)
+        logger.info("Applied user policy preset: %s", mode)
+
+    @property
+    def settings(self) -> RiskSettings:
+        return self._compile_settings(self.user_policy)
 
     def set_daily_start_equity(self, equity: float):
         self._daily_start_equity = equity
@@ -62,6 +183,16 @@ class RiskEngine:
     @property
     def panic_stopped(self) -> bool:
         return self._panic_stop
+
+    def runtime_controls(self) -> dict:
+        return {
+            "auto_trade_enabled": self.auto_trade_enabled,
+            "auto_trade_scan_interval_seconds": self.auto_trade_scan_interval_seconds,
+            "panic_stop": self.panic_stopped,
+        }
+
+    def policy_presets(self) -> dict[str, dict]:
+        return available_policy_presets()
 
     def evaluate(
         self,
@@ -93,13 +224,14 @@ class RiskEngine:
         # --- Hard blocks for auto-trade mode ---
 
         # Max positions — hard block in auto-trade
-        if len(open_positions) >= s.max_concurrent_positions:
+        max_positions = s.max_open_positions_total or s.max_concurrent_positions
+        if len(open_positions) >= max_positions:
             if is_auto_trade:
                 return RiskDecision(
                     approved=False,
-                    reason=f"Max {s.max_concurrent_positions} positions reached. Waiting for exits.",
+                    reason=f"Max {max_positions} positions reached. Waiting for exits.",
                 )
-            warnings.append(f"You have {len(open_positions)} positions open (max recommended: {s.max_concurrent_positions})")
+            warnings.append(f"You have {len(open_positions)} positions open (max recommended: {max_positions})")
 
         # Daily loss — hard block in auto-trade
         if self._daily_start_equity > 0:
@@ -123,12 +255,12 @@ class RiskEngine:
                 if sl_distance > 0:
                     rr_ratio = tp_distance / sl_distance
                     logger.info(f"R:R check {symbol} {signal.action}: entry={entry_est:.5f} SL={signal.stop_loss:.5f} TP={signal.take_profit:.5f} => RR={rr_ratio:.2f}:1 (entry_price_param={entry_price:.5f})")
-                    if rr_ratio < 1.5 and is_auto_trade:
+                    if rr_ratio < s.min_reward_risk_ratio and is_auto_trade:
                         return RiskDecision(
                             approved=False,
-                            reason=f"Reward:Risk ratio {rr_ratio:.1f}:1 too low (need 1.5:1 minimum). TP target not worth the risk.",
+                            reason=f"Reward:Risk ratio {rr_ratio:.1f}:1 too low (need {s.min_reward_risk_ratio:.1f}:1 minimum). TP target not worth the risk.",
                         )
-                    if rr_ratio < 1.5:
+                    if rr_ratio < s.min_reward_risk_ratio:
                         warnings.append(f"Low R:R ratio ({rr_ratio:.1f}:1) - TP target may not justify the risk")
 
         # --- Warnings (never block) ---
@@ -167,7 +299,7 @@ class RiskEngine:
             use_fixed=s.use_fixed_lot,
             fixed_lot=s.fixed_lot_size,
             open_position_count=len(open_positions),
-            max_concurrent=s.max_concurrent_positions,
+            max_concurrent=max_positions,
             action=signal.action,
         )
 
@@ -185,6 +317,52 @@ class RiskEngine:
             reason=reason,
             adjusted_volume=volume,
             warnings=warnings,
+        )
+
+    def _normalize_policy(self, policy: UserPolicySettings) -> UserPolicySettings:
+        normalized = policy.model_copy(deep=True)
+        normalized.mode = normalized.mode or "safe"
+        normalized.allowed_symbols = [symbol.upper() for symbol in normalized.allowed_symbols if symbol]
+        normalized.session_filters = normalized.session_filters or ["24/7"]
+        return normalized
+
+    def _compile_settings(self, policy: UserPolicySettings) -> RiskSettings:
+        policy = self._normalize_policy(policy)
+        mode_tuning = {
+            "safe": {"min_confidence": 0.70, "max_spread": 12.0, "cooldown": 180, "auto_confidence": 0.72},
+            "balanced": {"min_confidence": 0.64, "max_spread": 15.0, "cooldown": 120, "auto_confidence": 0.66},
+            "aggressive": {"min_confidence": 0.60, "max_spread": 18.0, "cooldown": 60, "auto_confidence": 0.65},
+        }[policy.mode]
+        return RiskSettings(
+            policy_mode=policy.mode,
+            gemini_role=policy.gemini_role,
+            allow_counter_trend_trades=policy.allow_counter_trend_trades,
+            allow_overnight_holding=policy.allow_overnight_holding,
+            session_filters=list(policy.session_filters),
+            demo_only_default=policy.demo_only_default,
+            risk_percent_per_trade=policy.max_risk_per_trade,
+            max_daily_loss_percent=policy.max_daily_drawdown,
+            max_concurrent_positions=policy.max_open_trades,
+            max_open_positions_total=policy.max_open_trades,
+            max_positions_per_symbol=1,
+            max_trades_per_symbol=policy.max_trades_per_symbol,
+            cooldown_minutes_per_symbol=mode_tuning["cooldown"],
+            min_confidence_threshold=mode_tuning["min_confidence"],
+            max_spread_threshold=mode_tuning["max_spread"],
+            min_reward_risk_ratio=policy.min_reward_risk,
+            max_margin_utilization_pct=policy.max_margin_utilization,
+            min_free_margin_pct=policy.min_free_margin,
+            max_sector_exposure_pct=20.0,
+            max_usd_beta_exposure_pct=18.0,
+            max_equity_exposure_pct_for_stocks=25.0,
+            max_correlated_positions=2 if policy.mode != "aggressive" else 3,
+            allowed_symbols=list(policy.allowed_symbols),
+            require_stop_loss=True,
+            use_fixed_lot=False,
+            fixed_lot_size=0.01,
+            auto_trade_enabled=self.auto_trade_enabled,
+            auto_trade_min_confidence=mode_tuning["auto_confidence"],
+            auto_trade_scan_interval_seconds=self.auto_trade_scan_interval_seconds,
         )
 
     def _get_entry_estimate(self, signal: TradeSignal) -> float:

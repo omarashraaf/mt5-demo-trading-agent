@@ -1,4 +1,6 @@
-const BASE_URL = 'http://127.0.0.1:8002/api';
+import { runtimeConfig } from '../config';
+
+const BASE_URL = runtimeConfig.apiBaseUrl;
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
@@ -14,8 +16,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   // Connection
-  connect: (data: { account: number; password: string; server: string; terminal_path?: string }) =>
-    request('/connect', { method: 'POST', body: JSON.stringify(data) }),
+  connect: (data: { account: number; password: string; server: string; terminal_path?: string; save_credentials?: boolean }) =>
+    request<{
+      connected: boolean;
+      account?: import('@/types').AccountInfo;
+      is_demo?: boolean;
+      credential_status?: { requested?: boolean; saved?: boolean; reason?: string };
+    }>('/connect', { method: 'POST', body: JSON.stringify(data) }),
 
   disconnect: () =>
     request('/disconnect', { method: 'POST' }),
@@ -95,10 +102,10 @@ export const api = {
 
   // Risk
   getRiskSettings: () =>
-    request<import('@/types').RiskSettings>('/risk/settings'),
+    request<import('@/types').PolicySettingsResponse>('/risk/settings'),
 
-  updateRiskSettings: (settings: import('@/types').RiskSettings) =>
-    request<import('@/types').RiskSettings>('/risk/settings', { method: 'POST', body: JSON.stringify(settings) }),
+  updateRiskSettings: (settings: import('@/types').UserPolicySettings) =>
+    request<import('@/types').PolicySettingsResponse>('/risk/settings', { method: 'POST', body: JSON.stringify(settings) }),
 
   setPanicStop: (active: boolean) =>
     request('/risk/panic-stop', { method: 'POST', body: JSON.stringify({ active }) }),
@@ -120,8 +127,10 @@ export const api = {
   deleteCredentials: (account: number) =>
     request(`/credentials/${account}`, { method: 'DELETE' }),
 
-  autoConnect: () =>
-    request<{ connected: boolean; reason?: string; account?: import('@/types').AccountInfo }>('/credentials/auto-connect'),
+  autoConnect: (accountId?: number) =>
+    request<{ connected: boolean; reason?: string; account?: import('@/types').AccountInfo }>(
+      `/credentials/auto-connect${accountId ? `?account_id=${accountId}` : ''}`
+    ),
 
   // Smart Evaluate
   smartEvaluate: (symbols?: string[]) =>
@@ -163,12 +172,20 @@ export const api = {
         symbol: string;
         action: string;
         confidence: number;
+        quality_score?: number;
         detail: string;
         success: boolean;
       }>;
       panic_stop: boolean;
       position_manager_running?: boolean;
       managed_tickets?: number[];
+      portfolio?: import('@/types').PortfolioSnapshot;
+      user_policy?: import('@/types').UserPolicySettings;
+      gemini?: {
+        available: boolean;
+        degraded: boolean;
+        last_error?: string | null;
+      };
     }>('/auto-trade/status'),
 
   startAutoTrade: () =>

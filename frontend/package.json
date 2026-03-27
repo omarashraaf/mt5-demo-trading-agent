@@ -5,10 +5,13 @@
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build && electron-builder",
+    "electron:build-main": "tsc -p tsconfig.electron.json",
+    "build": "vite build",
+    "build:web": "vite build",
+    "build:desktop": "npm run electron:build-main && vite build && electron-builder",
     "preview": "vite preview",
-    "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
-    "electron:build": "vite build && electron-builder"
+    "electron:dev": "concurrently -k \"vite\" \"npm run electron:build-main -- --watch --preserveWatchOutput\" \"wait-on http://localhost:5173 dist-electron/main.js && electron .\"",
+    "electron:build": "npm run build:desktop"
   },
   "dependencies": {
     "react": "^18.2.0",

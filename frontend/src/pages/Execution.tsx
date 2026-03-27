@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Zap, X, Play, AlertOctagon } from 'lucide-react';
+import { X, Play, AlertOctagon } from 'lucide-react';
 import { api } from '../utils/api';
+import { FALLBACK_SYMBOL_LIST, ACTIVE_SYMBOL_MODE_LABEL } from '../utils/symbolUniverse';
 import type { StatusResponse, PositionInfo, OrderResult, EvaluateResponse } from '../types';
 
 interface Props {
@@ -13,7 +14,8 @@ export default function Execution({ connected, status }: Props) {
   const [lastSignal, setLastSignal] = useState<EvaluateResponse | null>(null);
   const [lastOrder, setLastOrder] = useState<OrderResult | null>(null);
   const [orderHistory, setOrderHistory] = useState<OrderResult[]>([]);
-  const [symbol, setSymbol] = useState('EURUSD');
+  const [availableSymbols, setAvailableSymbols] = useState<string[]>(FALLBACK_SYMBOL_LIST);
+  const [symbol, setSymbol] = useState(FALLBACK_SYMBOL_LIST[0]);
   const [timeframe, setTimeframe] = useState('H1');
   const [loading, setLoading] = useState(false);
   const [executing, setExecuting] = useState(false);
@@ -34,6 +36,21 @@ export default function Execution({ connected, status }: Props) {
     const t = setInterval(refreshPositions, 3000);
     return () => clearInterval(t);
   }, [refreshPositions]);
+
+  useEffect(() => {
+    if (!connected) return;
+    api.getAvailableSymbols()
+      .then((response) => {
+        const symbols = Object.values(response.categories)
+          .flat()
+          .map((item) => item.name)
+          .sort((a, b) => a.localeCompare(b));
+        if (!symbols.length) return;
+        setAvailableSymbols(symbols);
+        setSymbol((prev) => (symbols.includes(prev) ? prev : symbols[0]));
+      })
+      .catch(() => {});
+  }, [connected]);
 
   const handleFullCycle = async () => {
     setLoading(true);
@@ -102,7 +119,7 @@ export default function Execution({ connected, status }: Props) {
         <div className="flex justify-between items-center">
           <div>
             <h2>Execution</h2>
-            <p>Run the full signal-to-trade pipeline</p>
+            <p>Run the full signal-to-trade pipeline. Current mode: {ACTIVE_SYMBOL_MODE_LABEL}.</p>
           </div>
           <button
             className={`btn ${status?.panic_stop ? 'btn-success' : 'btn-danger'}`}
@@ -137,7 +154,7 @@ export default function Execution({ connected, status }: Props) {
           <div className="form-group" style={{ margin: 0, flex: 1 }}>
             <label>Symbol</label>
             <select className="form-input" value={symbol} onChange={(e) => setSymbol(e.target.value)}>
-              {['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD'].map((s) => (
+              {availableSymbols.map((s) => (
                 <option key={s}>{s}</option>
               ))}
             </select>

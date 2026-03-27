@@ -7,9 +7,13 @@ STOCKS = {
     "NFLX", "AVGO", "CRM", "ORCL", "ADBE", "QCOM", "PYPL", "BA", "DIS", "JPM",
     "V", "MA", "WMT", "KO", "MCD", "NKE", "COST", "PEP", "CSCO",
 }
+INDICES = {
+    "US500", "SPX500", "US100", "NAS100", "US30", "GER40", "UK100", "JPN225", "AUS200",
+}
 COMMODITIES = {
     "XAUUSD", "XAGUSD", "XAUEUR", "XAGEUR", "XPTUSD", "XPDUSD",  # Metals
     "GLD", "SLV", "USO", "DBC",  # Commodity ETFs (oil, gold, silver, broad)
+    "GOLD", "WTI", "BRENT", "USOIL", "UKOIL",
 }
 # Everything else is forex
 
@@ -18,6 +22,8 @@ def get_asset_class(symbol: str) -> str:
     """Classify symbol into asset class for strategy selection."""
     if symbol in STOCKS:
         return "stock"
+    if symbol in INDICES:
+        return "index"
     if symbol in COMMODITIES:
         return "commodity"
     return "forex"
@@ -46,6 +52,15 @@ def get_trade_params(asset_class: str) -> dict:
             "tp_mult_no_entry": 3.0,  # 2:1 R:R
             "max_hold_minutes": 2880,  # 2 days
             "label": "Swing Trade",
+        }
+    elif asset_class == "index":
+        return {
+            "sl_mult_entry": 1.6,
+            "tp_mult_entry": 3.2,
+            "sl_mult_no_entry": 1.4,
+            "tp_mult_no_entry": 2.8,
+            "max_hold_minutes": 720,
+            "label": "Event Trade",
         }
     else:  # forex
         return {
@@ -86,62 +101,83 @@ class SmartAgent(TradingAgent):
                 reason="Not enough market data yet. Waiting for more price history to analyze.",
             )
 
-        # Use H4 if available, otherwise fall back to H1 for trend
-        trend_bars = h4_bars if len(h4_bars) >= 52 else h1_bars
+        # Step 1: H4/H1 trend agreement via EMA
+        h1_closes = [b["close"] for b in h1_bars]
+        h1_ema20 = self._ema(h1_closes, 20)
+        h1_ema50 = self._ema(h1_closes, 50)
+        h1_trend = self._classify_trend(h1_ema20, h1_ema50)
 
-        # Step 1: H4 / long-term trend via EMA
-        closes_trend = [b["close"] for b in trend_bars]
-        ema20 = self._ema(closes_trend, 20)
-        ema50 = self._ema(closes_trend, 50)
+        if len(h4_bars) >= 52:
+            h4_closes = [b["close"] for b in h4_bars]
+            h4_ema20 = self._ema(h4_closes, 20)
+            h4_ema50 = self._ema(h4_closes, 50)
+            h4_trend = self._classify_trend(h4_ema20, h4_ema50)
+        else:
+            h4_trend = h1_trend
 
-        trend = "flat"
+        trend = h1_trend
         trend_score = 0.0
-        if ema20[-1] > ema50[-1] and ema20[-2] > ema50[-2]:
-            trend = "bullish"
-            trend_score = 0.15
-        elif ema20[-1] < ema50[-1] and ema20[-2] < ema50[-2]:
-            trend = "bearish"
-            trend_score = 0.15
+        if h1_trend == h4_trend and h1_trend in {"bullish", "bearish"}:
+            trend_score = 0.2
+        elif h1_trend in {"bullish", "bearish"}:
+            trend_score = 0.08
+
+        asset_class = get_asset_class(input_data.symbol)
 
         # Step 2: H1 momentum via RSI
-        closes_h1 = [b["close"] for b in h1_bars]
+        closes_h1 = h1_closes
         rsi = self._rsi(closes_h1, 14)
         current_rsi = rsi[-1] if rsi else 50.0
 
         momentum = "neutral"
         momentum_score = 0.0
-        if trend == "bullish" and 40 < current_rsi < 70:
-            momentum = "bullish"
+        bull_upper = 72 if asset_class in {"stock", "index"} else 65
+        bear_lower = 28 if asset_class in {"stock", "index"} else 35
+        exhaustion_high = 80 if asset_class in {"stock", "index"} else 75
+        exhaustion_low = 20 if asset_class in {"stock", "index"} else 25
+        if trend == "bullish" and 45 < current_rsi < bull_upper:
+            momentum = "bullish_pullback"
             momentum_score = 0.15
-        elif trend == "bearish" and 30 < current_rsi < 60:
-            momentum = "bearish"
+        elif trend == "bearish" and bear_lower < current_rsi < 55:
+            momentum = "bearish_pullback"
             momentum_score = 0.15
+        elif asset_class in {"stock", "index"} and trend == "bullish" and bull_upper <= current_rsi < exhaustion_high:
+            momentum = "bullish_trend_persistence"
+            momentum_score = 0.08
+        elif asset_class in {"stock", "index"} and trend == "bearish" and exhaustion_low < current_rsi <= bear_lower:
+            momentum = "bearish_trend_persistence"
+            momentum_score = 0.08
         # Exhaustion zones reduce confidence
-        if current_rsi > 75 or current_rsi < 25:
+        if current_rsi > exhaustion_high or current_rsi < exhaustion_low:
             momentum = "exhausted"
             momentum_score = -0.1
 
         # Step 3: M15 entry trigger
-        entry_signal, entry_score = self._detect_entry(m15_bars, trend)
+        entry_signal, entry_score = self._detect_entry(m15_bars, h1_bars, trend, asset_class)
 
         # Step 4: Support/Resistance confirmation
-        sr_score = self._check_sr_alignment(h1_bars, m15_bars[-1]["close"], trend)
+        sr_score, position_in_range = self._check_sr_alignment(h1_bars, m15_bars[-1]["close"], trend)
 
         # Step 5: Volume confirmation
         volume_score = 0.0
         if len(m15_bars) >= 21:
             recent_vol = m15_bars[-1].get("volume", 0)
             avg_vol = sum(b.get("volume", 0) for b in m15_bars[-21:-1]) / 20
-            if avg_vol > 0 and recent_vol > avg_vol * 1.2:
+            if avg_vol > 0 and recent_vol > avg_vol * 1.25:
                 volume_score = 0.05
 
         # Step 6: Calculate ATR for SL/TP
         atr = self._atr(h1_bars, 14)
         last_close = m15_bars[-1]["close"]
+        atr_pct = (atr / last_close) * 100 if last_close > 0 else 0.0
+        m15_closes = [b["close"] for b in m15_bars]
+        m15_ema20 = self._ema(m15_closes, 20)
+        ema_distance_atr = abs(last_close - m15_ema20[-1]) / max(atr, 0.0000001)
 
         # Aggregate confidence
-        confidence = 0.3 + trend_score + momentum_score + entry_score + sr_score + volume_score
+        confidence = 0.25 + trend_score + momentum_score + entry_score + sr_score + volume_score
         confidence = round(max(0.0, min(0.95, confidence)), 2)
+        trend_conflict = h1_trend != h4_trend and h1_trend != "flat" and h4_trend != "flat"
 
         # Position awareness — don't stack same-direction trades
         for pos in input_data.open_positions:
@@ -159,16 +195,45 @@ class SmartAgent(TradingAgent):
                     )
 
         # Determine action — BUY and SELL
-        # With entry trigger: trade at 55%+ confidence
-        # Without entry trigger: trade at 60%+ confidence if trend+momentum align
+        # With entry trigger: trade only when confidence clears a stricter bar.
         has_entry = entry_signal not in ("none", "")
 
         # Get asset-specific parameters (forex=day trade, stocks/gold=swing trade)
-        asset_class = get_asset_class(input_data.symbol)
         params = get_trade_params(asset_class)
+        min_entry_conf, min_non_entry_conf = self._confidence_thresholds(asset_class, has_entry)
+        metadata = {
+            "direction": trend if trend in {"bullish", "bearish"} else "flat",
+            "asset_class": asset_class,
+            "technical_confidence": round(confidence, 3),
+            "h1_trend": h1_trend,
+            "h4_trend": h4_trend,
+            "trend_alignment": round(1.0 if h1_trend == h4_trend and h1_trend in {"bullish", "bearish"} else 0.5 if h1_trend == trend or h4_trend == trend else 0.0, 3),
+            "trend_score": round(trend_score, 3),
+            "momentum": momentum,
+            "momentum_score": round(momentum_score, 3),
+            "entry_signal": entry_signal,
+            "entry_score": round(entry_score, 3),
+            "entry_quality": round(max(0.0, min(1.0, 0.45 + entry_score * 2.5 + sr_score * 1.5 + volume_score)), 3),
+            "sr_score": round(sr_score, 3),
+            "volume_score": round(volume_score, 3),
+            "atr": round(atr, 6),
+            "atr_pct": round(atr_pct, 4),
+            "position_in_range": round(position_in_range, 4),
+            "ema_distance_atr": round(ema_distance_atr, 4),
+            "trend_conflict": trend_conflict,
+        }
+
+        if trend_conflict:
+            return TradeSignal(
+                action="HOLD",
+                confidence=max(0.0, confidence - 0.08),
+                strategy="trend_follow",
+                reason="No trade. H1 and H4 trend structure disagree, so the setup is too noisy.",
+                metadata=metadata,
+            )
 
         if trend == "bullish" and (
-            (has_entry and confidence >= 0.55) or confidence >= 0.60
+            (has_entry and confidence >= min_entry_conf) or confidence >= min_non_entry_conf
         ):
             action = "BUY"
             sl_mult = params["sl_mult_entry"] if has_entry else params["sl_mult_no_entry"]
@@ -176,7 +241,7 @@ class SmartAgent(TradingAgent):
             sl = round(last_close - atr * sl_mult, 5)
             tp = round(last_close + atr * tp_mult, 5)
         elif trend == "bearish" and (
-            (has_entry and confidence >= 0.55) or confidence >= 0.60
+            (has_entry and confidence >= min_entry_conf) or confidence >= min_non_entry_conf
         ):
             action = "SELL"
             sl_mult = params["sl_mult_entry"] if has_entry else params["sl_mult_no_entry"]
@@ -187,7 +252,13 @@ class SmartAgent(TradingAgent):
             return TradeSignal(
                 action="HOLD", confidence=confidence, strategy="trend_follow",
                 reason=self._build_hold_reason(trend, momentum, current_rsi, entry_signal),
+                metadata=metadata,
             )
+
+        rr_ratio = abs(tp - last_close) / max(abs(last_close - sl), 0.0000001)
+        metadata["reward_risk_ratio"] = round(rr_ratio, 3)
+        metadata["reward_risk"] = round(rr_ratio, 3)
+        metadata["late_entry"] = ema_distance_atr >= 1.1
 
         reason = self._build_reason(
             action, trend, momentum, current_rsi, entry_signal,
@@ -202,6 +273,7 @@ class SmartAgent(TradingAgent):
             max_holding_minutes=params["max_hold_minutes"],
             reason=reason,
             strategy=f"{params['label'].lower().replace(' ', '_')}_{asset_class}",
+            metadata=metadata,
         )
 
     # --- Technical indicators ---
@@ -249,7 +321,7 @@ class SmartAgent(TradingAgent):
 
     # --- Entry detection ---
 
-    def _detect_entry(self, m15_bars: list[dict], trend: str) -> tuple[str, float]:
+    def _detect_entry(self, m15_bars: list[dict], h1_bars: list[dict], trend: str, asset_class: str) -> tuple[str, float]:
         """Look for pullback + reversal candle on M15."""
         if len(m15_bars) < 22:
             return "none", 0.0
@@ -277,12 +349,52 @@ class SmartAgent(TradingAgent):
             if body < 0 and last["high"] >= ema20[-1] * 0.999:
                 return "neutral_lean_sell", 0.05
 
+        # Stocks, indices, and commodities often trend without giving clean M15 pullbacks.
+        # Allow a continuation entry only when higher-timeframe structure is already strong
+        # and the move is not too extended versus ATR.
+        if asset_class in {"stock", "index", "commodity"} and len(h1_bars) >= 30:
+            h1_closes = [b["close"] for b in h1_bars]
+            h1_ema20 = self._ema(h1_closes, 20)
+            h1_ema50 = self._ema(h1_closes, 50)
+            h1_body = h1_bars[-1]["close"] - h1_bars[-1]["open"]
+            h1_range = max(h1_bars[-1]["high"] - h1_bars[-1]["low"], 0.0000001)
+            h1_body_ratio = abs(h1_body) / h1_range
+            m15_atr = self._atr(m15_bars, 14)
+            extended = abs(last["close"] - ema20[-1]) / max(m15_atr, 0.0000001) > 1.55
+            if trend == "bullish":
+                if (
+                    h1_ema20[-1] > h1_ema50[-1]
+                    and h1_bars[-1]["close"] > h1_ema20[-1]
+                    and h1_body > 0
+                    and h1_body_ratio >= 0.35
+                    and not extended
+                ):
+                    return "trend_continuation_buy", 0.08
+            elif trend == "bearish":
+                if (
+                    h1_ema20[-1] < h1_ema50[-1]
+                    and h1_bars[-1]["close"] < h1_ema20[-1]
+                    and h1_body < 0
+                    and h1_body_ratio >= 0.35
+                    and not extended
+                ):
+                    return "trend_continuation_sell", 0.08
+
         return "none", 0.0
 
-    def _check_sr_alignment(self, h1_bars: list[dict], current_price: float, trend: str) -> float:
+    def _confidence_thresholds(self, asset_class: str, has_entry: bool) -> tuple[float, float]:
+        if asset_class == "stock":
+            return 0.56, 0.62
+        if asset_class == "index":
+            return 0.55, 0.60
+        if asset_class == "commodity":
+            return 0.56, 0.61
+        return 0.60, 0.67
+
+    def _check_sr_alignment(self, h1_bars: list[dict], current_price: float, trend: str) -> tuple[float, float]:
         """Check if price is near a support (for buys) or resistance (for sells)."""
         if len(h1_bars) < 20:
-            return 0.0
+            return 0.0, 0.5
 
         highs = [b["high"] for b in h1_bars[-30:]]
         lows = [b["low"] for b in h1_bars[-30:]]
@@ -290,19 +402,27 @@ class SmartAgent(TradingAgent):
         recent_low = min(lows)
         range_size = recent_high - recent_low
         if range_size <= 0:
-            return 0.0
+            return 0.0, 0.5
 
+        position_in_range = (current_price - recent_low) / range_size
         # For buys: price near lower third = good support zone
         if trend == "bullish":
-            position_in_range = (current_price - recent_low) / range_size
             if position_in_range < 0.4:
-                return 0.1
+                return 0.1, position_in_range
         # For sells: price near upper third = good resistance zone
         elif trend == "bearish":
-            position_in_range = (current_price - recent_low) / range_size
             if position_in_range > 0.6:
-                return 0.1
-        return 0.0
+                return 0.1, position_in_range
+        return 0.0, position_in_range
+
+    def _classify_trend(self, ema20: list[float], ema50: list[float]) -> str:
+        if len(ema20) < 2 or len(ema50) < 2:
+            return "flat"
+        if ema20[-1] > ema50[-1] and ema20[-2] > ema50[-2]:
+            return "bullish"
+        if ema20[-1] < ema50[-1] and ema20[-2] < ema50[-2]:
+            return "bearish"
+        return "flat"
 
     # --- Reasoning ---
 
@@ -345,9 +465,15 @@ class SmartAgent(TradingAgent):
         if momentum == "neutral":
             issues.append("Hard to tell which way the price will go")
         if entry_signal == "none":
-            issues.append("The price hasn't reached a good buying level yet")
+            issues.append("The price hasn't reached a clean entry zone yet")
+        elif "continuation" in entry_signal:
+            issues.append("The trend is there, but the continuation entry is not strong enough yet")
 
         if not issues:
             issues.append("Not a strong enough opportunity right now")
-
-        return "No buying opportunity right now. " + ". ".join(issues) + ". The AI will keep watching."
+        direction_hint = {
+            "bullish": "No buying setup right now.",
+            "bearish": "No selling setup right now.",
+            "flat": "No trade setup right now.",
+        }.get(trend, "No trade setup right now.")
+        return f"{direction_hint} " + ". ".join(issues) + ". The AI will keep watching."

@@ -3,9 +3,9 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from 'recharts';
 import { api } from '../utils/api';
+import { FALLBACK_SYMBOL_LIST, ACTIVE_SYMBOL_MODE_LABEL } from '../utils/symbolUniverse';
 import type { TickData, BarData } from '../types';
 
-const SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD'];
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
 
 interface Props {
@@ -13,8 +13,9 @@ interface Props {
 }
 
 export default function Market({ connected }: Props) {
-  const [selectedSymbols, setSelectedSymbols] = useState<string[]>(['EURUSD']);
-  const [activeSymbol, setActiveSymbol] = useState('EURUSD');
+  const [availableSymbols, setAvailableSymbols] = useState<string[]>(FALLBACK_SYMBOL_LIST);
+  const [selectedSymbols, setSelectedSymbols] = useState<string[]>([FALLBACK_SYMBOL_LIST[0]]);
+  const [activeSymbol, setActiveSymbol] = useState(FALLBACK_SYMBOL_LIST[0]);
   const [timeframe, setTimeframe] = useState('H1');
   const [ticks, setTicks] = useState<Record<string, TickData>>({});
   const [bars, setBars] = useState<BarData[]>([]);
@@ -72,6 +73,25 @@ export default function Market({ connected }: Props) {
   }, [connected]);
 
   useEffect(() => {
+    if (!connected) return;
+    api.getAvailableSymbols()
+      .then((response) => {
+        const symbols = Object.values(response.categories)
+          .flat()
+          .map((item) => item.name)
+          .sort((a, b) => a.localeCompare(b));
+        if (!symbols.length) return;
+        setAvailableSymbols(symbols);
+        setSelectedSymbols((prev) => {
+          const filtered = prev.filter((symbol) => symbols.includes(symbol));
+          return filtered.length ? filtered : [symbols[0]];
+        });
+        setActiveSymbol((prev) => (symbols.includes(prev) ? prev : symbols[0]));
+      })
+      .catch(() => {});
+  }, [connected]);
+
+  useEffect(() => {
     refreshTicks();
     const t = setInterval(refreshTicks, 2000);
     return () => clearInterval(t);
@@ -103,7 +123,7 @@ export default function Market({ connected }: Props) {
     <div>
       <div className="page-header">
         <h2>Market</h2>
-        <p>Symbol watchlist and price data</p>
+        <p>Symbol watchlist and price data. Current mode: {ACTIVE_SYMBOL_MODE_LABEL}.</p>
       </div>
 
       {error && <div className="error-banner">{error}</div>}
@@ -113,7 +133,7 @@ export default function Market({ connected }: Props) {
           <h3>Symbol Selection</h3>
         </div>
         <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
-          {SYMBOLS.map((sym) => (
+          {availableSymbols.map((sym) => (
             <button
               key={sym}
               className={`btn btn-sm ${selectedSymbols.includes(sym) ? 'btn-primary' : 'btn-secondary'}`}
