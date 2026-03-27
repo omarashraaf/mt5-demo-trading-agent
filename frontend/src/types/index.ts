@@ -317,3 +317,93 @@ export interface AIActivity {
   success?: boolean;
   quality_score?: number;
 }
+
+export interface ChatMessageItem {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface ChatTradeRequest {
+  symbol: string;
+  action: 'BUY' | 'SELL';
+  amount_usd: number;
+  stop_loss?: number | null;
+  take_profit?: number | null;
+  reason?: string | null;
+}
+
+export interface ChatTradePreview {
+  symbol: string;
+  action: 'BUY' | 'SELL';
+  amount_usd: number;
+  estimated_entry: number;
+  estimated_volume: number;
+  stop_loss: number | null;
+  take_profit: number | null;
+  reason?: string | null;
+}
+
+export interface ChatResponse {
+  reply: string;
+  intent: 'chat' | 'trade_request';
+  trade_request?: ChatTradeRequest | null;
+  trade_preview?: ChatTradePreview | null;
+  order_result?: OrderResult | null;
+  executed: boolean;
+}
+
+export interface ChatHistoryResponse {
+  messages: ChatMessageItem[];
+}
+
+export interface TradeHistorySummary {
+  total_trades: number;
+  closed_trades: number;
+  open_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  breakeven_trades: number;
+  win_rate_pct: number;
+  total_profit_usd: number;
+  avg_profit_per_closed_trade_usd: number;
+  total_started_capital_usd: number;
+  roi_pct: number | null;
+  best_trade_usd: number;
+  worst_trade_usd: number;
+}
+
+export interface TradeHistoryItem {
+  ticket: number | null;
+  signal_id: number | null;
+  symbol: string;
+  action: 'BUY' | 'SELL';
+  status: 'open' | 'closed';
+  opened_at: number;
+  closed_at: number | null;
+  duration_minutes: number | null;
+  volume: number;
+  entry_price: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  profit_usd: number | null;
+  profit_pct: number | null;
+  started_with_usd: number | null;
+  ended_with_usd: number | null;
+  entry_market_value_usd: number | null;
+  sl_amount_usd: number | null;
+  tp_amount_usd: number | null;
+  sl_pct_of_start: number | null;
+  tp_pct_of_start: number | null;
+  started_with_source: 'provided' | 'estimated' | 'unknown';
+  agent_name?: string;
+  signal_confidence?: number;
+  signal_reason?: string;
+  risk_approved?: number;
+  risk_reason?: string;
+  exit_reason?: string | null;
+}
+
+export interface TradeHistoryResponse {
+  summary: TradeHistorySummary;
+  trades: TradeHistoryItem[];
+}

@@ -7,6 +7,9 @@ import {
   Brain,
   Shield,
   Zap,
+  Activity,
+  MessageSquare,
+  History,
   ScrollText,
   ChevronDown,
   ChevronRight,
@@ -21,12 +24,18 @@ import Strategy from './pages/Strategy';
 import RiskManagement from './pages/RiskManagement';
 import Execution from './pages/Execution';
 import Logs from './pages/Logs';
+import AIActivityPage from './pages/AIActivity';
+import ChatPage from './pages/Chat';
+import TradeHistoryPage from './pages/TradeHistory';
 
 const ADVANCED_NAV = [
+  { path: '/chat', label: 'Gemini Chat', icon: MessageSquare },
+  { path: '/ai-activity', label: 'AI Brain Activity', icon: Activity },
   { path: '/market', label: 'Market Data', icon: BarChart3 },
   { path: '/strategy', label: 'Strategy', icon: Brain },
   { path: '/risk', label: 'Risk Settings', icon: Shield },
   { path: '/execution', label: 'Execution', icon: Zap },
+  { path: '/trade-history', label: 'Trade History', icon: History },
   { path: '/logs', label: 'Logs', icon: ScrollText },
 ];
 
@@ -151,6 +160,9 @@ export default function App() {
           <Route path="/strategy" element={<Strategy connected={connected} />} />
           <Route path="/risk" element={<RiskManagement status={status} />} />
           <Route path="/execution" element={<Execution connected={connected} status={status} />} />
+          <Route path="/trade-history" element={<TradeHistoryPage connected={connected} />} />
+          <Route path="/ai-activity" element={<AIActivityPage status={status} />} />
+          <Route path="/chat" element={<ChatPage connected={connected} />} />
           <Route path="/logs" element={<Logs />} />
         </Routes>
       </main>

@@ -49,7 +49,7 @@ export const api = {
   getSymbolInfo: (symbol: string) =>
     request(`/market/symbol-info/${symbol}`),
 
-  getAvailableSymbols: (category?: string, tradeableOnly: boolean = true) =>
+  getAvailableSymbols: (category?: string, tradeableOnly: boolean = false) =>
     request<{
       total: number;
       categories: Record<string, Array<{
@@ -115,7 +115,7 @@ export const api = {
     request<import('@/types').LogEntry[]>(`/logs?limit=${limit}&log_type=${logType}`),
 
   getTradeHistory: (limit: number = 50) =>
-    request(`/trade-history?limit=${limit}`),
+    request<import('@/types').TradeHistoryResponse>(`/trade-history?limit=${limit}`),
 
   // Credentials
   getCredentials: () =>
@@ -209,4 +209,30 @@ export const api = {
         managed_tickets: number[];
       };
     }>(`/auto-trade/activity?limit=${limit}`),
+
+  sendChatMessage: (
+    message: string,
+    history: import('@/types').ChatMessageItem[] = [],
+    executeTrade: boolean = false,
+  ) =>
+    request<import('@/types').ChatResponse>('/chat/message', {
+      method: 'POST',
+      body: JSON.stringify({
+        message,
+        history,
+        execute_trade: executeTrade,
+      }),
+    }),
+
+  getChatHistory: () =>
+    request<import('@/types').ChatHistoryResponse>('/chat/history'),
+
+  saveChatHistory: (messages: import('@/types').ChatMessageItem[]) =>
+    request<{ saved: boolean }>('/chat/history', {
+      method: 'POST',
+      body: JSON.stringify({ messages }),
+    }),
+
+  clearChatHistory: () =>
+    request<{ cleared: boolean }>('/chat/history', { method: 'DELETE' }),
 };

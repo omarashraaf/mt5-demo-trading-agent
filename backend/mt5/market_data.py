@@ -165,12 +165,14 @@ class MarketDataService:
         if name.endswith("USD") and name[:3] in ["BTC", "ETH", "LTC", "XRP", "SOL", "ADA", "BNB", "DOG", "AVA", "DOT", "LIN", "UNI", "MAT"]:
             return "Crypto"
 
-        # Indices detection
-        index_keywords = ["index", "indices", "us30", "us500", "nas", "dax", "ftse", "nikkei", "sp500", "dowjones", "dow"]
-        if any(k in path for k in index_keywords) or any(k in desc for k in index_keywords):
-            return "Indices"
-        if name in ["US30", "US500", "NAS100", "US100", "SPX500", "GER40", "UK100", "JPN225", "AUS200"]:
-            return "Indices"
+        # Stocks detection (must run before index detection so Nasdaq stocks are not mis-labeled)
+        stock_keywords = ["stock", "share", "equity", "equities", "cfd"]
+        if any(k in path for k in stock_keywords):
+            return "Stocks"
+        # Common stock symbols (US tech stocks, etc.)
+        stock_names = ["AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "INTC", "DIS", "BA", "V", "JPM", "WMT", "PFE", "KO", "NKE"]
+        if name in stock_names or name.replace(".US", "") in stock_names:
+            return "Stocks"
 
         # Commodities detection
         commodity_keywords = ["commodity", "gold", "silver", "oil", "natural", "copper", "platinum"]
@@ -192,14 +194,12 @@ class MarketDataService:
         if name in ("GLD", "SLV", "USO", "DBC", "GLDM", "IAU", "PPLT", "PALL", "PDBC", "GSG"):
             return "Commodities"
 
-        # Stocks detection
-        stock_keywords = ["stock", "share", "equity", "equities", "cfd"]
-        if any(k in path for k in stock_keywords):
-            return "Stocks"
-        # Common stock symbols (US tech stocks, etc.)
-        stock_names = ["AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "TSLA", "META", "NVDA", "NFLX", "AMD", "INTC", "DIS", "BA", "V", "JPM", "WMT", "PFE", "KO", "NKE"]
-        if name in stock_names or name.replace(".US", "") in stock_names:
-            return "Stocks"
+        # Indices detection
+        index_keywords = ["index", "indices", "us30", "us500", "nas100", "dax", "ftse", "nikkei", "sp500", "dowjones", "dow"]
+        if any(k in path for k in index_keywords) or any(k in desc for k in index_keywords):
+            return "Indices"
+        if name in ["US30", "US500", "NAS100", "US100", "SPX500", "GER40", "UK100", "JPN225", "AUS200"]:
+            return "Indices"
 
         # Forex (default for currency pairs)
         forex_keywords = ["forex", "fx", "currency", "major", "minor", "exotic"]

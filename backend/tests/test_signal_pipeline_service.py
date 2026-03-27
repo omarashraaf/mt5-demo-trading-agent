@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent.interface import TradeSignal
-from domain.models import NormalizedNewsItem
+from domain.models import NormalizedNewsItem, TechnicalSignal
 from services.signal_pipeline_service import SignalPipelineService
 from services.trade_quality_service import TradeQualityService
 
@@ -159,6 +159,33 @@ class _SmartAgent:
         )
 
 
+class _SellAgent:
+    def evaluate(self, _input_data):
+        return TradeSignal(
+            action="SELL",
+            confidence=0.78,
+            stop_loss=1.1012,
+            take_profit=1.0980,
+            max_holding_minutes=360,
+            reason="Bearish setup",
+            strategy="trend_follow",
+            metadata={
+                "h1_trend": "bearish",
+                "h4_trend": "bearish",
+                "trend_score": 0.2,
+                "momentum_score": 0.15,
+                "entry_signal": "sell",
+                "entry_score": 0.1,
+                "sr_score": 0.1,
+                "volume_score": 0.05,
+                "atr_pct": 0.35,
+                "position_in_range": 0.75,
+                "ema_distance_atr": 0.6,
+                "reward_risk_ratio": 2.0,
+            },
+        )
+
+
 class _GeminiAdapter:
     async def confirm(self, _input_data, _primary_signal):
         from domain.models import GeminiAssessment
@@ -202,6 +229,18 @@ class _EventIngestionService:
 class _AlwaysOpenTradeQualityService(TradeQualityService):
     def session_allowed(self, sessions: list[str]) -> bool:
         return True
+
+
+class _DbRecentLosses:
+    async def get_recent_symbol_outcomes(self, _symbol, limit=5, within_minutes=1440):
+        return [
+            {"action": "SELL", "profit": -120.0, "closed_at": 1710000100.0},
+            {"action": "SELL", "profit": -80.0, "closed_at": 1710000000.0},
+            {"action": "BUY", "profit": 45.0, "closed_at": 1709999900.0},
+        ][:limit]
+
+    async def get_recent_symbol_evaluations(self, _symbol, limit=5, within_minutes=1440):
+        return []
 
 
 class SignalPipelineServiceTests(unittest.TestCase):
@@ -279,6 +318,7 @@ class SignalPipelineServiceTests(unittest.TestCase):
                     {"name": "US500", "category": "Indices", "path": "indices\\cash", "trade_enabled": True, "visible": True},
                     {"name": "TSLA", "category": "Stocks", "path": "stocks\\us", "trade_enabled": True, "visible": True},
                     {"name": "XAUUSD", "category": "Commodities", "path": "commodities\\metals", "trade_enabled": True, "visible": True},
+                    {"name": "XAGUSD", "category": "Commodities", "path": "commodities\\metals", "trade_enabled": True, "visible": True},
                     {"name": "EURUSD", "category": "Forex", "path": "forex\\majors", "trade_enabled": True, "visible": True},
                 ],
                 limit=5,
@@ -287,5 +327,56 @@ class SignalPipelineServiceTests(unittest.TestCase):
 
         self.assertIn("US500", symbols)
         self.assertIn("XAUUSD", symbols)
+        self.assertIn("XAGUSD", symbols)
         self.assertIn("TSLA", symbols)
         self.assertNotIn("EURUSD", symbols)
+
+    def test_aggressive_mode_scales_sl_tp_distance_by_5_percent(self):
+        pipeline = SignalPipelineService(
+            connector=_Connector(),
+            market_data=_MarketData(),
+            execution=_Execution(),
+            risk_engine=_RiskEngine(),
+            agents={"SmartAgent": _SmartAgent()},
+            gemini_adapter=_GeminiAdapter(),
+            trade_quality_service=_AlwaysOpenTradeQualityService(),
+        )
+        signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=0.7,
+            stop_loss=95.0,
+            take_profit=110.0,
+            metadata={"digits": 2},
+        )
+
+        scaled = pipeline._apply_mode_target_scaling(signal, entry_price=100.0, mode="aggressive")
+
+        self.assertEqual(scaled.stop_loss, 94.75)
+        self.assertEqual(scaled.take_profit, 110.5)
+
+    def test_outcome_learning_flips_direction_after_repeated_losses(self):
+        pipeline = SignalPipelineService(
+            connector=_Connector(),
+            market_data=_MarketData(),
+            execution=_Execution(),
+            risk_engine=_RiskEngine(),
+            agents={"SmartAgent": _SellAgent()},
+            gemini_adapter=_GeminiAdapter(),
+            event_ingestion_service=_EventIngestionService(),
+            trade_quality_service=_AlwaysOpenTradeQualityService(),
+            db=_DbRecentLosses(),
+        )
+
+        decision = asyncio.run(
+            pipeline.evaluate(
+                symbol="US500",
+                requested_agent_name="SmartAgent",
+                requested_timeframe="H1",
+                evaluation_mode="auto",
+                bar_count=60,
+            )
+        )
+
+        self.assertEqual(decision.signal_decision.primary_signal.action, "BUY")
+        self.assertIn("Direction adapted", decision.signal_decision.primary_signal.reason)

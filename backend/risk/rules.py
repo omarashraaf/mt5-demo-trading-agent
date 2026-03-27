@@ -15,7 +15,7 @@ DEFAULT_ALLOWED_SYMBOLS: list[str] = []
 
 
 class UserPolicySettings(BaseModel):
-    mode: PolicyMode = "safe"
+    mode: PolicyMode = "balanced"
     allowed_symbols: list[str] = Field(default_factory=lambda: DEFAULT_ALLOWED_SYMBOLS.copy())
     max_risk_per_trade: float = 0.25
     max_daily_drawdown: float = 2.5
@@ -65,12 +65,12 @@ def build_policy_preset(mode: PolicyMode) -> UserPolicySettings:
         ),
         "aggressive": UserPolicySettings(
             mode="aggressive",
-            max_risk_per_trade=0.40,
+            max_risk_per_trade=0.75,
             max_daily_drawdown=4.5,
-            max_open_trades=4,
-            max_trades_per_symbol=2,
-            max_margin_utilization=16.0,
-            min_free_margin=60.0,
+            max_open_trades=8,
+            max_trades_per_symbol=3,
+            max_margin_utilization=30.0,
+            min_free_margin=45.0,
             min_reward_risk=1.6,
             allow_counter_trend_trades=True,
             allow_overnight_holding=False,
@@ -90,7 +90,7 @@ def available_policy_presets() -> dict[str, dict]:
 
 
 class RiskSettings(BaseModel):
-    policy_mode: PolicyMode = "safe"
+    policy_mode: PolicyMode = "balanced"
     gemini_role: GeminiRole = "confirmation-required"
     allow_counter_trend_trades: bool = False
     allow_overnight_holding: bool = False
@@ -132,7 +132,7 @@ class RiskDecision(BaseModel):
 
 class RiskEngine:
     def __init__(self):
-        self.user_policy = build_policy_preset("safe")
+        self.user_policy = build_policy_preset("balanced")
         self.auto_trade_enabled: bool = False
         self.auto_trade_scan_interval_seconds: int = 60
         self._daily_loss: float = 0.0
@@ -321,7 +321,7 @@ class RiskEngine:
 
     def _normalize_policy(self, policy: UserPolicySettings) -> UserPolicySettings:
         normalized = policy.model_copy(deep=True)
-        normalized.mode = normalized.mode or "safe"
+        normalized.mode = normalized.mode or "balanced"
         normalized.allowed_symbols = [symbol.upper() for symbol in normalized.allowed_symbols if symbol]
         normalized.session_filters = normalized.session_filters or ["24/7"]
         return normalized
@@ -330,8 +330,8 @@ class RiskEngine:
         policy = self._normalize_policy(policy)
         mode_tuning = {
             "safe": {"min_confidence": 0.70, "max_spread": 12.0, "cooldown": 180, "auto_confidence": 0.72},
-            "balanced": {"min_confidence": 0.64, "max_spread": 15.0, "cooldown": 120, "auto_confidence": 0.66},
-            "aggressive": {"min_confidence": 0.60, "max_spread": 18.0, "cooldown": 60, "auto_confidence": 0.65},
+            "balanced": {"min_confidence": 0.60, "max_spread": 15.0, "cooldown": 120, "auto_confidence": 0.62},
+            "aggressive": {"min_confidence": 0.45, "max_spread": 22.0, "cooldown": 30, "auto_confidence": 0.45},
         }[policy.mode]
         return RiskSettings(
             policy_mode=policy.mode,

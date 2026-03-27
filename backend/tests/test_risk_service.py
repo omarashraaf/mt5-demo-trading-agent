@@ -69,7 +69,7 @@ class RiskServiceTests(unittest.TestCase):
         signal = TechnicalSignal(
             agent_name="SmartAgent",
             action="BUY",
-            confidence=0.62,
+            confidence=0.61,
             stop_loss=2990.0,
             take_profit=3025.0,
         )
@@ -101,6 +101,31 @@ class RiskServiceTests(unittest.TestCase):
         quality = TradeQualityAssessment(
             final_trade_quality_score=0.86,
             threshold=0.76,
+            no_trade_zone=False,
+        )
+        result = self.service.assess(
+            context=self.context,
+            signal=signal,
+            trade_quality=quality,
+            evaluation_mode="auto",
+            recent_outcomes=[],
+            recent_evaluations=[],
+            entry_price=3000.5,
+        )
+        self.assertTrue(result.approved)
+
+    def test_aggressive_allows_45_percent_confidence_auto_trade(self):
+        self.risk_engine.apply_policy_preset("aggressive")
+        signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=0.45,
+            stop_loss=2990.0,
+            take_profit=3025.0,
+        )
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.86,
+            threshold=0.72,
             no_trade_zone=False,
         )
         result = self.service.assess(

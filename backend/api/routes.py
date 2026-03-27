@@ -1,8 +1,11 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 import logging
 import time
+import asyncio
+import json
+import re
 
 from adapters.finnhub_adapter import FinnhubAdapter
 from mt5.connector import MT5Connector, ConnectionParams
@@ -120,6 +123,9 @@ task_orchestrator = TaskOrchestrator(auto_trader)
 analytics_service = AnalyticsService()
 replay_service = ReplayService(signal_pipeline)
 RUNTIME_STATE_KEY = "runtime_controls_v1"
+CHAT_HISTORY_STATE_KEY = "chat_history_v1"
+DEFAULT_MARGIN_SL_PCT = 0.08
+DEFAULT_MARGIN_TP_PCT = 0.12
 
 
 def set_database(database: Database):
@@ -143,6 +149,37 @@ async def _persist_runtime_state():
     if db is None:
         return
     await db.save_runtime_state(RUNTIME_STATE_KEY, _runtime_state_payload())
+
+
+def _normalize_chat_history(messages: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for item in messages[-200:]:
+        role = str(item.get("role", "")).lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        normalized.append({"role": role, "content": content[:4000]})
+    return normalized
+
+
+async def _save_chat_history(messages: list[dict]):
+    if db is None:
+        return
+    await db.save_runtime_state(
+        CHAT_HISTORY_STATE_KEY,
+        {"messages": _normalize_chat_history(messages)},
+    )
+
+
+async def _load_chat_history() -> list[dict]:
+    if db is None:
+        return []
+    state = await db.get_runtime_state(CHAT_HISTORY_STATE_KEY)
+    if not state:
+        return []
+    return _normalize_chat_history(state.get("messages", []))
 
 
 async def restore_runtime_state():
@@ -313,6 +350,52 @@ def _policy_settings_response() -> dict:
         "universe": universe_service.summary_dict(),
         "event_providers": {
             "finnhub": finnhub_adapter.healthcheck(),
+        },
+    }
+
+
+def _extract_json_object(raw_text: str) -> dict:
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("Empty Gemini response")
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
+
+
+def _simple_trade_intent_fallback(message: str) -> dict:
+    text = (message or "").strip()
+    upper = text.upper()
+    action = "BUY" if "BUY" in upper else "SELL" if "SELL" in upper else ""
+    symbol_match = re.search(r"\b([A-Z]{3,10}(?:USD)?)\b", upper)
+    amount_match = re.search(r"\$?\s*(\d+(?:\.\d+)?)", upper)
+    if not action or not symbol_match or not amount_match:
+        return {
+            "reply": "I can help analyze the market. To request a trade, write for example: BUY XAUUSD 1000",
+            "intent": "chat",
+            "trade": None,
+        }
+    amount = float(amount_match.group(1))
+    return {
+        "reply": f"I prepared a {action} request for {symbol_match.group(1)} with ${amount:.2f} margin. Review and confirm.",
+        "intent": "trade_request",
+        "trade": {
+            "symbol": symbol_match.group(1),
+            "action": action,
+            "amount_usd": amount,
+            "stop_loss": None,
+            "take_profit": None,
+            "reason": "Parsed from request fallback.",
         },
     }
 
@@ -495,7 +578,7 @@ async def get_symbol_info(symbol: str):
 @router.get("/market/available-symbols")
 async def get_available_symbols(
     category: Optional[str] = None,
-    tradeable_only: bool = True,
+    tradeable_only: bool = False,
     include_inactive: bool = False,
 ):
     """Get all symbols available on the MT5 terminal, optionally filtered by category."""
@@ -772,6 +855,270 @@ async def calculate_volume(symbol: str, amount_usd: float):
     }
 
 
+def _derive_amount_based_sl_tp(
+    *,
+    action: str,
+    entry_price: float,
+    volume: float,
+    contract_size: float,
+    sl_amount_usd: float,
+    tp_amount_usd: float,
+    digits: int,
+) -> tuple[float, float]:
+    price_per_unit = volume * contract_size
+    if entry_price <= 0 or price_per_unit <= 0:
+        return 0.0, 0.0
+
+    sl_distance = sl_amount_usd / price_per_unit
+    tp_distance = tp_amount_usd / price_per_unit
+    action_upper = (action or "").upper()
+
+    if action_upper == "BUY":
+        sl = entry_price - sl_distance
+        tp = entry_price + tp_distance
+    else:
+        sl = entry_price + sl_distance
+        tp = entry_price - tp_distance
+
+    return round(sl, digits), round(tp, digits)
+
+
+def _build_trade_comment(
+    amount_usd: float | None,
+    sl_amount_usd: float | None = None,
+    tp_amount_usd: float | None = None,
+) -> str:
+    if amount_usd is None or amount_usd <= 0:
+        return "TradingAgent"
+    parts = [f"TA:${float(amount_usd):.2f}"]
+    if sl_amount_usd is not None and sl_amount_usd > 0:
+        parts.append(f"SLA:${float(sl_amount_usd):.2f}")
+    if tp_amount_usd is not None and tp_amount_usd > 0:
+        parts.append(f"TPA:${float(tp_amount_usd):.2f}")
+    return "|".join(parts)
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+async def _gemini_target_pct_adjustment(
+    *,
+    mode: str,
+    action: str,
+    range_pct: float,
+    drift_pct: float,
+    drift_aligned: bool,
+    category: str,
+    quality: float,
+    threshold: float,
+    news_bias: str,
+    event_risk: str,
+    contradiction_flag: bool,
+) -> tuple[float, float]:
+    if not gemini_agent.available or getattr(gemini_agent, "_client", None) is None:
+        return 0.0, 0.0
+    try:
+        from google.genai import types as genai_types
+
+        prompt_payload = {
+            "task": "Adjust SL/TP percentages for one trade in a bounded way.",
+            "risk_mode": mode,
+            "action": action,
+            "chart_last_hours": {
+                "range_pct": range_pct,
+                "drift_pct": drift_pct,
+                "drift_aligned_with_action": drift_aligned,
+            },
+            "context": {
+                "category": category,
+                "trade_quality": quality,
+                "quality_threshold": threshold,
+                "news_bias": news_bias,
+                "event_risk": event_risk,
+                "contradiction_flag": contradiction_flag,
+            },
+            "constraints": {
+                "sl_delta_pct_min": -0.02,
+                "sl_delta_pct_max": 0.03,
+                "tp_delta_pct_min": -0.03,
+                "tp_delta_pct_max": 0.06,
+            },
+            "output_schema": {
+                "sl_delta_pct": "number",
+                "tp_delta_pct": "number",
+            },
+        }
+        system_instruction = (
+            "Return JSON only. You are a bounded risk assistant. "
+            "Do not output absolute prices. Output only sl_delta_pct and tp_delta_pct."
+        )
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                gemini_agent._client.models.generate_content,
+                model="gemini-2.5-flash",
+                contents=[{"role": "user", "parts": [{"text": json.dumps(prompt_payload, ensure_ascii=True)}]}],
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                ),
+            ),
+            timeout=5.0,
+        )
+        parsed = _extract_json_object((response.text or "").strip())
+        sl_delta = _clamp(float(parsed.get("sl_delta_pct", 0.0)), -0.02, 0.03)
+        tp_delta = _clamp(float(parsed.get("tp_delta_pct", 0.0)), -0.03, 0.06)
+        return sl_delta, tp_delta
+    except Exception as exc:
+        logger.warning("Gemini SL/TP adjustment unavailable: %s", exc)
+        return 0.0, 0.0
+
+
+async def _derive_dynamic_amount_targets(
+    *,
+    amount_usd: float,
+    action: str,
+    decision=None,
+) -> tuple[float, float]:
+    """
+    Build default SL/TP dollar targets from:
+    - user risk mode
+    - trade quality score vs threshold
+    - Gemini/news assessment
+    - asset category/profile
+    - policy minimum reward:risk
+    """
+    mode = (risk_engine.user_policy.mode or "balanced").lower()
+    min_rr = max(1.0, float(risk_engine.user_policy.min_reward_risk or 1.8))
+
+    base_by_mode = {
+        "safe": (0.05, 0.09),
+        "balanced": (0.07, 0.12),
+        "aggressive": (0.09, 0.16),
+    }
+    sl_pct, tp_pct = base_by_mode.get(mode, (0.07, 0.12))
+
+    if decision is not None:
+        # 1) Last-hours chart behavior (explicit volatility + directional push)
+        range_pct = 0.0
+        drift_pct = 0.0
+        drift_aligned = True
+        try:
+            h1_bars = (
+                decision.signal_decision.market_context.bars_by_timeframe.get("H1", [])
+                if decision.signal_decision.market_context and decision.signal_decision.market_context.bars_by_timeframe
+                else []
+            )
+            if len(h1_bars) >= 6:
+                recent = h1_bars[-6:]
+                highs = [float(b.get("high", 0.0)) for b in recent]
+                lows = [float(b.get("low", 0.0)) for b in recent]
+                closes = [float(b.get("close", 0.0)) for b in recent]
+                avg_close = sum(closes) / max(len(closes), 1)
+                if avg_close > 0:
+                    range_pct = ((max(highs) - min(lows)) / avg_close) * 100.0
+                    drift = closes[-1] - closes[0]
+                    drift_pct = (abs(drift) / avg_close) * 100.0
+                    drift_aligned = (action == "BUY" and drift > 0) or (action == "SELL" and drift < 0)
+
+                    if range_pct >= 1.2:
+                        sl_pct += 0.02
+                        tp_pct += 0.03
+                    elif range_pct >= 0.8:
+                        sl_pct += 0.01
+                        tp_pct += 0.015
+                    elif range_pct <= 0.35:
+                        sl_pct -= 0.01
+                        tp_pct -= 0.015
+
+                    if drift_pct >= 0.25 and drift_aligned:
+                        tp_pct += 0.01
+                    elif drift_pct >= 0.25 and not drift_aligned:
+                        sl_pct += 0.005
+                        tp_pct -= 0.01
+        except Exception:
+            pass
+
+        # 2) Trade quality + Gemini/news + profile context
+        quality = float(getattr(decision.trade_quality_assessment, "final_trade_quality_score", 0.0) or 0.0)
+        threshold = float(getattr(decision.trade_quality_assessment, "threshold", 0.75) or 0.75)
+        quality_edge = quality - threshold
+
+        if quality_edge >= 0.10:
+            sl_pct -= 0.01
+            tp_pct += 0.03
+        elif quality_edge >= 0.04:
+            sl_pct -= 0.005
+            tp_pct += 0.015
+        elif quality_edge <= -0.05:
+            sl_pct += 0.015
+            tp_pct -= 0.02
+
+        gemini = decision.signal_decision.gemini_confirmation
+        if gemini is None or getattr(gemini, "degraded", False):
+            sl_pct += 0.01
+            tp_pct -= 0.01
+        else:
+            event_risk = str(getattr(gemini, "event_risk", "low")).lower()
+            contradiction = bool(getattr(gemini, "contradiction_flag", False))
+            news_bias = str(getattr(gemini, "news_bias", "neutral")).lower()
+            aligned_bias = (
+                (action == "BUY" and news_bias == "bullish")
+                or (action == "SELL" and news_bias == "bearish")
+            )
+            if event_risk == "high" or contradiction:
+                sl_pct += 0.015
+                tp_pct -= 0.02
+            elif aligned_bias and event_risk == "low":
+                tp_pct += 0.01
+
+        category = ""
+        if decision.signal_decision.market_context.profile is not None:
+            category = str(decision.signal_decision.market_context.profile.category or "")
+        elif decision.signal_decision.market_context.symbol_info is not None:
+            category = str(decision.signal_decision.market_context.symbol_info.category or "")
+        category = category.title()
+        if category == "Commodities":
+            sl_pct += 0.01
+            tp_pct += 0.015
+        elif category == "Stocks":
+            sl_pct += 0.005
+            tp_pct += 0.01
+        elif category == "Indices":
+            sl_pct += 0.005
+            tp_pct += 0.008
+
+        # 3) Gemini bounded adjustment with explicit last-two factors input.
+        gemini = decision.signal_decision.gemini_confirmation
+        sl_delta, tp_delta = await _gemini_target_pct_adjustment(
+            mode=mode,
+            action=action,
+            range_pct=range_pct,
+            drift_pct=drift_pct,
+            drift_aligned=drift_aligned,
+            category=category or "Other",
+            quality=quality,
+            threshold=threshold,
+            news_bias=str(getattr(gemini, "news_bias", "neutral")).lower() if gemini else "neutral",
+            event_risk=str(getattr(gemini, "event_risk", "low")).lower() if gemini else "low",
+            contradiction_flag=bool(getattr(gemini, "contradiction_flag", False)) if gemini else False,
+        )
+        sl_pct += sl_delta
+        tp_pct += tp_delta
+
+    sl_pct = _clamp(sl_pct, 0.03, 0.15)
+    tp_pct = _clamp(tp_pct, 0.06, 0.35)
+
+    # Enforce policy reward:risk requirement for default targets.
+    tp_pct = max(tp_pct, sl_pct * min_rr)
+    tp_pct = _clamp(tp_pct, 0.06, 0.40)
+
+    sl_amount = amount_usd * sl_pct
+    tp_amount = amount_usd * tp_pct
+    return sl_amount, tp_amount
+
+
 class QuickBuyRequest(BaseModel):
     symbol: str
     amount_usd: float
@@ -802,6 +1149,18 @@ async def quick_buy(req: QuickBuyRequest):
     if action not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="Action must be BUY or SELL")
 
+    decision_for_targets = None
+    try:
+        decision_for_targets = await signal_pipeline.evaluate(
+            symbol=symbol,
+            requested_agent_name=active_agent_name,
+            requested_timeframe="H1",
+            evaluation_mode="manual",
+            bar_count=100,
+        )
+    except Exception as exc:
+        logger.warning("Could not build dynamic SL/TP context for quick trade %s: %s", symbol, exc)
+
     is_buy = action == "BUY"
     price = tick.ask if is_buy else tick.bid
     contract_size = sym_info.get("trade_contract_size", 100000)
@@ -821,20 +1180,39 @@ async def quick_buy(req: QuickBuyRequest):
         raw_volume = round(raw_volume / vol_step) * vol_step
     volume = max(raw_volume, vol_min)
 
-    # Auto-calculate SL and TP using ATR-like approach
-    h1_bars = market_data.get_bars(symbol, "H1", 20)
-    if h1_bars and len(h1_bars) >= 5:
-        ranges = [b.high - b.low for b in h1_bars[-14:]]
-        atr = sum(ranges) / len(ranges)
-    else:
-        atr = price * 0.01  # Default 1% if no bars
+    digits = sym_info.get("digits", 5)
+    sl = req.custom_stop_loss if req.custom_stop_loss and req.custom_stop_loss > 0 else None
+    tp = req.custom_take_profit if req.custom_take_profit and req.custom_take_profit > 0 else None
+    sl_amount_for_comment: float | None = None
+    tp_amount_for_comment: float | None = None
 
-    if is_buy:
-        sl = req.custom_stop_loss if req.custom_stop_loss and req.custom_stop_loss > 0 else round(price - atr * 1.5, sym_info.get("digits", 5))
-        tp = req.custom_take_profit if req.custom_take_profit and req.custom_take_profit > 0 else round(price + atr * 2.0, sym_info.get("digits", 5))
-    else:  # SELL
-        sl = req.custom_stop_loss if req.custom_stop_loss and req.custom_stop_loss > 0 else round(price + atr * 1.5, sym_info.get("digits", 5))
-        tp = req.custom_take_profit if req.custom_take_profit and req.custom_take_profit > 0 else round(price - atr * 2.0, sym_info.get("digits", 5))
+    if sl is None or tp is None:
+        # Dynamic defaults from mode + trade quality + Gemini/news + symbol profile.
+        sl_amount, tp_amount = await _derive_dynamic_amount_targets(
+            amount_usd=req.amount_usd,
+            action=action,
+            decision=decision_for_targets,
+        )
+        sl_amount_for_comment = sl_amount
+        tp_amount_for_comment = tp_amount
+        default_sl, default_tp = _derive_amount_based_sl_tp(
+            action=action,
+            entry_price=price,
+            volume=volume,
+            contract_size=contract_size,
+            sl_amount_usd=sl_amount,
+            tp_amount_usd=tp_amount,
+            digits=digits,
+        )
+        if sl is None:
+            sl = default_sl
+        if tp is None:
+            tp = default_tp
+
+    if sl_amount_for_comment is None and sl is not None and sl > 0:
+        sl_amount_for_comment = abs(price - sl) * volume * contract_size
+    if tp_amount_for_comment is None and tp is not None and tp > 0:
+        tp_amount_for_comment = abs(tp - price) * volume * contract_size
 
     # Validate SL/TP minimum distance (STOPLEVEL + spread)
     point = sym_info.get("point", 0.00001)
@@ -842,8 +1220,6 @@ async def quick_buy(req: QuickBuyRequest):
     spread_points = tick.spread if tick else 10
     effective_stops = max(stops_level, spread_points, 10)
     min_distance = effective_stops * point * 1.5  # 50% buffer for spread fluctuation
-    digits = sym_info.get("digits", 5)
-
     if sl and abs(price - sl) < min_distance:
         min_sl_dollars = round(min_distance * volume * contract_size, 2)
         raise HTTPException(
@@ -869,7 +1245,7 @@ async def quick_buy(req: QuickBuyRequest):
     order_req = OrderRequest(
         symbol=symbol, action=action,
         volume=volume, stop_loss=sl, take_profit=tp,
-        comment=f"TA:${int(req.amount_usd)}",
+        comment=_build_trade_comment(req.amount_usd, sl_amount_for_comment, tp_amount_for_comment),
     )
     quick_preflight = await execution_service.preflight(
         symbol=symbol,
@@ -893,6 +1269,7 @@ async def quick_buy(req: QuickBuyRequest):
             stop_loss=sl, take_profit=tp, ticket=result.ticket,
             retcode=result.retcode, retcode_desc=result.retcode_desc,
             success=result.success,
+            comment=order_req.comment,
         )
         if result.success and result.ticket:
             decision = await signal_pipeline.evaluate(
@@ -907,6 +1284,208 @@ async def quick_buy(req: QuickBuyRequest):
                 await db.mark_evaluation_outcome(signal_id, "opened")
 
     return result.model_dump()
+
+
+class ChatMessageItem(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatTradeRequest(BaseModel):
+    symbol: str
+    action: Literal["BUY", "SELL"]
+    amount_usd: float
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    reason: Optional[str] = None
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[ChatMessageItem] = []
+    execute_trade: bool = False
+
+
+class ChatHistoryRequest(BaseModel):
+    messages: list[ChatMessageItem] = []
+
+
+@router.get("/chat/history")
+async def get_chat_history():
+    return {"messages": await _load_chat_history()}
+
+
+@router.post("/chat/history")
+async def save_chat_history(req: ChatHistoryRequest):
+    await _save_chat_history([item.model_dump() for item in req.messages])
+    return {"saved": True}
+
+
+@router.delete("/chat/history")
+async def clear_chat_history():
+    await _save_chat_history([])
+    return {"cleared": True}
+
+
+@router.post("/chat/message")
+async def chat_message(req: ChatRequest):
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    system_prompt = """
+You are an AI trading copilot inside a demo trading app.
+Return STRICT JSON only:
+{
+  "reply": "string",
+  "intent": "chat" | "trade_request",
+  "trade": {
+    "symbol": "string",
+    "action": "BUY" | "SELL",
+    "amount_usd": number,
+    "stop_loss": number|null,
+    "take_profit": number|null,
+    "reason": "string"
+  } | null
+}
+If details are missing, set intent=chat and ask a short follow-up.
+Never promise guaranteed profits.
+"""
+
+    payload = {
+        "history": [item.model_dump() for item in req.history[-10:]],
+        "message": message,
+        "policy_mode": risk_engine.user_policy.mode,
+        "auto_trade_min_confidence": risk_engine.settings.auto_trade_min_confidence,
+        "connected": connector.connected,
+    }
+
+    parsed: dict
+    if gemini_agent.available and getattr(gemini_agent, "_client", None) is not None:
+        try:
+            from google.genai import types as genai_types
+
+            response = await asyncio.to_thread(
+                gemini_agent._client.models.generate_content,
+                model="gemini-2.5-flash",
+                contents=[{"role": "user", "parts": [{"text": json.dumps(payload, ensure_ascii=True)}]}],
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                ),
+            )
+            parsed = _extract_json_object((response.text or "").strip())
+        except Exception as exc:
+            logger.warning("Gemini chat failed, using fallback parser: %s", exc)
+            parsed = _simple_trade_intent_fallback(message)
+    else:
+        parsed = _simple_trade_intent_fallback(message)
+
+    intent = str(parsed.get("intent", "chat")).lower()
+    reply = str(parsed.get("reply", "Done."))
+    trade_payload = parsed.get("trade")
+
+    trade_preview = None
+    order_result = None
+    normalized_trade_request = None
+
+    if intent == "trade_request" and trade_payload:
+        trade_req = ChatTradeRequest(**trade_payload)
+        symbol = _resolve_market_symbol(trade_req.symbol)
+        normalized_trade_request = {**trade_req.model_dump(), "symbol": symbol}
+
+        if not connector.connected:
+            reply = "Trade request detected, but MT5 is not connected. Connect first, then confirm execution."
+        else:
+            tick = market_data.get_tick(symbol)
+            sym_info = market_data.get_symbol_info(symbol)
+            if tick and sym_info:
+                side_price = tick.ask if trade_req.action == "BUY" else tick.bid
+                account_info = connector.refresh_account()
+                leverage = account_info.leverage if account_info else 1
+                contract_size = sym_info.get("trade_contract_size", 100000)
+                vol_step = sym_info.get("volume_step", 0.01)
+                vol_min = sym_info.get("volume_min", 0.01)
+
+                raw_volume = (
+                    (trade_req.amount_usd * leverage) / (side_price * contract_size)
+                    if side_price > 0 and contract_size > 0
+                    else vol_min
+                )
+                if vol_step > 0:
+                    raw_volume = round(raw_volume / vol_step) * vol_step
+                volume = max(raw_volume, vol_min)
+
+                decision_for_targets = None
+                try:
+                    decision_for_targets = await signal_pipeline.evaluate(
+                        symbol=symbol,
+                        requested_agent_name=active_agent_name,
+                        requested_timeframe="H1",
+                        evaluation_mode="manual",
+                        bar_count=100,
+                    )
+                except Exception as exc:
+                    logger.warning("Could not build dynamic SL/TP context for chat trade %s: %s", symbol, exc)
+
+                sl_amount, tp_amount = await _derive_dynamic_amount_targets(
+                    amount_usd=trade_req.amount_usd,
+                    action=trade_req.action,
+                    decision=decision_for_targets,
+                )
+                # Safety: chat trades always use amount-based defaults for SL/TP,
+                # derived from risk/news/quality context (not raw model prices).
+                sl, tp = _derive_amount_based_sl_tp(
+                    action=trade_req.action,
+                    entry_price=side_price,
+                    volume=volume,
+                    contract_size=contract_size,
+                    sl_amount_usd=sl_amount,
+                    tp_amount_usd=tp_amount,
+                    digits=sym_info.get("digits", 5),
+                )
+
+                trade_preview = {
+                    "symbol": symbol,
+                    "action": trade_req.action,
+                    "amount_usd": trade_req.amount_usd,
+                    "estimated_entry": side_price,
+                    "estimated_volume": round(volume, 4),
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "reason": trade_req.reason,
+                }
+
+                if req.execute_trade:
+                    order_result = await quick_buy(
+                        QuickBuyRequest(
+                            symbol=symbol,
+                            amount_usd=trade_req.amount_usd,
+                            action=trade_req.action,
+                            custom_stop_loss=sl,
+                            custom_take_profit=tp,
+                        )
+                    )
+                    if order_result.get("success"):
+                        reply = f"Trade executed: {trade_req.action} {symbol} with ${trade_req.amount_usd:.2f} margin."
+            else:
+                reply = f"I detected a trade request, but {symbol} is not currently tradable."
+
+    # Persist chat state so it survives reload/restart.
+    persisted_history = [item.model_dump() for item in req.history]
+    persisted_history.append({"role": "user", "content": message})
+    persisted_history.append({"role": "assistant", "content": reply})
+    await _save_chat_history(persisted_history)
+
+    return {
+        "reply": reply,
+        "intent": "trade_request" if intent == "trade_request" else "chat",
+        "trade_request": normalized_trade_request,
+        "trade_preview": trade_preview,
+        "order_result": order_result,
+        "executed": bool(order_result and order_result.get("success")),
+    }
 
 
 class ExecuteTradeRequest(BaseModel):
@@ -972,6 +1551,7 @@ async def execute_trade(req: ExecuteTradeRequest):
             retcode=result.retcode,
             retcode_desc=result.retcode_desc,
             success=result.success,
+            comment=order_req.comment,
         )
         if result.success and result.ticket:
             await db.log_position_change(
@@ -1097,8 +1677,198 @@ async def get_logs(limit: int = 100, log_type: str = "all"):
 @router.get("/trade-history")
 async def get_trade_history(limit: int = 50):
     if db is None:
-        return []
-    return await db.get_trade_history(limit)
+        return {
+            "summary": {
+                "total_trades": 0,
+                "closed_trades": 0,
+                "open_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "breakeven_trades": 0,
+                "win_rate_pct": 0.0,
+                "total_profit_usd": 0.0,
+                "avg_profit_per_closed_trade_usd": 0.0,
+                "total_started_capital_usd": 0.0,
+                "roi_pct": None,
+                "best_trade_usd": 0.0,
+                "worst_trade_usd": 0.0,
+            },
+            "trades": [],
+        }
+
+    raw_orders = await db.get_trade_history(max(limit * 4, 100))
+    outcomes = await db.get_trade_outcomes(max(limit * 4, 100))
+
+    account = connector.refresh_account() if connector.connected else None
+    leverage = float(getattr(account, "leverage", 100) or 100)
+
+    def _to_float(v, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def _extract_started_amount(comment: str | None, signal_reason: str | None):
+        for text in (comment or "", signal_reason or ""):
+            m = re.search(r"TA:\$(\d+(?:\.\d+)?)|\$(\d+(?:\.\d+)?)", text or "", re.IGNORECASE)
+            if m:
+                value = m.group(1) or m.group(2)
+                if value:
+                    return float(value), "provided"
+        return None, "unknown"
+
+    def _extract_comment_named_amount(comment: str | None, key: str) -> Optional[float]:
+        m = re.search(rf"{key}:\$(\d+(?:\.\d+)?)", comment or "", re.IGNORECASE)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    def _duration_minutes(opened_at: float, closed_at: Optional[float]) -> Optional[float]:
+        if opened_at <= 0:
+            return None
+        if closed_at is None:
+            return max(0.0, (time.time() - opened_at) / 60.0)
+        return max(0.0, (closed_at - opened_at) / 60.0)
+
+    outcome_by_ticket: dict[int, dict] = {}
+    outcome_by_signal: dict[int, dict] = {}
+    for outcome in outcomes:
+        ticket = outcome.get("ticket")
+        signal_id = outcome.get("signal_id")
+        if isinstance(ticket, int) and ticket not in outcome_by_ticket:
+            outcome_by_ticket[ticket] = outcome
+        if isinstance(signal_id, int) and signal_id not in outcome_by_signal:
+            outcome_by_signal[signal_id] = outcome
+
+    trades: list[dict] = []
+    for row in raw_orders:
+        action = str(row.get("action", "")).upper()
+        if action not in {"BUY", "SELL"}:
+            continue
+        if not bool(row.get("success", 0)):
+            continue
+
+        symbol = str(row.get("symbol", "")).upper()
+        ticket = row.get("ticket")
+        signal_id = row.get("signal_id")
+        opened_at = _to_float(row.get("timestamp"), 0.0)
+        entry_price = _to_float(row.get("price"), 0.0)
+        volume = _to_float(row.get("volume"), 0.0)
+        stop_loss = _to_float(row.get("stop_loss"), 0.0)
+        take_profit = _to_float(row.get("take_profit"), 0.0)
+
+        outcome = None
+        if isinstance(ticket, int):
+            outcome = outcome_by_ticket.get(ticket)
+        if outcome is None and isinstance(signal_id, int):
+            candidate = outcome_by_signal.get(signal_id)
+            if candidate and str(candidate.get("symbol", "")).upper() == symbol:
+                outcome = candidate
+
+        closed_at = _to_float(outcome.get("closed_at"), 0.0) if outcome else 0.0
+        closed_at_value = closed_at if closed_at > 0 else None
+        profit = _to_float(outcome.get("profit"), 0.0) if outcome else None
+        status = "closed" if outcome else "open"
+        exit_reason = str(outcome.get("exit_reason", "")) if outcome else ""
+
+        info = market_data.get_symbol_info(symbol) or {}
+        contract_size = _to_float(info.get("trade_contract_size"), 0.0)
+        if contract_size <= 0:
+            contract_size = None
+
+        started_with, started_source = _extract_started_amount(row.get("comment"), row.get("signal_reason"))
+        if (
+            started_with is None
+            and contract_size is not None
+            and entry_price > 0
+            and volume > 0
+        ):
+            started_with = (entry_price * volume * contract_size) / max(leverage, 1.0)
+            started_source = "estimated"
+
+        ended_with = None
+        if started_with is not None and profit is not None:
+            ended_with = started_with + profit
+
+        profit_pct = None
+        if started_with and profit is not None and started_with != 0:
+            profit_pct = (profit / started_with) * 100.0
+
+        sl_amount = _extract_comment_named_amount(row.get("comment"), "SLA")
+        tp_amount = _extract_comment_named_amount(row.get("comment"), "TPA")
+        sl_pct = None
+        tp_pct = None
+        if sl_amount is None and stop_loss > 0 and entry_price > 0 and volume > 0 and contract_size is not None:
+            sl_amount = abs(entry_price - stop_loss) * volume * contract_size
+        if tp_amount is None and take_profit > 0 and entry_price > 0 and volume > 0 and contract_size is not None:
+            tp_amount = abs(take_profit - entry_price) * volume * contract_size
+        if started_with and started_with > 0 and sl_amount is not None:
+            sl_pct = (sl_amount / started_with) * 100.0
+        if started_with and started_with > 0 and tp_amount is not None:
+            tp_pct = (tp_amount / started_with) * 100.0
+
+        trades.append(
+            {
+                "ticket": ticket,
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "action": action,
+                "status": status,
+                "opened_at": opened_at,
+                "closed_at": closed_at_value,
+                "duration_minutes": _duration_minutes(opened_at, closed_at_value),
+                "volume": volume,
+                "entry_price": entry_price if entry_price > 0 else None,
+                "stop_loss": stop_loss if stop_loss > 0 else None,
+                "take_profit": take_profit if take_profit > 0 else None,
+                "profit_usd": profit,
+                "profit_pct": profit_pct,
+                "started_with_usd": started_with,
+                "ended_with_usd": ended_with,
+                "entry_market_value_usd": (entry_price * volume * contract_size) if (entry_price > 0 and contract_size is not None) else None,
+                "sl_amount_usd": sl_amount,
+                "tp_amount_usd": tp_amount,
+                "sl_pct_of_start": sl_pct,
+                "tp_pct_of_start": tp_pct,
+                "started_with_source": started_source,
+                "agent_name": row.get("agent_name"),
+                "signal_confidence": row.get("confidence"),
+                "signal_reason": row.get("signal_reason"),
+                "risk_approved": row.get("approved"),
+                "risk_reason": row.get("risk_reason"),
+                "exit_reason": exit_reason or None,
+            }
+        )
+        if len(trades) >= limit:
+            break
+
+    closed = [t for t in trades if t.get("status") == "closed" and t.get("profit_usd") is not None]
+    wins = [t for t in closed if _to_float(t.get("profit_usd")) > 0]
+    losses = [t for t in closed if _to_float(t.get("profit_usd")) < 0]
+    breakeven = [t for t in closed if _to_float(t.get("profit_usd")) == 0]
+    total_profit = sum(_to_float(t.get("profit_usd")) for t in closed)
+    total_started = sum(_to_float(t.get("started_with_usd")) for t in closed if t.get("started_with_usd") is not None)
+
+    summary = {
+        "total_trades": len(trades),
+        "closed_trades": len(closed),
+        "open_trades": len([t for t in trades if t.get("status") == "open"]),
+        "winning_trades": len(wins),
+        "losing_trades": len(losses),
+        "breakeven_trades": len(breakeven),
+        "win_rate_pct": (len(wins) / len(closed) * 100.0) if closed else 0.0,
+        "total_profit_usd": total_profit,
+        "avg_profit_per_closed_trade_usd": (total_profit / len(closed)) if closed else 0.0,
+        "total_started_capital_usd": total_started,
+        "roi_pct": (total_profit / total_started * 100.0) if total_started > 0 else None,
+        "best_trade_usd": max((_to_float(t.get("profit_usd")) for t in closed), default=0.0),
+        "worst_trade_usd": min((_to_float(t.get("profit_usd")) for t in closed), default=0.0),
+    }
+
+    return {"summary": summary, "trades": trades}
 
 
 # --- Credentials Routes ---
@@ -1199,33 +1969,36 @@ async def smart_evaluate(req: SmartEvaluateRequest):
     if not connector.connected:
         raise HTTPException(status_code=400, detail="Not connected")
 
+    MAX_SCAN_SYMBOLS = 80
     symbols = req.symbols or risk_engine.settings.allowed_symbols
+    market_universe = universe_service.filter_market_symbols(
+        market_data.get_all_symbols(),
+        include_inactive=False,
+    )
+    symbol_lookup = {
+        (item.get("name") or ""): item
+        for item in market_universe
+        if item.get("name")
+    }
 
-    # If no symbols configured, use defaults but don't overwrite settings
     if not symbols:
-        logger.info("No symbols configured, using active event-driven universe from MT5 for scan...")
-        tradeable = universe_service.filter_market_symbols(market_data.get_tradeable_symbols())
-        if tradeable:
-            symbols = universe_service.candidate_universe(tradeable)
-        else:
-            visible = universe_service.filter_market_symbols(
-                [s for s in market_data.get_visible_symbols() if s["trade_enabled"]]
-            )
-            symbols = universe_service.candidate_universe(visible)
-        # NOTE: Don't save to settings — manual scan should show everything
-        # but auto-trade uses only the curated allowed_symbols list
+        symbols = [item.get("name", "") for item in market_universe if item.get("name")]
+        symbols = [name for name in symbols if name][:MAX_SCAN_SYMBOLS]
     else:
-        symbols = universe_service.restrict_symbols(symbols)
+        symbols = universe_service.restrict_symbols(symbols)[:MAX_SCAN_SYMBOLS]
 
     recommendations = []
     for sym in symbols:
         try:
-            execution_decision = await signal_pipeline.evaluate(
-                symbol=sym,
-                requested_agent_name="GeminiAgent",
-                requested_timeframe="H1",
-                evaluation_mode="scan",
-                bar_count=100,
+            execution_decision = await asyncio.wait_for(
+                signal_pipeline.evaluate(
+                    symbol=sym,
+                    requested_agent_name="SmartAgent",
+                    requested_timeframe="H1",
+                    evaluation_mode="scan",
+                    bar_count=100,
+                ),
+                timeout=6.0,
             )
             signal_id = await signal_pipeline.persist_evaluation(execution_decision, "multi")
             signal = execution_decision.signal_decision.final_signal
@@ -1254,11 +2027,36 @@ async def smart_evaluate(req: SmartEvaluateRequest):
                 else None,
                 "execution_reason": execution_decision.reason,
             })
-        except Exception as e:
-            logger.error(f"Smart evaluate error for {sym}: {e}")
-            continue
+        except Exception as exc:
+            logger.error("Smart evaluate error for %s: %s", sym, exc)
+            symbol_info = symbol_lookup.get(sym, {})
+            recommendations.append({
+                "symbol": sym,
+                "signal": {
+                    "action": "HOLD",
+                    "confidence": 0.0,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "max_holding_minutes": None,
+                    "reason": "No executable market data right now.",
+                },
+                "signal_id": None,
+                "risk_decision": {
+                    "approved": False,
+                    "reason": "No executable market data right now.",
+                    "adjusted_volume": 0.0,
+                    "warnings": [],
+                },
+                "entry_price_estimate": float(symbol_info.get("bid") or 0.0),
+                "explanation": "Symbol is listed, but cannot be executed now (market closed or missing live quote/history).",
+                "ready_to_execute": False,
+                "category": universe_service.normalize_asset_class(symbol_info.get("category")),
+                "description": symbol_info.get("description", ""),
+                "degraded_reasons": ["scan_error"],
+                "gemini_confirmation": None,
+                "execution_reason": "Symbol unavailable for execution in current market conditions.",
+            })
 
-    # Sort by trade quality, actionable first
     recommendations.sort(
         key=lambda r: (
             r["ready_to_execute"],
@@ -1268,7 +2066,6 @@ async def smart_evaluate(req: SmartEvaluateRequest):
         reverse=True,
     )
 
-    import time
     return {
         "recommendations": recommendations,
         "scanned_at": time.time(),
@@ -1327,6 +2124,8 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
     sl = req.custom_stop_loss if req.custom_stop_loss and req.custom_stop_loss > 0 else current_signal.stop_loss
     tp = req.custom_take_profit if req.custom_take_profit and req.custom_take_profit > 0 else current_signal.take_profit
     volume = decision.risk_evaluation.adjusted_volume or risk_engine.settings.fixed_lot_size
+    sl_amount_for_comment: float | None = None
+    tp_amount_for_comment: float | None = None
 
     # Convert dollar amount to volume if provided
     tick = market_data.get_tick(symbol)
@@ -1350,6 +2149,35 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
                 volume,
                 symbol,
             )
+            if req.custom_stop_loss is None or req.custom_take_profit is None:
+                sl_amount, tp_amount = await _derive_dynamic_amount_targets(
+                    amount_usd=req.amount_usd,
+                    action=action,
+                    decision=decision,
+                )
+                sl_amount_for_comment = sl_amount
+                tp_amount_for_comment = tp_amount
+                default_sl, default_tp = _derive_amount_based_sl_tp(
+                    action=action,
+                    entry_price=price,
+                    volume=volume,
+                    contract_size=contract_size,
+                    sl_amount_usd=sl_amount,
+                    tp_amount_usd=tp_amount,
+                    digits=sym_info.get("digits", 5),
+                )
+                if req.custom_stop_loss is None:
+                    sl = default_sl
+                if req.custom_take_profit is None:
+                    tp = default_tp
+
+    if req.amount_usd and req.amount_usd > 0 and tick and sym_info:
+        entry_ref_price = tick.ask if action == "BUY" else tick.bid
+        contract_size_for_comment = float(sym_info.get("trade_contract_size", 100000) or 100000)
+        if sl_amount_for_comment is None and sl is not None and sl > 0:
+            sl_amount_for_comment = abs(entry_ref_price - sl) * volume * contract_size_for_comment
+        if tp_amount_for_comment is None and tp is not None and tp > 0:
+            tp_amount_for_comment = abs(tp - entry_ref_price) * volume * contract_size_for_comment
 
     execution_guard = await _pre_execution_checks(
         symbol=symbol,
@@ -1385,7 +2213,7 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
                 detail=f"Take Profit too close to price. Minimum ~${min_tp_dollars:.2f} for your position.",
             )
 
-    amt_label = f"TA:${int(req.amount_usd)}" if req.amount_usd and req.amount_usd > 0 else "TradingAgent"
+    amt_label = _build_trade_comment(req.amount_usd, sl_amount_for_comment, tp_amount_for_comment)
     order_req = OrderRequest(
         symbol=symbol,
         action=action,
@@ -1403,6 +2231,7 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
             stop_loss=sl, take_profit=tp, ticket=result.ticket,
             retcode=result.retcode, retcode_desc=result.retcode_desc,
             success=result.success,
+            comment=order_req.comment,
         )
         if result.success and result.ticket:
             await db.log_position_change(

@@ -531,16 +531,23 @@ function PositionCard({ position, currency, onClose, leverage = 100 }: { positio
     const distance = Math.abs(position.price_open - priceLevel);
     return distance * position.volume * contractSize;
   };
-  const slDollars = position.stop_loss > 0 ? calcDollarDistance(position.stop_loss) : null;
-  const tpDollars = position.take_profit > 0 ? calcDollarDistance(position.take_profit) : null;
+  const commentAmount = position.comment?.match(/TA:\$(\d+(?:\.\d+)?)/)?.[1];
+  const commentSlAmount = position.comment?.match(/SLA:\$(\d+(?:\.\d+)?)/)?.[1];
+  const commentTpAmount = position.comment?.match(/TPA:\$(\d+(?:\.\d+)?)/)?.[1];
+  const slDollars = commentSlAmount ? parseFloat(commentSlAmount) : (position.stop_loss > 0 ? calcDollarDistance(position.stop_loss) : null);
+  const tpDollars = commentTpAmount ? parseFloat(commentTpAmount) : (position.take_profit > 0 ? calcDollarDistance(position.take_profit) : null);
 
   // Calculate investment amount — use comment if available, otherwise compute from position data
-  const commentAmount = position.comment?.match(/TA:\$(\d+)/)?.[1];
   const computedInvestment = contractSize
     ? Math.round(position.volume * position.price_open * contractSize / leverage)
     : 0;
   const investedNum = commentAmount ? parseFloat(commentAmount) : computedInvestment;
   const currentValue = investedNum > 0 ? investedNum + position.profit : 0;
+  const slTargetValue = investedNum > 0 && slDollars != null ? Math.max(0, investedNum - slDollars) : null;
+  const tpTargetValue = investedNum > 0 && tpDollars != null ? investedNum + tpDollars : null;
+  const slPct = investedNum > 0 && slDollars != null ? (slDollars / investedNum) * 100 : null;
+  const tpPct = investedNum > 0 && tpDollars != null ? (tpDollars / investedNum) * 100 : null;
+  const slExceedsStart = investedNum > 0 && slDollars != null && slDollars > investedNum;
 
   const handleClose = async () => {
     setClosing(true);
@@ -626,10 +633,16 @@ function PositionCard({ position, currency, onClose, leverage = 100 }: { positio
           <span>
             <span style={{ fontWeight: 600, color: 'var(--accent-red)' }}>SL:</span>{' '}
             <span className="font-mono" style={{ color: 'var(--accent-red)' }}>
-              {slDollars != null ? `-$${slDollars.toFixed(2)}` : position.stop_loss.toFixed(digs)}
+              {slExceedsStart
+                ? `Risk > $${investedNum.toFixed(0)}`
+                : (slTargetValue != null ? `$${slTargetValue.toFixed(2)}` : (slDollars != null ? `-$${slDollars.toFixed(2)}` : position.stop_loss.toFixed(digs)))}
             </span>
             {slDollars != null && (
-              <span className="text-muted" style={{ fontSize: 10 }}> ({position.stop_loss.toFixed(digs)})</span>
+              <span className="text-muted" style={{ fontSize: 10 }}>
+                {` (-$${slDollars.toFixed(2)}`}
+                {slPct != null ? `, -${slPct.toFixed(1)}%` : ''}
+                {`) (${position.stop_loss.toFixed(digs)})`}
+              </span>
             )}
           </span>
         )}
@@ -637,10 +650,14 @@ function PositionCard({ position, currency, onClose, leverage = 100 }: { positio
           <span>
             <span style={{ fontWeight: 600, color: 'var(--accent-green)' }}>TP:</span>{' '}
             <span className="font-mono" style={{ color: 'var(--accent-green)' }}>
-              {tpDollars != null ? `+$${tpDollars.toFixed(2)}` : position.take_profit.toFixed(digs)}
+              {tpTargetValue != null ? `$${tpTargetValue.toFixed(2)}` : (tpDollars != null ? `+$${tpDollars.toFixed(2)}` : position.take_profit.toFixed(digs))}
             </span>
             {tpDollars != null && (
-              <span className="text-muted" style={{ fontSize: 10 }}> ({position.take_profit.toFixed(digs)})</span>
+              <span className="text-muted" style={{ fontSize: 10 }}>
+                {` (+$${tpDollars.toFixed(2)}`}
+                {tpPct != null ? `, +${tpPct.toFixed(1)}%` : ''}
+                {`) (${position.take_profit.toFixed(digs)})`}
+              </span>
             )}
           </span>
         )}
@@ -1056,6 +1073,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
     } catch {}
   }, [connected]);
 
+
   const scanMarkets = useCallback(async () => {
     if (!connected) return;
     setScanning(true);
@@ -1076,6 +1094,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
     const t = setInterval(refreshPositions, 5000);
     return () => clearInterval(t);
   }, [refreshPositions]);
+
 
   useEffect(() => {
     if (connected) {
@@ -1497,7 +1516,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 150, overflowY: 'auto' }}>
               {autoTradeLogs.slice().reverse().slice(0, 10).map((log, i) => (
-                <div key={i} className="flex items-center gap-2" style={{ fontSize: 12, padding: '4px 0' }}>
+                <div key={i} className="flex items-start gap-2" style={{ fontSize: 12, padding: '4px 0' }}>
                   {log.success ? (
                     <CheckCircle size={12} style={{ color: 'var(--accent-green)', flexShrink: 0 }} />
                   ) : (
@@ -1514,10 +1533,10 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                       Q {Math.round(log.quality_score * 100)}%
                     </span>
                   )}
-                  <span style={{ color: log.success ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-                    {log.detail.length > 40 ? log.detail.substring(0, 40) + '...' : log.detail}
+                  <span style={{ color: log.success ? 'var(--accent-green)' : 'var(--accent-red)', flex: 1, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                    {log.detail}
                   </span>
-                  <span className="text-muted" style={{ marginLeft: 'auto', fontSize: 11 }}>
+                  <span className="text-muted" style={{ marginLeft: 'auto', fontSize: 11, flexShrink: 0 }}>
                     {new Date(log.timestamp * 1000).toLocaleTimeString()}
                   </span>
                 </div>
@@ -1724,7 +1743,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       )}
 
       {/* AI Brain Activity — shows when auto-trade is on */}
-      {autoTradeRunning && aiActivity.length > 0 && (
+      {false && autoTradeRunning && aiActivity.length > 0 && (
         <div className="mt-4">
           <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
             <Zap size={16} style={{ color: 'var(--accent-blue)' }} />

@@ -15,19 +15,19 @@ interface Props {
 const SESSION_OPTIONS = ['24/7', 'London', 'New York', 'Overlap', 'US Open'];
 
 const FALLBACK_POLICY: UserPolicySettings = {
-  mode: 'safe',
+  mode: 'balanced',
   allowed_symbols: [],
-  max_risk_per_trade: 0.25,
-  max_daily_drawdown: 2.5,
-  max_open_trades: 3,
-  max_trades_per_symbol: 1,
-  max_margin_utilization: 12,
-  min_free_margin: 70,
-  min_reward_risk: 2.2,
+  max_risk_per_trade: 0.5,
+  max_daily_drawdown: 4,
+  max_open_trades: 5,
+  max_trades_per_symbol: 2,
+  max_margin_utilization: 18,
+  min_free_margin: 60,
+  min_reward_risk: 1.8,
   allow_counter_trend_trades: false,
   allow_overnight_holding: false,
-  gemini_role: 'confirmation-required',
-  session_filters: ['London', 'New York', 'Overlap'],
+  gemini_role: 'advisory',
+  session_filters: ['Europe', 'US Open', 'New York'],
   demo_only_default: true,
 };
 
@@ -77,6 +77,7 @@ export default function RiskManagement({ status }: Props) {
       const updated = await api.updateRiskSettings(policy);
       setSettingsResponse(updated);
       setPolicy(updated.user_policy);
+      api.getAutoTradeStatus().then(setAutoTradeStatus).catch(() => {});
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (e: any) {
@@ -95,11 +96,25 @@ export default function RiskManagement({ status }: Props) {
     }
   };
 
-  const applyPreset = (mode: PolicyMode) => {
+  const applyPreset = async (mode: PolicyMode) => {
     const preset = settingsResponse?.presets?.[mode];
     if (!preset) return;
-    setPolicy({ ...preset });
+    setLoading(true);
+    setError('');
     setSaved(false);
+    try {
+      const updated = await api.updateRiskSettings({ ...preset });
+      setSettingsResponse(updated);
+      setPolicy(updated.user_policy);
+      api.getAutoTradeStatus().then(setAutoTradeStatus).catch(() => {});
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e: any) {
+      setError(e.message);
+      setPolicy({ ...preset });
+    } finally {
+      setLoading(false);
+    }
   };
 
   const update = <K extends keyof UserPolicySettings>(field: K, value: UserPolicySettings[K]) => {
@@ -182,6 +197,7 @@ export default function RiskManagement({ status }: Props) {
               key={mode}
               className={`btn ${policy.mode === mode ? 'btn-primary' : 'btn-secondary'}`}
               onClick={() => applyPreset(mode)}
+              disabled={loading}
               style={{ padding: '14px 16px', alignItems: 'flex-start', textAlign: 'left', flexDirection: 'column' as const }}
             >
               <span style={{ fontWeight: 700, textTransform: 'capitalize' }}>{mode}</span>
@@ -194,7 +210,7 @@ export default function RiskManagement({ status }: Props) {
           <div>
             <div className="form-group">
               <label>Policy Mode</label>
-              <select className="form-input" value={policy.mode} onChange={(e) => applyPreset(e.target.value as PolicyMode)}>
+              <select className="form-input" value={policy.mode} onChange={(e) => applyPreset(e.target.value as PolicyMode)} disabled={loading}>
                 <option value="safe">Safe</option>
                 <option value="balanced">Balanced</option>
                 <option value="aggressive">Aggressive</option>
@@ -392,7 +408,7 @@ export default function RiskManagement({ status }: Props) {
               <div className="text-sm text-muted" style={{ lineHeight: 1.8 }}>
                 <div>- The bot cannot raise your max risk, margin cap, or drawdown limits automatically.</div>
                 <div>- Runtime logic can reject more trades, but it cannot loosen your policy.</div>
-                <div>- Safe is the default preset whenever the app starts fresh.</div>
+                <div>- Balanced is the default preset whenever the app starts fresh.</div>
               </div>
             </div>
 
@@ -420,6 +436,7 @@ export default function RiskManagement({ status }: Props) {
             Reset to Saved
           </button>
           {saved && <span className="text-green text-sm">Policy saved</span>}
+          {!saved && !loading && <span className="text-sm text-muted">Preset changes now auto-save when selected.</span>}
         </div>
       </div>
 

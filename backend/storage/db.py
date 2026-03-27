@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS orders (
     ticket INTEGER,
     retcode INTEGER,
     retcode_desc TEXT,
+    comment TEXT DEFAULT '',
     success INTEGER NOT NULL,
     FOREIGN KEY (signal_id) REFERENCES signals(id)
 );
@@ -286,6 +287,14 @@ class Database:
                 await self._db.execute(
                     "ALTER TABLE trade_outcomes ADD COLUMN planned_hold_minutes INTEGER DEFAULT 0"
                 )
+        cursor = await self._db.execute("PRAGMA table_info(orders)")
+        rows = await cursor.fetchall()
+        if rows:
+            order_columns = {row[1] for row in rows}
+            if "comment" not in order_columns:
+                await self._db.execute(
+                    "ALTER TABLE orders ADD COLUMN comment TEXT DEFAULT ''"
+                )
 
     async def log_connection_event(
         self, event: str, account: int = 0, server: str = "", details: str = ""
@@ -354,11 +363,12 @@ class Database:
         retcode: int,
         retcode_desc: str,
         success: bool,
+        comment: str = "",
     ):
         await self._db.execute(
             """INSERT INTO orders
-            (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, success)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, comment, success)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 time.time(),
                 signal_id,
@@ -371,6 +381,7 @@ class Database:
                 ticket,
                 retcode,
                 retcode_desc,
+                comment or "",
                 int(success),
             ),
         )

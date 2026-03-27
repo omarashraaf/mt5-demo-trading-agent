@@ -10,6 +10,7 @@ The risk engine must approve every trade before execution.
 """
 
 import asyncio
+import json
 import logging
 import time
 from typing import Optional
@@ -276,22 +277,31 @@ class AutoTrader:
                 contract_size = symbol_info.trade_contract_size if symbol_info else 100000
                 leverage = context.account_leverage or 100
                 investment = round(risk_evaluation.adjusted_volume * entry_price * contract_size / leverage, 0)
-                comment = f"TA:${int(investment)}"
+                normalized_sl, normalized_tp, sl_amount_usd, tp_amount_usd = await self._dynamic_amount_based_targets(
+                    decision=decision,
+                    action=signal.action,
+                    entry_price=entry_price,
+                    volume=risk_evaluation.adjusted_volume,
+                    contract_size=contract_size,
+                    amount_usd=max(float(investment), 1.0),
+                    digits=symbol_info.digits if symbol_info else 5,
+                )
+                comment = f"TA:${float(investment):.2f}|SLA:${float(sl_amount_usd):.2f}|TPA:${float(tp_amount_usd):.2f}"
 
                 order_req = OrderRequest(
                     symbol=sym,
                     action=signal.action,
                     volume=risk_evaluation.adjusted_volume,
-                    stop_loss=signal.stop_loss or 0,
-                    take_profit=signal.take_profit or 0,
+                    stop_loss=normalized_sl,
+                    take_profit=normalized_tp,
                     comment=comment,
                 )
                 preflight = await self.execution_service.preflight(
                     symbol=sym,
                     action=signal.action,
                     volume=risk_evaluation.adjusted_volume,
-                    stop_loss=signal.stop_loss,
-                    take_profit=signal.take_profit,
+                    stop_loss=normalized_sl,
+                    take_profit=normalized_tp,
                     reference_spread=decision.signal_decision.market_context.tick.get("spread", 0.0)
                     if decision.signal_decision.market_context.tick
                     else 0.0,
@@ -312,12 +322,13 @@ class AutoTrader:
                         action=signal.action,
                         volume=order_req.volume,
                         price=result.price,
-                        stop_loss=signal.stop_loss,
-                        take_profit=signal.take_profit,
+                        stop_loss=normalized_sl,
+                        take_profit=normalized_tp,
                         ticket=result.ticket,
                         retcode=result.retcode,
                         retcode_desc=result.retcode_desc,
                         success=result.success,
+                        comment=order_req.comment,
                     )
                     if result.success and result.ticket:
                         await self.db.log_position_change(
@@ -360,3 +371,221 @@ class AutoTrader:
         # Keep only last 50
         if len(self._trade_log) > 50:
             self._trade_log = self._trade_log[-50:]
+
+    def _clamp(self, value: float, minimum: float, maximum: float) -> float:
+        return max(minimum, min(maximum, value))
+
+    async def _dynamic_amount_based_targets(
+        self,
+        *,
+        decision,
+        action: str,
+        entry_price: float,
+        volume: float,
+        contract_size: float,
+        amount_usd: float,
+        digits: int,
+    ) -> tuple[float, float, float, float]:
+        mode = str(getattr(self.risk_engine.user_policy, "mode", "balanced")).lower()
+        min_rr = max(1.0, float(getattr(self.risk_engine.user_policy, "min_reward_risk", 1.8) or 1.8))
+        base_by_mode = {
+            "safe": (0.05, 0.09),
+            "balanced": (0.07, 0.12),
+            "aggressive": (0.09, 0.16),
+        }
+        sl_pct, tp_pct = base_by_mode.get(mode, (0.07, 0.12))
+        range_pct = 0.0
+        drift_pct = 0.0
+        drift_aligned = True
+
+        # 1) Last-hours chart behavior (explicit volatility + directional push)
+        try:
+            h1_bars = (
+                decision.signal_decision.market_context.bars_by_timeframe.get("H1", [])
+                if decision.signal_decision.market_context and decision.signal_decision.market_context.bars_by_timeframe
+                else []
+            )
+            if len(h1_bars) >= 6:
+                recent = h1_bars[-6:]
+                highs = [float(b.get("high", 0.0)) for b in recent]
+                lows = [float(b.get("low", 0.0)) for b in recent]
+                closes = [float(b.get("close", 0.0)) for b in recent]
+                avg_close = sum(closes) / max(len(closes), 1)
+                if avg_close > 0:
+                    range_pct = ((max(highs) - min(lows)) / avg_close) * 100.0
+                    drift = closes[-1] - closes[0]
+                    drift_pct = (abs(drift) / avg_close) * 100.0
+                    drift_aligned = (action == "BUY" and drift > 0) or (action == "SELL" and drift < 0)
+
+                    if range_pct >= 1.2:
+                        sl_pct += 0.02
+                        tp_pct += 0.03
+                    elif range_pct >= 0.8:
+                        sl_pct += 0.01
+                        tp_pct += 0.015
+                    elif range_pct <= 0.35:
+                        sl_pct -= 0.01
+                        tp_pct -= 0.015
+
+                    if drift_pct >= 0.25 and drift_aligned:
+                        tp_pct += 0.01
+                    elif drift_pct >= 0.25 and not drift_aligned:
+                        sl_pct += 0.005
+                        tp_pct -= 0.01
+        except Exception:
+            pass
+
+        # 2) Trade quality + Gemini/news + profile context
+        quality = float(getattr(decision.trade_quality_assessment, "final_trade_quality_score", 0.0) or 0.0)
+        threshold = float(getattr(decision.trade_quality_assessment, "threshold", 0.75) or 0.75)
+        quality_edge = quality - threshold
+        if quality_edge >= 0.10:
+            sl_pct -= 0.01
+            tp_pct += 0.03
+        elif quality_edge >= 0.04:
+            sl_pct -= 0.005
+            tp_pct += 0.015
+        elif quality_edge <= -0.05:
+            sl_pct += 0.015
+            tp_pct -= 0.02
+
+        gemini = decision.signal_decision.gemini_confirmation
+        if gemini is None or getattr(gemini, "degraded", False):
+            sl_pct += 0.01
+            tp_pct -= 0.01
+        else:
+            event_risk = str(getattr(gemini, "event_risk", "low")).lower()
+            contradiction = bool(getattr(gemini, "contradiction_flag", False))
+            news_bias = str(getattr(gemini, "news_bias", "neutral")).lower()
+            aligned_bias = (
+                (action == "BUY" and news_bias == "bullish")
+                or (action == "SELL" and news_bias == "bearish")
+            )
+            if event_risk == "high" or contradiction:
+                sl_pct += 0.015
+                tp_pct -= 0.02
+            elif aligned_bias and event_risk == "low":
+                tp_pct += 0.01
+
+        category = ""
+        if decision.signal_decision.market_context.profile is not None:
+            category = str(decision.signal_decision.market_context.profile.category or "")
+        elif decision.signal_decision.market_context.symbol_info is not None:
+            category = str(decision.signal_decision.market_context.symbol_info.category or "")
+        category = category.title()
+        if category == "Commodities":
+            sl_pct += 0.01
+            tp_pct += 0.015
+        elif category == "Stocks":
+            sl_pct += 0.005
+            tp_pct += 0.01
+        elif category == "Indices":
+            sl_pct += 0.005
+            tp_pct += 0.008
+
+        # 3) Ask Gemini for bounded SL/TP percentage deltas from last-hours chart + mode.
+        sl_delta, tp_delta = await self._gemini_target_pct_adjustment(
+            mode=mode,
+            action=action,
+            range_pct=range_pct,
+            drift_pct=drift_pct,
+            drift_aligned=drift_aligned,
+            category=category or "Other",
+            quality=quality,
+            threshold=threshold,
+            news_bias=str(getattr(gemini, "news_bias", "neutral")).lower() if gemini else "neutral",
+            event_risk=str(getattr(gemini, "event_risk", "low")).lower() if gemini else "low",
+            contradiction_flag=bool(getattr(gemini, "contradiction_flag", False)) if gemini else False,
+        )
+        sl_pct += sl_delta
+        tp_pct += tp_delta
+
+        sl_pct = self._clamp(sl_pct, 0.03, 0.15)
+        tp_pct = self._clamp(tp_pct, 0.06, 0.35)
+        tp_pct = max(tp_pct, sl_pct * min_rr)
+        tp_pct = self._clamp(tp_pct, 0.06, 0.40)
+
+        price_per_unit = max(volume * contract_size, 1e-9)
+        sl_distance = (amount_usd * sl_pct) / price_per_unit
+        tp_distance = (amount_usd * tp_pct) / price_per_unit
+
+        sl_amount_usd = float(amount_usd * sl_pct)
+        tp_amount_usd = float(amount_usd * tp_pct)
+
+        if action == "BUY":
+            sl = round(entry_price - sl_distance, digits)
+            tp = round(entry_price + tp_distance, digits)
+        else:
+            sl = round(entry_price + sl_distance, digits)
+            tp = round(entry_price - tp_distance, digits)
+        return sl, tp, sl_amount_usd, tp_amount_usd
+
+    async def _gemini_target_pct_adjustment(
+        self,
+        *,
+        mode: str,
+        action: str,
+        range_pct: float,
+        drift_pct: float,
+        drift_aligned: bool,
+        category: str,
+        quality: float,
+        threshold: float,
+        news_bias: str,
+        event_risk: str,
+        contradiction_flag: bool,
+    ) -> tuple[float, float]:
+        gemini = self.agents.get("GeminiAgent")
+        client = getattr(gemini, "_client", None)
+        if not getattr(gemini, "available", False) or client is None:
+            return 0.0, 0.0
+        try:
+            from google.genai import types as genai_types
+
+            payload = {
+                "risk_mode": mode,
+                "action": action,
+                "chart_last_hours": {
+                    "range_pct": range_pct,
+                    "drift_pct": drift_pct,
+                    "drift_aligned_with_action": drift_aligned,
+                },
+                "context": {
+                    "category": category,
+                    "trade_quality": quality,
+                    "quality_threshold": threshold,
+                    "news_bias": news_bias,
+                    "event_risk": event_risk,
+                    "contradiction_flag": contradiction_flag,
+                },
+                "constraints": {
+                    "sl_delta_pct_min": -0.02,
+                    "sl_delta_pct_max": 0.03,
+                    "tp_delta_pct_min": -0.03,
+                    "tp_delta_pct_max": 0.06,
+                },
+                "output_schema": {"sl_delta_pct": "number", "tp_delta_pct": "number"},
+            }
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model="gemini-2.5-flash",
+                    contents=[{"role": "user", "parts": [{"text": json.dumps(payload, ensure_ascii=True)}]}],
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction="Return JSON only with sl_delta_pct and tp_delta_pct.",
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                    ),
+                ),
+                timeout=5.0,
+            )
+            text = (resp.text or "").strip()
+            if text.startswith("```"):
+                text = text.strip("`").replace("json", "", 1).strip()
+            data = json.loads(text)
+            sl_delta = self._clamp(float(data.get("sl_delta_pct", 0.0)), -0.02, 0.03)
+            tp_delta = self._clamp(float(data.get("tp_delta_pct", 0.0)), -0.03, 0.06)
+            return sl_delta, tp_delta
+        except Exception as exc:
+            logger.warning("Auto-trader Gemini SL/TP adjustment skipped: %s", exc)
+            return 0.0, 0.0

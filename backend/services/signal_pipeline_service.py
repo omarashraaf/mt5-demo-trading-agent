@@ -410,6 +410,126 @@ class SignalPipelineService:
             downgraded.reason = f"{signal.reason} Blocked: {' '.join(reasons)}"
         return downgraded
 
+    def _recent_drift(self, context: MarketContext, bars: int = 6) -> tuple[str, float]:
+        try:
+            h1_bars = context.bars_by_timeframe.get("H1", []) if context.bars_by_timeframe else []
+            if len(h1_bars) < max(2, bars):
+                return "flat", 0.0
+            recent = h1_bars[-bars:]
+            start = float(recent[0].get("close", 0.0))
+            end = float(recent[-1].get("close", 0.0))
+            if start <= 0:
+                return "flat", 0.0
+            drift_pct = ((end - start) / start) * 100.0
+            if drift_pct > 0.03:
+                return "bullish", abs(drift_pct)
+            if drift_pct < -0.03:
+                return "bearish", abs(drift_pct)
+            return "flat", abs(drift_pct)
+        except Exception:
+            return "flat", 0.0
+
+    def _flip_signal_action(self, context: MarketContext, signal: TechnicalSignal) -> TechnicalSignal:
+        if signal.action not in {"BUY", "SELL"}:
+            return signal
+        if not context.tick:
+            return signal
+
+        current_action = signal.action
+        opposite_action = "BUY" if current_action == "SELL" else "SELL"
+        current_entry = float(context.tick.get("ask", 0.0)) if current_action == "BUY" else float(context.tick.get("bid", 0.0))
+        opposite_entry = float(context.tick.get("ask", 0.0)) if opposite_action == "BUY" else float(context.tick.get("bid", 0.0))
+        if current_entry <= 0 or opposite_entry <= 0:
+            return signal
+
+        sl = signal.stop_loss
+        tp = signal.take_profit
+        sl_dist = abs(current_entry - float(sl)) if sl is not None else 0.0
+        tp_dist = abs(float(tp) - current_entry) if tp is not None else 0.0
+
+        flipped = signal.model_copy(deep=True)
+        flipped.action = opposite_action
+        flipped.confidence = round(max(0.45, min(0.95, float(signal.confidence) - 0.02)), 2)
+        meta = dict(flipped.metadata or {})
+        for trend_key in ("h1_trend", "h4_trend"):
+            trend_val = str(meta.get(trend_key, "")).lower()
+            if trend_val == "bullish":
+                meta[trend_key] = "bearish"
+            elif trend_val == "bearish":
+                meta[trend_key] = "bullish"
+        entry_signal = str(meta.get("entry_signal", "")).lower()
+        if entry_signal == "buy":
+            meta["entry_signal"] = "sell"
+        elif entry_signal == "sell":
+            meta["entry_signal"] = "buy"
+        meta["direction_flipped_by_learning"] = True
+        flipped.metadata = meta
+        if sl_dist > 0 and tp_dist > 0:
+            if opposite_action == "BUY":
+                flipped.stop_loss = opposite_entry - sl_dist
+                flipped.take_profit = opposite_entry + tp_dist
+            else:
+                flipped.stop_loss = opposite_entry + sl_dist
+                flipped.take_profit = opposite_entry - tp_dist
+        return flipped
+
+    def _apply_outcome_learning(
+        self,
+        context: MarketContext,
+        signal: TechnicalSignal,
+        recent_outcomes: list[dict],
+    ) -> tuple[TechnicalSignal, list[str]]:
+        if signal.action not in {"BUY", "SELL"}:
+            return signal, []
+        if not recent_outcomes:
+            return signal, []
+
+        same_dir = [o for o in recent_outcomes if str(o.get("action", "")).upper() == signal.action]
+        opposite_action = "BUY" if signal.action == "SELL" else "SELL"
+        opp_dir = [o for o in recent_outcomes if str(o.get("action", "")).upper() == opposite_action]
+        same_losses = [o for o in same_dir[:4] if float(o.get("profit", 0.0)) <= 0.0]
+        same_wins = [o for o in same_dir[:4] if float(o.get("profit", 0.0)) > 0.0]
+        same_pnl = sum(float(o.get("profit", 0.0)) for o in same_dir[:4])
+        opp_pnl = sum(float(o.get("profit", 0.0)) for o in opp_dir[:4])
+        drift_dir, drift_pct = self._recent_drift(context)
+        drift_opposes_signal = (
+            (signal.action == "BUY" and drift_dir == "bearish")
+            or (signal.action == "SELL" and drift_dir == "bullish")
+        )
+
+        reasons: list[str] = []
+        adjusted = signal.model_copy(deep=True)
+
+        if len(same_losses) >= 2 and len(same_wins) == 0 and same_pnl < 0:
+            adjusted.confidence = round(max(0.0, adjusted.confidence - 0.10), 2)
+            reasons.append(
+                f"Outcome learning: recent {signal.action} trades on {context.symbol} are losing ({len(same_losses)} losses, pnl {same_pnl:.2f})."
+            )
+
+        if len(same_losses) >= 2 and drift_opposes_signal and drift_pct >= 0.03:
+            adjusted = self._flip_signal_action(context, adjusted)
+            reasons.append(
+                f"Direction adapted: flipped to {adjusted.action} because last-hours drift is {drift_dir} ({drift_pct:.2f}%) and recent {signal.action} outcomes are negative."
+            )
+        elif adjusted.confidence < 0.45 and len(same_losses) >= 2:
+            adjusted.action = "HOLD"
+            reasons.append("Outcome learning: confidence reduced below execution floor after repeated same-direction losses.")
+
+        if reasons:
+            meta = dict(adjusted.metadata or {})
+            meta["outcome_learning"] = {
+                "same_direction_losses": len(same_losses),
+                "same_direction_wins": len(same_wins),
+                "same_direction_pnl": round(same_pnl, 2),
+                "opposite_direction_pnl": round(opp_pnl, 2),
+                "drift_direction": drift_dir,
+                "drift_pct": round(drift_pct, 4),
+            }
+            adjusted.metadata = meta
+            adjusted.reason = f"{adjusted.reason} {' '.join(reasons)}"
+
+        return adjusted, reasons
+
     def _entry_price(self, context: MarketContext, action: str) -> float:
         if not context.tick:
             return 0.0
@@ -418,6 +538,51 @@ class SignalPipelineService:
         if action == "SELL":
             return float(context.tick.get("bid", 0.0))
         return 0.0
+
+    def _apply_mode_target_scaling(
+        self,
+        signal: TechnicalSignal,
+        entry_price: float,
+        mode: str,
+    ) -> TechnicalSignal:
+        if signal.action not in {"BUY", "SELL"}:
+            return signal
+        if not signal.stop_loss or not signal.take_profit or entry_price <= 0:
+            return signal
+
+        multipliers = {
+            "safe": 0.95,
+            "balanced": 1.00,
+            "aggressive": 1.05,
+        }
+        multiplier = multipliers.get((mode or "balanced").lower(), 1.00)
+        if abs(multiplier - 1.0) < 1e-6:
+            return signal
+
+        sl_distance = abs(entry_price - signal.stop_loss) * multiplier
+        tp_distance = abs(signal.take_profit - entry_price) * multiplier
+        digits = (signal.metadata or {}).get("digits")
+        if not isinstance(digits, int):
+            digits = 5
+
+        if signal.action == "BUY":
+            new_sl = round(entry_price - sl_distance, digits)
+            new_tp = round(entry_price + tp_distance, digits)
+        else:
+            new_sl = round(entry_price + sl_distance, digits)
+            new_tp = round(entry_price - tp_distance, digits)
+
+        updated = signal.model_copy(deep=True)
+        updated.stop_loss = new_sl
+        updated.take_profit = new_tp
+        updated.metadata = {
+            **(updated.metadata or {}),
+            "mode_target_scaling": {
+                "mode": mode,
+                "multiplier": multiplier,
+            },
+        }
+        return updated
 
     def _strategy_family(
         self,
@@ -634,6 +799,14 @@ class SignalPipelineService:
             )
 
         preview_portfolio_fit = self.risk_service.preview_portfolio_fit(context)
+        learned_signal, learning_reasons = self._apply_outcome_learning(
+            context=context,
+            signal=primary_signal,
+            recent_outcomes=recent_outcomes,
+        )
+        if learning_reasons:
+            primary_signal = learned_signal
+
         trade_decision = self.trade_decision_service.decide(
             context=context,
             technical_signal=primary_signal,
@@ -642,6 +815,13 @@ class SignalPipelineService:
         )
 
         entry_price = self._entry_price(context, trade_decision.final_signal.action)
+        policy_mode = str((context.user_policy or {}).get("mode", "balanced"))
+        scaled_signal = self._apply_mode_target_scaling(
+            trade_decision.final_signal,
+            entry_price,
+            policy_mode,
+        )
+        trade_decision = trade_decision.model_copy(update={"final_signal": scaled_signal})
         risk_approval = self.risk_service.assess(
             context=context,
             signal=trade_decision.final_signal,
@@ -736,6 +916,35 @@ class SignalPipelineService:
         *,
         limit: int = 12,
     ) -> list[str]:
+        def _market_commodity_candidates(symbols: list[dict]) -> list[str]:
+            # Discover broker-available commodities so auto-trade is not
+            # restricted to the static fallback list (e.g., include XAGUSD).
+            priority = [
+                "XAUUSD", "GOLD", "XAGUSD", "SILVER", "USOIL", "WTI", "UKOIL", "BRENT", "NATGAS",
+            ]
+            buckets: dict[str, str] = {}
+            for item in symbols:
+                name = (item.get("name") or "").strip()
+                if not name:
+                    continue
+                category = self.universe_service.normalize_asset_class(item.get("category"))
+                if category != "Commodities":
+                    continue
+                canonical = self.universe_service.canonical_symbol(name)
+                if not self.universe_service.is_symbol_active(canonical or name, category):
+                    continue
+                buckets.setdefault(canonical or name.upper(), name)
+
+            ordered: list[str] = []
+            for preferred in priority:
+                canonical = self.universe_service.canonical_symbol(preferred)
+                if canonical in buckets:
+                    ordered.append(buckets[canonical])
+            for canonical, raw_name in buckets.items():
+                if raw_name not in ordered:
+                    ordered.append(raw_name)
+            return ordered
+
         def _filter_session_eligible(symbols: list[str]) -> list[str]:
             eligible: list[str] = []
             for symbol in symbols:
@@ -774,17 +983,25 @@ class SignalPipelineService:
                     # If event feed is too narrow (for example only GOLD),
                     # augment with curated symbols to avoid single-symbol lock-in.
                     fallback = self.universe_service.default_auto_trade_symbols(market_symbols, limit=limit)
+                    discovered_commodities = _market_commodity_candidates(market_symbols)
                     fallback_eligible = _filter_session_eligible(fallback)
+                    commodity_eligible = _filter_session_eligible(discovered_commodities)
                     merged: list[str] = []
-                    for symbol in eligible + fallback_eligible:
+                    for symbol in eligible + commodity_eligible + fallback_eligible:
                         if symbol not in merged:
                             merged.append(symbol)
                     return merged[:limit]
                 return _non_stock_fallback(event_symbols)
         fallback = self.universe_service.default_auto_trade_symbols(market_symbols, limit=limit)
+        discovered_commodities = _market_commodity_candidates(market_symbols)
         eligible_fallback = _filter_session_eligible(fallback)
-        if eligible_fallback:
-            return eligible_fallback[:limit]
+        commodity_eligible = _filter_session_eligible(discovered_commodities)
+        merged_fallback: list[str] = []
+        for symbol in commodity_eligible + eligible_fallback:
+            if symbol not in merged_fallback:
+                merged_fallback.append(symbol)
+        if merged_fallback:
+            return merged_fallback[:limit]
         return _non_stock_fallback(fallback)
 
     async def persist_evaluation(
