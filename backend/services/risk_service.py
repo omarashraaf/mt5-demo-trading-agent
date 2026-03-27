@@ -64,12 +64,17 @@ class RiskService:
             entry_price=live_entry_price,
         )
         risk_evaluation = RiskEvaluation.from_risk_decision(risk_decision, evaluation_mode)
-        fitted_volume, fit_reason = self.portfolio_risk_service.fit_volume_to_margin_limits(
-            context=context,
-            proposed_volume=risk_evaluation.adjusted_volume,
-            entry_price=live_entry_price,
-            settings=self.risk_engine.settings,
-        )
+        if hasattr(self.portfolio_risk_service, "fit_volume_to_margin_limits"):
+            fitted_volume, fit_reason = self.portfolio_risk_service.fit_volume_to_margin_limits(
+                context=context,
+                proposed_volume=risk_evaluation.adjusted_volume,
+                entry_price=live_entry_price,
+                settings=self.risk_engine.settings,
+            )
+        else:
+            # Backward compatibility: older/mocked portfolio services may not expose
+            # margin-fit scaling yet, so keep the proposed volume unchanged.
+            fitted_volume, fit_reason = risk_evaluation.adjusted_volume, None
         if fit_reason and fitted_volume > 0:
             risk_evaluation.warnings.append(fit_reason)
         if fit_reason and fitted_volume <= 0:

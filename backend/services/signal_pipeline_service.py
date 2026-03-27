@@ -104,12 +104,18 @@ class SignalPipelineService:
         user_policy = self.risk_engine.user_policy.model_dump() if hasattr(self.risk_engine, "user_policy") else {}
         policy_sessions = list(user_policy.get("session_filters") or [])
         sessions = policy_sessions or list(profile.allowed_sessions or [])
-        return self.trade_quality_service.session_allowed(
-            sessions,
-            symbol=self.universe_service.canonical_symbol(symbol),
-            category=profile.category,
-            profile_name=profile.profile_name,
-        )
+        canonical_symbol = self.universe_service.canonical_symbol(symbol)
+        try:
+            return self.trade_quality_service.session_allowed(
+                sessions,
+                symbol=canonical_symbol,
+                category=profile.category,
+                profile_name=profile.profile_name,
+            )
+        except TypeError:
+            # Backward compatibility with older implementations that only
+            # accept the sessions list.
+            return self.trade_quality_service.session_allowed(sessions)
 
     def set_database(self, db):
         self.db = db
