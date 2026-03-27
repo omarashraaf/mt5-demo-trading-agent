@@ -215,11 +215,132 @@ CREATE TABLE IF NOT EXISTS gemini_event_assessments (
     FOREIGN KEY (external_event_id) REFERENCES external_events(id)
 );
 
+CREATE TABLE IF NOT EXISTS trade_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id TEXT NOT NULL UNIQUE,
+    signal_id INTEGER,
+    timestamp_utc REAL NOT NULL,
+    symbol TEXT NOT NULL,
+    asset_class TEXT DEFAULT '',
+    strategy_mode TEXT DEFAULT '',
+    session TEXT DEFAULT '',
+    day_of_week INTEGER DEFAULT 0,
+    technical_direction TEXT NOT NULL,
+    smart_agent_summary TEXT DEFAULT '',
+    gemini_summary TEXT DEFAULT '',
+    quality_score REAL DEFAULT 0.0,
+    confidence_score REAL DEFAULT 0.0,
+    trend_h1 TEXT DEFAULT '',
+    trend_h4 TEXT DEFAULT '',
+    stop_loss REAL DEFAULT 0.0,
+    take_profit REAL DEFAULT 0.0,
+    reward_risk REAL DEFAULT 0.0,
+    spread_at_eval REAL DEFAULT 0.0,
+    atr_regime TEXT DEFAULT '',
+    support_resistance_context TEXT DEFAULT '',
+    event_id TEXT DEFAULT '',
+    event_type TEXT DEFAULT '',
+    event_importance TEXT DEFAULT '',
+    contradiction_flag INTEGER DEFAULT 0,
+    risk_decision TEXT DEFAULT '',
+    rejection_reasons_json TEXT DEFAULT '[]',
+    executed INTEGER NOT NULL DEFAULT 0,
+    execution_ticket INTEGER,
+    execution_fill_price REAL,
+    execution_slippage_est REAL,
+    margin_snapshot_json TEXT DEFAULT '{}',
+    hold_duration_minutes REAL DEFAULT 0.0,
+    exit_timestamp REAL,
+    exit_reason TEXT DEFAULT '',
+    gross_pnl REAL DEFAULT 0.0,
+    net_pnl REAL DEFAULT 0.0,
+    mfe REAL DEFAULT 0.0,
+    mae REAL DEFAULT 0.0,
+    unrealized_peak REAL DEFAULT 0.0,
+    gemini_changed_decision INTEGER DEFAULT 0,
+    meta_model_changed_decision INTEGER DEFAULT 0,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feature_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id TEXT NOT NULL,
+    signal_id INTEGER,
+    schema_version TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (candidate_id) REFERENCES trade_candidates(candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS model_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id TEXT NOT NULL UNIQUE,
+    algorithm TEXT NOT NULL,
+    target_definition TEXT NOT NULL,
+    feature_schema_version TEXT NOT NULL,
+    training_date REAL NOT NULL,
+    data_range_start REAL,
+    data_range_end REAL,
+    evaluation_metrics_json TEXT DEFAULT '{}',
+    walk_forward_metrics_json TEXT DEFAULT '{}',
+    approval_status TEXT NOT NULL DEFAULT 'candidate',
+    notes TEXT DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    version_id TEXT,
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    status TEXT NOT NULL DEFAULT 'training',
+    metrics_json TEXT DEFAULT '{}',
+    params_json TEXT DEFAULT '{}',
+    notes TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS replay_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    model_version_id TEXT DEFAULT '',
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    status TEXT NOT NULL DEFAULT 'running',
+    config_json TEXT DEFAULT '{}',
+    metrics_json TEXT DEFAULT '{}',
+    notes TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS attribution_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id TEXT NOT NULL UNIQUE,
+    report_type TEXT NOT NULL,
+    generated_at REAL NOT NULL,
+    data_range_start REAL,
+    data_range_end REAL,
+    report_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS app_runtime_state (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp
+    ON signals(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_eval_journal_symbol_timestamp
+    ON evaluation_journal(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_outcomes_symbol_closed_at
+    ON trade_outcomes(symbol, closed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_activity_symbol_timestamp
+    ON ai_activity(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_candidates_symbol_timestamp
+    ON trade_candidates(symbol, timestamp_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_feature_snapshots_candidate_created
+    ON feature_snapshots(candidate_id, created_at DESC);
 """
 
 
@@ -637,6 +758,135 @@ class Database:
         await self._db.commit()
         return cursor.lastrowid
 
+    async def log_trade_candidate(
+        self,
+        *,
+        candidate_id: str,
+        signal_id: Optional[int],
+        symbol: str,
+        asset_class: str,
+        strategy_mode: str,
+        session: str,
+        day_of_week: int,
+        technical_direction: str,
+        smart_agent_summary: str,
+        gemini_summary: str,
+        quality_score: float,
+        confidence_score: float,
+        trend_h1: str,
+        trend_h4: str,
+        stop_loss: float,
+        take_profit: float,
+        reward_risk: float,
+        spread_at_eval: float,
+        atr_regime: str,
+        support_resistance_context: str,
+        event_id: str,
+        event_type: str,
+        event_importance: str,
+        contradiction_flag: bool,
+        risk_decision: str,
+        rejection_reasons: list[str],
+        executed: bool,
+        gemini_changed_decision: bool,
+        meta_model_changed_decision: bool = False,
+    ) -> int:
+        cursor = await self._db.execute(
+            """INSERT OR REPLACE INTO trade_candidates
+            (candidate_id, signal_id, timestamp_utc, symbol, asset_class, strategy_mode, session, day_of_week,
+             technical_direction, smart_agent_summary, gemini_summary, quality_score, confidence_score,
+             trend_h1, trend_h4, stop_loss, take_profit, reward_risk, spread_at_eval, atr_regime,
+             support_resistance_context, event_id, event_type, event_importance, contradiction_flag,
+             risk_decision, rejection_reasons_json, executed, gemini_changed_decision, meta_model_changed_decision, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                candidate_id,
+                signal_id,
+                time.time(),
+                symbol,
+                asset_class,
+                strategy_mode,
+                session,
+                int(day_of_week),
+                technical_direction,
+                smart_agent_summary,
+                gemini_summary,
+                float(quality_score or 0.0),
+                float(confidence_score or 0.0),
+                trend_h1,
+                trend_h4,
+                float(stop_loss or 0.0),
+                float(take_profit or 0.0),
+                float(reward_risk or 0.0),
+                float(spread_at_eval or 0.0),
+                atr_regime,
+                support_resistance_context,
+                event_id,
+                event_type,
+                event_importance,
+                int(bool(contradiction_flag)),
+                risk_decision,
+                json.dumps(rejection_reasons or []),
+                int(bool(executed)),
+                int(bool(gemini_changed_decision)),
+                int(bool(meta_model_changed_decision)),
+                time.time(),
+            ),
+        )
+        await self._db.commit()
+        return int(cursor.lastrowid)
+
+    async def log_feature_snapshot(
+        self,
+        *,
+        candidate_id: str,
+        signal_id: Optional[int],
+        schema_version: str,
+        features: dict,
+    ) -> int:
+        cursor = await self._db.execute(
+            """INSERT INTO feature_snapshots
+            (candidate_id, signal_id, schema_version, features_json, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                candidate_id,
+                signal_id,
+                schema_version,
+                json.dumps(features or {}),
+                time.time(),
+            ),
+        )
+        await self._db.commit()
+        return int(cursor.lastrowid)
+
+    async def mark_trade_candidate_execution(
+        self,
+        *,
+        signal_id: Optional[int],
+        executed: bool,
+        ticket: Optional[int] = None,
+        fill_price: Optional[float] = None,
+        slippage_estimate: Optional[float] = None,
+        margin_snapshot: Optional[dict] = None,
+    ):
+        if signal_id is None:
+            return
+        await self._db.execute(
+            """UPDATE trade_candidates
+               SET executed = ?, execution_ticket = ?, execution_fill_price = ?, execution_slippage_est = ?,
+                   margin_snapshot_json = COALESCE(?, margin_snapshot_json)
+               WHERE signal_id = ?""",
+            (
+                int(bool(executed)),
+                ticket,
+                fill_price,
+                slippage_estimate,
+                json.dumps(margin_snapshot) if margin_snapshot is not None else None,
+                signal_id,
+            ),
+        )
+        await self._db.commit()
+
     async def get_recent_symbol_outcomes(
         self,
         symbol: str,
@@ -781,7 +1031,7 @@ class Database:
         strategy: str = "",
         planned_hold_minutes: Optional[int] = None,
         outcome_json: Optional[dict] = None,
-    ):
+        ):
         await self._db.execute(
             """INSERT INTO trade_outcomes
             (timestamp, closed_at, ticket, signal_id, symbol, action, confidence, profit, exit_reason,
@@ -802,6 +1052,30 @@ class Database:
                 strategy,
                 int(planned_hold_minutes or 0),
                 json.dumps(outcome_json) if outcome_json is not None else None,
+            ),
+        )
+        await self._db.execute(
+            """UPDATE trade_candidates
+               SET hold_duration_minutes = ?,
+                   exit_timestamp = ?,
+                   exit_reason = ?,
+                   gross_pnl = ?,
+                   net_pnl = ?,
+                   mfe = COALESCE(mfe, 0.0),
+                   mae = COALESCE(mae, 0.0),
+                   unrealized_peak = COALESCE(unrealized_peak, 0.0)
+               WHERE (signal_id = ? AND ? IS NOT NULL)
+                  OR (execution_ticket = ? AND ? IS NOT NULL)""",
+            (
+                float(holding_minutes or 0.0),
+                time.time(),
+                exit_reason,
+                float(profit or 0.0),
+                float(profit or 0.0),
+                signal_id,
+                signal_id,
+                ticket,
+                ticket,
             ),
         )
         if ticket is not None:
@@ -1013,6 +1287,348 @@ class Database:
             return json.loads(row[0])
         except Exception:
             return None
+
+    async def log_model_run(
+        self,
+        *,
+        run_id: str,
+        version_id: Optional[str],
+        status: str = "training",
+        params: Optional[dict] = None,
+        metrics: Optional[dict] = None,
+        notes: str = "",
+        started_at: Optional[float] = None,
+        finished_at: Optional[float] = None,
+    ) -> int:
+        cursor = await self._db.execute(
+            """INSERT INTO model_runs
+            (run_id, version_id, started_at, finished_at, status, metrics_json, params_json, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run_id,
+                version_id,
+                float(started_at or time.time()),
+                finished_at,
+                status,
+                json.dumps(metrics or {}),
+                json.dumps(params or {}),
+                notes,
+            ),
+        )
+        await self._db.commit()
+        return int(cursor.lastrowid)
+
+    async def update_model_run(
+        self,
+        *,
+        run_id: str,
+        status: Optional[str] = None,
+        metrics: Optional[dict] = None,
+        notes: Optional[str] = None,
+        finished_at: Optional[float] = None,
+        version_id: Optional[str] = None,
+    ):
+        updates: list[str] = []
+        params: list = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if metrics is not None:
+            updates.append("metrics_json = ?")
+            params.append(json.dumps(metrics))
+        if notes is not None:
+            updates.append("notes = ?")
+            params.append(notes)
+        if finished_at is not None:
+            updates.append("finished_at = ?")
+            params.append(float(finished_at))
+        if version_id is not None:
+            updates.append("version_id = ?")
+            params.append(version_id)
+        if not updates:
+            return
+        params.append(run_id)
+        await self._db.execute(
+            f"UPDATE model_runs SET {', '.join(updates)} WHERE run_id = ?",
+            tuple(params),
+        )
+        await self._db.commit()
+
+    async def register_model_version(
+        self,
+        *,
+        version_id: str,
+        algorithm: str,
+        target_definition: str,
+        feature_schema_version: str,
+        training_date: float,
+        data_range_start: Optional[float] = None,
+        data_range_end: Optional[float] = None,
+        evaluation_metrics: Optional[dict] = None,
+        walk_forward_metrics: Optional[dict] = None,
+        approval_status: str = "candidate",
+        notes: str = "",
+    ) -> int:
+        now = time.time()
+        cursor = await self._db.execute(
+            """INSERT INTO model_versions
+            (version_id, algorithm, target_definition, feature_schema_version, training_date,
+             data_range_start, data_range_end, evaluation_metrics_json, walk_forward_metrics_json,
+             approval_status, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                version_id,
+                algorithm,
+                target_definition,
+                feature_schema_version,
+                float(training_date),
+                data_range_start,
+                data_range_end,
+                json.dumps(evaluation_metrics or {}),
+                json.dumps(walk_forward_metrics or {}),
+                approval_status,
+                notes,
+                now,
+                now,
+            ),
+        )
+        await self._db.commit()
+        return int(cursor.lastrowid)
+
+    async def update_model_version(
+        self,
+        *,
+        version_id: str,
+        evaluation_metrics: Optional[dict] = None,
+        walk_forward_metrics: Optional[dict] = None,
+        approval_status: Optional[str] = None,
+        notes: Optional[str] = None,
+    ):
+        updates: list[str] = ["updated_at = ?"]
+        params: list = [time.time()]
+        if evaluation_metrics is not None:
+            updates.append("evaluation_metrics_json = ?")
+            params.append(json.dumps(evaluation_metrics))
+        if walk_forward_metrics is not None:
+            updates.append("walk_forward_metrics_json = ?")
+            params.append(json.dumps(walk_forward_metrics))
+        if approval_status is not None:
+            updates.append("approval_status = ?")
+            params.append(approval_status)
+        if notes is not None:
+            updates.append("notes = ?")
+            params.append(notes)
+        params.append(version_id)
+        await self._db.execute(
+            f"UPDATE model_versions SET {', '.join(updates)} WHERE version_id = ?",
+            tuple(params),
+        )
+        await self._db.commit()
+
+    async def get_model_version(self, version_id: str) -> Optional[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM model_versions WHERE version_id = ? LIMIT 1",
+            (version_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        item = dict(zip(cols, row))
+        item["evaluation_metrics_json"] = json.loads(item.get("evaluation_metrics_json") or "{}")
+        item["walk_forward_metrics_json"] = json.loads(item.get("walk_forward_metrics_json") or "{}")
+        return item
+
+    async def list_model_versions(self, limit: int = 50) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM model_versions ORDER BY training_date DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        items = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            item["evaluation_metrics_json"] = json.loads(item.get("evaluation_metrics_json") or "{}")
+            item["walk_forward_metrics_json"] = json.loads(item.get("walk_forward_metrics_json") or "{}")
+            items.append(item)
+        return items
+
+    async def get_latest_approved_model_version(self) -> Optional[dict]:
+        cursor = await self._db.execute(
+            """SELECT * FROM model_versions
+               WHERE approval_status = 'approved'
+               ORDER BY training_date DESC
+               LIMIT 1"""
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        item = dict(zip(cols, row))
+        item["evaluation_metrics_json"] = json.loads(item.get("evaluation_metrics_json") or "{}")
+        item["walk_forward_metrics_json"] = json.loads(item.get("walk_forward_metrics_json") or "{}")
+        return item
+
+    async def log_replay_run(
+        self,
+        *,
+        run_id: str,
+        model_version_id: str = "",
+        config: Optional[dict] = None,
+        status: str = "running",
+        notes: str = "",
+        started_at: Optional[float] = None,
+        finished_at: Optional[float] = None,
+        metrics: Optional[dict] = None,
+    ) -> int:
+        cursor = await self._db.execute(
+            """INSERT INTO replay_runs
+            (run_id, model_version_id, started_at, finished_at, status, config_json, metrics_json, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run_id,
+                model_version_id,
+                float(started_at or time.time()),
+                finished_at,
+                status,
+                json.dumps(config or {}),
+                json.dumps(metrics or {}),
+                notes,
+            ),
+        )
+        await self._db.commit()
+        return int(cursor.lastrowid)
+
+    async def update_replay_run(
+        self,
+        *,
+        run_id: str,
+        status: Optional[str] = None,
+        config: Optional[dict] = None,
+        metrics: Optional[dict] = None,
+        notes: Optional[str] = None,
+        finished_at: Optional[float] = None,
+        model_version_id: Optional[str] = None,
+    ):
+        updates: list[str] = []
+        params: list = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if config is not None:
+            updates.append("config_json = ?")
+            params.append(json.dumps(config))
+        if metrics is not None:
+            updates.append("metrics_json = ?")
+            params.append(json.dumps(metrics))
+        if notes is not None:
+            updates.append("notes = ?")
+            params.append(notes)
+        if finished_at is not None:
+            updates.append("finished_at = ?")
+            params.append(float(finished_at))
+        if model_version_id is not None:
+            updates.append("model_version_id = ?")
+            params.append(model_version_id)
+        if not updates:
+            return
+        params.append(run_id)
+        await self._db.execute(
+            f"UPDATE replay_runs SET {', '.join(updates)} WHERE run_id = ?",
+            tuple(params),
+        )
+        await self._db.commit()
+
+    async def list_model_runs(self, limit: int = 50) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM model_runs ORDER BY started_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        items = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            item["metrics_json"] = json.loads(item.get("metrics_json") or "{}")
+            item["params_json"] = json.loads(item.get("params_json") or "{}")
+            items.append(item)
+        return items
+
+    async def get_latest_model_run(self) -> Optional[dict]:
+        runs = await self.list_model_runs(limit=1)
+        return runs[0] if runs else None
+
+    async def list_replay_runs(self, limit: int = 50) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM replay_runs ORDER BY started_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        items = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            item["config_json"] = json.loads(item.get("config_json") or "{}")
+            item["metrics_json"] = json.loads(item.get("metrics_json") or "{}")
+            items.append(item)
+        return items
+
+    async def get_latest_replay_run(self, *, notes_like: Optional[str] = None) -> Optional[dict]:
+        if notes_like:
+            cursor = await self._db.execute(
+                "SELECT * FROM replay_runs WHERE notes LIKE ? ORDER BY started_at DESC LIMIT 1",
+                (notes_like,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            cols = [d[0] for d in cursor.description]
+            item = dict(zip(cols, row))
+            item["config_json"] = json.loads(item.get("config_json") or "{}")
+            item["metrics_json"] = json.loads(item.get("metrics_json") or "{}")
+            return item
+        runs = await self.list_replay_runs(limit=1)
+        return runs[0] if runs else None
+
+    async def save_attribution_report(
+        self,
+        *,
+        report_id: str,
+        report_type: str,
+        data_range_start: Optional[float],
+        data_range_end: Optional[float],
+        report: dict,
+    ) -> int:
+        cursor = await self._db.execute(
+            """INSERT INTO attribution_reports
+            (report_id, report_type, generated_at, data_range_start, data_range_end, report_json)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                report_id,
+                report_type,
+                time.time(),
+                data_range_start,
+                data_range_end,
+                json.dumps(report or {}),
+            ),
+        )
+        await self._db.commit()
+        return int(cursor.lastrowid)
+
+    async def list_attribution_reports(self, limit: int = 20) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM attribution_reports ORDER BY generated_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        items = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            item["report_json"] = json.loads(item.get("report_json") or "{}")
+            items.append(item)
+        return items
 
     def _decode_external_event(self, row: dict) -> dict:
         row["affected_assets"] = json.loads(row.pop("affected_assets_json", "[]") or "[]")

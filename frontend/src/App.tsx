@@ -14,6 +14,7 @@ import {
   ChevronDown,
   ChevronRight,
   Settings,
+  FlaskConical,
 } from 'lucide-react';
 import { api } from './utils/api';
 import type { StatusResponse } from './types';
@@ -27,6 +28,7 @@ import Logs from './pages/Logs';
 import AIActivityPage from './pages/AIActivity';
 import ChatPage from './pages/Chat';
 import TradeHistoryPage from './pages/TradeHistory';
+import ResearchPage from './pages/Research';
 
 const ADVANCED_NAV = [
   { path: '/chat', label: 'Gemini Chat', icon: MessageSquare },
@@ -36,6 +38,7 @@ const ADVANCED_NAV = [
   { path: '/risk', label: 'Risk Settings', icon: Shield },
   { path: '/execution', label: 'Execution', icon: Zap },
   { path: '/trade-history', label: 'Trade History', icon: History },
+  { path: '/research', label: 'Research Lab', icon: FlaskConical },
   { path: '/logs', label: 'Logs', icon: ScrollText },
 ];
 
@@ -56,7 +59,7 @@ export default function App() {
 
   useEffect(() => {
     refreshStatus();
-    const timer = setInterval(refreshStatus, 3000);
+    const timer = setInterval(refreshStatus, 8000);
     return () => clearInterval(timer);
   }, [refreshStatus]);
 
@@ -100,6 +103,14 @@ export default function App() {
           >
             <Plug size={16} />
             {connected ? 'Account' : 'Connect'}
+          </NavLink>
+
+          <NavLink
+            to="/trade-history"
+            className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+          >
+            <History size={16} />
+            Trade History
           </NavLink>
 
           {/* Advanced section - hidden by default */}
@@ -164,6 +175,7 @@ export default function App() {
           <Route path="/ai-activity" element={<AIActivityPage status={status} />} />
           <Route path="/chat" element={<ChatPage connected={connected} />} />
           <Route path="/logs" element={<Logs />} />
+          <Route path="/research" element={<ResearchPage />} />
         </Routes>
       </main>
     </div>

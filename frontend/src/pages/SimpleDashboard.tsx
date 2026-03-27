@@ -702,10 +702,9 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
   const digits = price < 50 ? 5 : 2;
   const minSlTp = volumeInfo?.min_sl_tp_dollars || 0;
 
-  // Fetch live tick data - only when visible (initial load + on expand)
+  // Fetch live tick data on demand.
   const [bid, setBid] = useState<number | null>(null);
   const [ask, setAsk] = useState<number | null>(null);
-  const tickFetched = useRef(false);
 
   // Reset state when symbol changes (React may reuse component for different rec)
   const prevSymbol = useRef(rec.symbol);
@@ -720,15 +719,6 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
       setVolumeInfo(null);
       setBid(null);
       setAsk(null);
-      tickFetched.current = false;
-    }
-  }, [rec.symbol]);
-
-  useEffect(() => {
-    // Fetch once on mount
-    if (!tickFetched.current) {
-      tickFetched.current = true;
-      api.getTick(rec.symbol).then((tick) => { setBid(tick.bid); setAsk(tick.ask); }).catch(() => {});
     }
   }, [rec.symbol]);
 
@@ -1027,11 +1017,13 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
 
 export default function SimpleDashboard({ status, onRefresh }: Props) {
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
+  const [analyzedCount, setAnalyzedCount] = useState(0);
   const [positions, setPositions] = useState<PositionInfo[]>([]);
   const [scanning, setScanning] = useState(false);
   const [lastScan, setLastScan] = useState<number | null>(null);
   const [error, setError] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
+  const [visibleMarketRows, setVisibleMarketRows] = useState<number>(60);
 
   // Auto-trade state
   const [autoTradeRunning, setAutoTradeRunning] = useState(false);
@@ -1075,23 +1067,101 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
 
 
   const scanMarkets = useCallback(async () => {
-    if (!connected) return;
+    if (!connected || scanning) return;
     setScanning(true);
     setError('');
     try {
-      const result = await api.smartEvaluate();
-      setRecommendations(result.recommendations);
-      setLastScan(result.scanned_at);
+      const available = await api.getAvailableSymbols(undefined, true);
+      const allMt5Symbols = Object.values(available.categories || {}).flat();
+      const baseList: Recommendation[] = [];
+      const seen = new Set<string>();
+
+      for (const sym of allMt5Symbols) {
+        baseList.push({
+          symbol: sym.name,
+          signal: {
+            action: 'HOLD',
+            confidence: 0,
+            stop_loss: null,
+            take_profit: null,
+            max_holding_minutes: null,
+            reason: 'Waiting for full analysis in the next scan cycle.',
+          },
+          signal_id: null,
+          risk_decision: {
+            approved: false,
+            reason: 'Not evaluated in this scan cycle yet.',
+            adjusted_volume: 0,
+            warnings: [],
+            status: 'warn',
+            machine_reasons: [],
+            metrics_snapshot: {},
+          },
+          entry_price_estimate: sym.ask || sym.bid || 0,
+          explanation: sym.description || `${sym.name} available on MT5`,
+          ready_to_execute: false,
+          category: sym.category,
+          description: sym.description,
+          execution_reason: 'Not evaluated in this scan window yet.',
+        });
+        seen.add(sym.name);
+      }
+      setRecommendations(baseList);
+      setAnalyzedCount(0);
+      setLastScan(Date.now() / 1000);
+
+      // Fast opportunity scan: score a focused subset first to avoid very long cycles.
+      const categoryPriority: Record<string, number> = {
+        Commodities: 0,
+        Indices: 1,
+        Stocks: 2,
+      };
+      const symbolsForAi = allMt5Symbols
+        .filter((s) => Number(s.bid || 0) > 0 && Number(s.ask || 0) > 0)
+        .sort((a, b) => {
+          const catA = categoryPriority[a.category || 'Stocks'] ?? 3;
+          const catB = categoryPriority[b.category || 'Stocks'] ?? 3;
+          if (catA !== catB) return catA - catB;
+          return Number(a.spread || 0) - Number(b.spread || 0);
+        })
+        .slice(0, 24)
+        .map((s) => s.name)
+        .filter(Boolean);
+
+      const result = await Promise.race([
+        api.smartEvaluate(symbolsForAi),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('AI scan timeout')), 25000),
+        ),
+      ]);
+      const scanned = result.recommendations || [];
+      setAnalyzedCount(scanned.length);
+      if (result.scanned_at) setLastScan(result.scanned_at);
+
+      const mergedMap = new Map(baseList.map((rec) => [rec.symbol, rec]));
+      for (const rec of scanned) {
+        const previous = mergedMap.get(rec.symbol);
+        mergedMap.set(rec.symbol, {
+          ...(previous || rec),
+          ...rec,
+          category: rec.category || previous?.category,
+          description: rec.description || previous?.description,
+        });
+      }
+      setRecommendations(Array.from(mergedMap.values()));
     } catch (e: any) {
-      setError(e.message);
+      // Keep full MT5 list visible even when AI scoring times out.
+      if (!String(e?.message || '').toLowerCase().includes('timeout')) {
+        setError(e.message);
+      }
     } finally {
       setScanning(false);
     }
-  }, [connected]);
+  }, [connected, scanning]);
 
   useEffect(() => {
     refreshPositions();
-    const t = setInterval(refreshPositions, 5000);
+    const t = setInterval(refreshPositions, 10000);
     return () => clearInterval(t);
   }, [refreshPositions]);
 
@@ -1099,7 +1169,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   useEffect(() => {
     if (connected) {
       scanMarkets();
-      const t = setInterval(scanMarkets, 60000);
+      const t = setInterval(scanMarkets, 120000);
       return () => clearInterval(t);
     }
   }, [connected, scanMarkets]);
@@ -1119,7 +1189,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
 
   useEffect(() => {
     refreshAutoTrade();
-    const t = setInterval(refreshAutoTrade, 5000);
+    const t = setInterval(refreshAutoTrade, 10000);
     return () => clearInterval(t);
   }, [refreshAutoTrade]);
 
@@ -1136,7 +1206,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   useEffect(() => {
     if (autoTradeRunning) {
       refreshAIActivity();
-      const t = setInterval(refreshAIActivity, 10000);
+      const t = setInterval(refreshAIActivity, 15000);
       return () => clearInterval(t);
     } else {
       setAiActivity([]);
@@ -1243,6 +1313,11 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
     : recommendations.filter((r) => (r.category || 'Other') === selectedCategory);
   const actionableRecs = filteredRecs.filter((r) => r.signal.action === 'BUY' || r.signal.action === 'SELL');
   const holdRecs = filteredRecs.filter((r) => r.signal.action === 'HOLD');
+  const visibleHoldRecs = holdRecs.slice(0, visibleMarketRows);
+
+  useEffect(() => {
+    setVisibleMarketRows(60);
+  }, [selectedCategory, recommendations.length]);
 
   // Count categories for tabs
   const categoryCounts: Record<string, number> = { All: recommendations.length };
@@ -1812,7 +1887,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
             <h3 style={{ fontSize: 16, fontWeight: 600 }}>Available Markets</h3>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
               {lastScan
-                ? `AI analyzed ${recommendations.length} symbols \u2022 Last checked: ${new Date(lastScan * 1000).toLocaleTimeString()}`
+                ? `MT5 available ${recommendations.length} symbols \u2022 AI analyzed ${analyzedCount} \u2022 Last checked: ${new Date(lastScan * 1000).toLocaleTimeString()}`
                 : 'Click "Scan All" to analyze every available market'
               }
             </p>
@@ -1831,7 +1906,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
           </div>
         </div>
 
-        {error && (
+        {error && !error.toLowerCase().includes('timeout') && (
           <div className="error-banner" style={{ fontSize: 13 }}>
             Something went wrong: {error}
           </div>
@@ -1909,10 +1984,20 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                   All Markets ({holdRecs.length})
                 </div>
                 <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-                  {holdRecs.map((rec, i) => (
-                    <MarketRow key={`hold-${i}`} rec={rec} currency={currency} onExecuted={refreshPositions} isLast={i === holdRecs.length - 1} />
+                  {visibleHoldRecs.map((rec, i) => (
+                    <MarketRow key={`hold-${i}`} rec={rec} currency={currency} onExecuted={refreshPositions} isLast={i === visibleHoldRecs.length - 1} />
                   ))}
                 </div>
+                {holdRecs.length > visibleHoldRecs.length && (
+                  <div style={{ padding: 12, borderTop: '1px solid var(--border)', textAlign: 'center' }}>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => setVisibleMarketRows((v) => Math.min(v + 60, holdRecs.length))}
+                    >
+                      Load More ({holdRecs.length - visibleHoldRecs.length} remaining)
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

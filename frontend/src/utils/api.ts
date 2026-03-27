@@ -1,12 +1,57 @@
 import { runtimeConfig } from '../config';
 
 const BASE_URL = runtimeConfig.apiBaseUrl;
+const LOCAL_PORT_FALLBACK_URL = BASE_URL.includes('127.0.0.1:8000')
+  ? BASE_URL.replace('127.0.0.1:8000', '127.0.0.1:8002')
+  : BASE_URL.includes('localhost:8000')
+    ? BASE_URL.replace('localhost:8000', 'localhost:8002')
+    : BASE_URL.includes('127.0.0.1:8002')
+      ? BASE_URL.replace('127.0.0.1:8002', '127.0.0.1:8000')
+      : BASE_URL.includes('localhost:8002')
+        ? BASE_URL.replace('localhost:8002', 'localhost:8000')
+        : null;
+
+let preferredBaseUrl: string = BASE_URL;
+
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const requestOptions: RequestInit = {
     headers: { 'Content-Type': 'application/json' },
     ...options,
-  });
+  };
+
+  const candidates = LOCAL_PORT_FALLBACK_URL
+    ? [preferredBaseUrl, preferredBaseUrl === BASE_URL ? LOCAL_PORT_FALLBACK_URL : BASE_URL]
+    : [preferredBaseUrl];
+
+  let res: Response | null = null;
+  let lastError: unknown = null;
+  for (let i = 0; i < candidates.length; i += 1) {
+    const base = candidates[i];
+    try {
+      const timeoutMs = i === 0 ? 2000 : 4000;
+      const attempt = await fetchWithTimeout(`${base}${path}`, requestOptions, timeoutMs);
+      preferredBaseUrl = base;
+      res = attempt;
+      break;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  if (!res) {
+    throw lastError instanceof Error ? lastError : new Error('Network request failed');
+  }
+
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || `HTTP ${res.status}`);
@@ -235,4 +280,72 @@ export const api = {
 
   clearChatHistory: () =>
     request<{ cleared: boolean }>('/chat/history', { method: 'DELETE' }),
+
+  // Research cycle
+  getResearchStatus: () =>
+    request<import('@/types').ResearchStatusResponse>('/research/status'),
+
+  rebuildResearchDataset: (data: {
+    output_name?: string;
+    limit?: number;
+    include_unexecuted?: boolean;
+    parquet?: boolean;
+  }) =>
+    request('/research/dataset/rebuild', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  trainResearchModel: (data: {
+    algorithm?: 'logistic_regression' | 'gradient_boosting';
+    target_column?: string;
+    include_unexecuted?: boolean;
+    min_rows?: number;
+  }) =>
+    request('/research/model/train', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  runResearchReplay: (data: {
+    version_id: string;
+    score_threshold?: number;
+    include_unexecuted?: boolean;
+    limit?: number;
+  }) =>
+    request('/research/replay/run', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  runResearchWalkForward: (data: {
+    algorithm?: 'logistic_regression' | 'gradient_boosting';
+    target_column?: string;
+    score_threshold?: number;
+    windows?: number;
+    include_unexecuted?: boolean;
+    limit?: number;
+  }) =>
+    request('/research/walk-forward/run', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  listResearchModels: (limit: number = 50) =>
+    request<{ models: import('@/types').ResearchModelVersion[] }>(`/research/models?limit=${limit}`),
+
+  approveResearchModel: (versionId: string) =>
+    request('/research/models/' + encodeURIComponent(versionId) + '/approve', { method: 'POST' }),
+
+  activateApprovedResearchModel: () =>
+    request('/research/models/activate-approved', { method: 'POST' }),
+
+  generateAttributionReport: (data?: { report_type?: string; limit?: number }) =>
+    request('/research/reports/attribution', {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
+    }),
+
+  listAttributionReports: (limit: number = 20) =>
+    request<{ reports: import('@/types').ResearchReportRecord[] }>(`/research/reports?limit=${limit}`),
 };

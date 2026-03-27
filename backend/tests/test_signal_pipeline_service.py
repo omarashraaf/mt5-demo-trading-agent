@@ -243,6 +243,46 @@ class _DbRecentLosses:
         return []
 
 
+class _BlockingMetaModelService:
+    def set_database(self, _db):
+        return None
+
+    async def assess_trade_decision(
+        self,
+        *,
+        context,
+        trade_decision,
+        gemini_assessment,
+        portfolio_risk_assessment,
+        anti_churn_blocked=False,
+    ):
+        quality = trade_decision.trade_quality_assessment.model_copy(deep=True)
+        quality.no_trade_zone = True
+        quality.no_trade_reasons = list(dict.fromkeys((quality.no_trade_reasons or []) + ["Meta-model blocked trade candidate."]))
+        signal = trade_decision.final_signal.model_copy(deep=True)
+        metadata = dict(signal.metadata or {})
+        metadata["meta_model"] = {"changed_decision": True, "active": True, "blocked": True}
+        signal.metadata = metadata
+        updated = trade_decision.model_copy(
+            update={
+                "trade": False,
+                "final_direction": "HOLD",
+                "final_signal": signal,
+                "trade_quality_assessment": quality,
+                "reasons": list(dict.fromkeys((trade_decision.reasons or []) + ["Meta-model blocked trade candidate."])),
+            }
+        )
+        return updated, {
+            "active": True,
+            "changed_decision": True,
+            "blocked": True,
+            "profit_probability": 0.2,
+            "expected_edge": -0.6,
+            "no_trade_probability": 0.8,
+            "reason": "blocked_by_test",
+        }
+
+
 class SignalPipelineServiceTests(unittest.TestCase):
     def test_pipeline_uses_consistent_multi_timeframe_context(self):
         pipeline = SignalPipelineService(
@@ -380,3 +420,31 @@ class SignalPipelineServiceTests(unittest.TestCase):
 
         self.assertEqual(decision.signal_decision.primary_signal.action, "BUY")
         self.assertIn("Direction adapted", decision.signal_decision.primary_signal.reason)
+
+    def test_meta_model_can_block_but_risk_still_remains_in_path(self):
+        pipeline = SignalPipelineService(
+            connector=_Connector(),
+            market_data=_MarketData(),
+            execution=_Execution(),
+            risk_engine=_RiskEngine(),
+            agents={"SmartAgent": _SmartAgent()},
+            gemini_adapter=_GeminiAdapter(),
+            event_ingestion_service=_EventIngestionService(),
+            trade_quality_service=_AlwaysOpenTradeQualityService(),
+            meta_model_service=_BlockingMetaModelService(),
+        )
+
+        decision = asyncio.run(
+            pipeline.evaluate(
+                symbol="US500",
+                requested_agent_name="SmartAgent",
+                requested_timeframe="H1",
+                evaluation_mode="manual",
+                bar_count=60,
+            )
+        )
+
+        self.assertFalse(decision.allow_execute)
+        self.assertEqual(decision.signal_decision.final_signal.action, "HOLD")
+        self.assertIn("meta-model", decision.reason.lower())
+        self.assertIn("meta_model", decision.risk_evaluation.metrics_snapshot)

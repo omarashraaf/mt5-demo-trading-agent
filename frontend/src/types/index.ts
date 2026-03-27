@@ -407,3 +407,54 @@ export interface TradeHistoryResponse {
   summary: TradeHistorySummary;
   trades: TradeHistoryItem[];
 }
+
+export interface ResearchModelVersion {
+  version_id: string;
+  algorithm: string;
+  target_definition: string;
+  feature_schema_version: string;
+  training_date: number;
+  data_range_start?: number | null;
+  data_range_end?: number | null;
+  evaluation_metrics_json: Record<string, unknown>;
+  walk_forward_metrics_json: Record<string, unknown>;
+  approval_status: 'training' | 'candidate' | 'approved' | 'rejected' | 'archived';
+  notes?: string;
+}
+
+export interface ResearchRunRecord {
+  run_id: string;
+  version_id?: string | null;
+  started_at: number;
+  finished_at?: number | null;
+  status: string;
+  metrics_json?: Record<string, unknown>;
+  params_json?: Record<string, unknown>;
+  notes?: string;
+}
+
+export interface ResearchReportRecord {
+  report_id: string;
+  report_type: string;
+  generated_at: number;
+  report_json: Record<string, unknown>;
+}
+
+export interface ResearchStatusResponse {
+  enabled: boolean;
+  config: {
+    AUTO_TRAIN_ON_DEMO: boolean;
+    AUTO_PROMOTE_ON_DEMO: boolean;
+    MIN_TRADES_BEFORE_TRAINING: number;
+    TRAINING_WINDOW_DAYS: number;
+    WALK_FORWARD_WINDOWS: number;
+  };
+  meta_model_active: boolean;
+  meta_model_active_version: string;
+  active_approved_model?: ResearchModelVersion | null;
+  last_training_run?: ResearchRunRecord | null;
+  last_replay_run?: Record<string, unknown> | null;
+  last_walk_forward_run?: Record<string, unknown> | null;
+  best_candidate_model?: ResearchModelVersion | null;
+  recent_attribution_reports?: Array<Record<string, unknown>>;
+}

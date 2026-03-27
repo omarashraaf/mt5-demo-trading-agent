@@ -16,7 +16,7 @@ function buildApiBaseUrl(): string {
   }
 
   const host = env.VITE_API_HOST?.trim() || window.location.hostname || '127.0.0.1';
-  const port = env.VITE_API_PORT?.trim() || '8000';
+  const port = env.VITE_API_PORT?.trim() || '8002';
   if (!/^\d+$/.test(port)) {
     throw new Error(`Invalid VITE_API_PORT: ${port}`);
   }

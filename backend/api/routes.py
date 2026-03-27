@@ -33,8 +33,9 @@ from services.symbol_universe_service import SymbolUniverseService
 from services.task_orchestrator import TaskOrchestrator
 from services.analytics_service import AnalyticsService
 from services.replay_service import ReplayService
+from services.research_cycle_service import ResearchCycleService
 from services.trade_decision_service import TradeDecisionService
-from domain.models import MarketContext
+from domain.models import MarketContext, TechnicalSignal
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,7 @@ auto_trader = AutoTrader(
 task_orchestrator = TaskOrchestrator(auto_trader)
 analytics_service = AnalyticsService()
 replay_service = ReplayService(signal_pipeline)
+research_cycle_service: Optional[ResearchCycleService] = None
 RUNTIME_STATE_KEY = "runtime_controls_v1"
 CHAT_HISTORY_STATE_KEY = "chat_history_v1"
 DEFAULT_MARGIN_SL_PCT = 0.08
@@ -130,11 +132,16 @@ DEFAULT_MARGIN_TP_PCT = 0.12
 
 def set_database(database: Database):
     global db
+    global research_cycle_service
     db = database
     signal_pipeline.set_database(database)
     execution_service.db = database
     auto_trader.set_database(database)
     event_ingestion_service.set_database(database)
+    research_cycle_service = ResearchCycleService(
+        database,
+        meta_model_service=signal_pipeline.meta_model_service,
+    )
 
 
 def _runtime_state_payload() -> dict:
@@ -282,6 +289,44 @@ async def _pre_execution_checks(
         "margin_required": preflight.margin_required,
         "risk_approval": preflight.risk_approval,
     }
+
+
+def _minimum_sl_tp_distance(
+    *,
+    tick,
+    symbol_info: dict,
+) -> float:
+    point = symbol_info.get("point", 0.00001)
+    stops_level = symbol_info.get("trade_stops_level", 0)
+    spread_points = tick.spread if tick and tick.spread else 10
+    effective_stops = max(stops_level, spread_points, 10)
+    return effective_stops * point * 1.5
+
+
+def _sl_tp_distance_error(
+    *,
+    action: str,
+    tick,
+    symbol_info: dict | None,
+    stop_loss: float | None,
+    take_profit: float | None,
+    volume: float,
+) -> str | None:
+    if not tick or not symbol_info:
+        return None
+    exec_price = tick.ask if action == "BUY" else tick.bid
+    if exec_price <= 0:
+        return "No live price available for execution."
+
+    min_distance = _minimum_sl_tp_distance(tick=tick, symbol_info=symbol_info)
+    contract_size = symbol_info.get("trade_contract_size", 100000)
+    if stop_loss and abs(exec_price - stop_loss) < min_distance:
+        min_sl_dollars = round(min_distance * volume * contract_size, 2)
+        return f"Stop Loss too close to price. Minimum ~${min_sl_dollars:.2f} for your position."
+    if take_profit and abs(take_profit - exec_price) < min_distance:
+        min_tp_dollars = round(min_distance * volume * contract_size, 2)
+        return f"Take Profit too close to price. Minimum ~${min_tp_dollars:.2f} for your position."
+    return None
 
 
 async def _persist_credentials_if_requested(
@@ -890,12 +935,26 @@ def _build_trade_comment(
 ) -> str:
     if amount_usd is None or amount_usd <= 0:
         return "TradingAgent"
-    parts = [f"TA:${float(amount_usd):.2f}"]
+    # MT5 order comment constraints are broker-dependent, but many servers reject
+    # long/special-char payloads. Keep compact ASCII-only <= 31 chars.
+    parts = [f"TA{int(round(float(amount_usd)))}"]
     if sl_amount_usd is not None and sl_amount_usd > 0:
-        parts.append(f"SLA:${float(sl_amount_usd):.2f}")
+        parts.append(f"SL{int(round(float(sl_amount_usd)))}")
     if tp_amount_usd is not None and tp_amount_usd > 0:
-        parts.append(f"TPA:${float(tp_amount_usd):.2f}")
-    return "|".join(parts)
+        parts.append(f"TP{int(round(float(tp_amount_usd)))}")
+    comment = "|".join(parts)
+    # Hard cap for broad MT5 compatibility.
+    if len(comment) > 31:
+        # Keep TA first, then SL/TP if space remains.
+        compact = parts[0]
+        for token in parts[1:]:
+            trial = f"{compact}|{token}"
+            if len(trial) <= 31:
+                compact = trial
+            else:
+                break
+        comment = compact[:31]
+    return comment
 
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -1282,6 +1341,20 @@ async def quick_buy(req: QuickBuyRequest):
             await _store_management_plan(result.ticket, signal_id, symbol, action, decision)
             if signal_id:
                 await db.mark_evaluation_outcome(signal_id, "opened")
+                account = connector.refresh_account() if connector.connected else None
+                await db.mark_trade_candidate_execution(
+                    signal_id=signal_id,
+                    executed=True,
+                    ticket=result.ticket,
+                    fill_price=result.price,
+                    slippage_estimate=0.0,
+                    margin_snapshot={
+                        "balance": float(account.balance) if account else 0.0,
+                        "equity": float(account.equity) if account else 0.0,
+                        "margin": float(account.margin) if account else 0.0,
+                        "free_margin": float(account.free_margin) if account else 0.0,
+                    },
+                )
 
     return result.model_dump()
 
@@ -1569,6 +1642,20 @@ async def execute_trade(req: ExecuteTradeRequest):
             await _store_management_plan(result.ticket, req.signal_id, resolved_symbol, req.action, decision)
             if req.signal_id:
                 await db.mark_evaluation_outcome(req.signal_id, "opened")
+                account = connector.refresh_account() if connector.connected else None
+                await db.mark_trade_candidate_execution(
+                    signal_id=req.signal_id,
+                    executed=True,
+                    ticket=result.ticket,
+                    fill_price=result.price,
+                    slippage_estimate=0.0,
+                    margin_snapshot={
+                        "balance": float(account.balance) if account else 0.0,
+                        "equity": float(account.equity) if account else 0.0,
+                        "margin": float(account.margin) if account else 0.0,
+                        "free_margin": float(account.free_margin) if account else 0.0,
+                    },
+                )
 
     return result.model_dump()
 
@@ -1710,19 +1797,23 @@ async def get_trade_history(limit: int = 50):
 
     def _extract_started_amount(comment: str | None, signal_reason: str | None):
         for text in (comment or "", signal_reason or ""):
-            m = re.search(r"TA:\$(\d+(?:\.\d+)?)|\$(\d+(?:\.\d+)?)", text or "", re.IGNORECASE)
+            m = re.search(
+                r"TA:\$(\d+(?:\.\d+)?)|TA(\d+(?:\.\d+)?)|\$(\d+(?:\.\d+)?)",
+                text or "",
+                re.IGNORECASE,
+            )
             if m:
-                value = m.group(1) or m.group(2)
+                value = m.group(1) or m.group(2) or m.group(3)
                 if value:
                     return float(value), "provided"
         return None, "unknown"
 
     def _extract_comment_named_amount(comment: str | None, key: str) -> Optional[float]:
-        m = re.search(rf"{key}:\$(\d+(?:\.\d+)?)", comment or "", re.IGNORECASE)
+        m = re.search(rf"{key}:\$(\d+(?:\.\d+)?)|{key}(\d+(?:\.\d+)?)", comment or "", re.IGNORECASE)
         if not m:
             return None
         try:
-            return float(m.group(1))
+            return float(m.group(1) or m.group(2))
         except Exception:
             return None
 
@@ -1969,10 +2060,13 @@ async def smart_evaluate(req: SmartEvaluateRequest):
     if not connector.connected:
         raise HTTPException(status_code=400, detail="Not connected")
 
-    MAX_SCAN_SYMBOLS = 80
+    # Keep scan wide enough so categories (especially commodities) are represented.
+    MAX_SCAN_SYMBOLS = 30
+    PER_SYMBOL_TIMEOUT_SECONDS = 4.0
+    MAX_CONCURRENT_EVALS = 4
     symbols = req.symbols or risk_engine.settings.allowed_symbols
     market_universe = universe_service.filter_market_symbols(
-        market_data.get_all_symbols(),
+        market_data.get_tradeable_symbols(),
         include_inactive=False,
     )
     symbol_lookup = {
@@ -1982,24 +2076,32 @@ async def smart_evaluate(req: SmartEvaluateRequest):
     }
 
     if not symbols:
-        symbols = [item.get("name", "") for item in market_universe if item.get("name")]
-        symbols = [name for name in symbols if name][:MAX_SCAN_SYMBOLS]
+        # Use canonical universe selection to reduce alias duplicates and include the full active set.
+        symbols = universe_service.candidate_universe(market_universe)[:MAX_SCAN_SYMBOLS]
     else:
-        symbols = universe_service.restrict_symbols(symbols)[:MAX_SCAN_SYMBOLS]
+        direct = []
+        for sym in symbols:
+            key = str(sym or "").strip()
+            if key and key in symbol_lookup:
+                direct.append(key)
+        symbols = (direct or universe_service.restrict_symbols(symbols))[:MAX_SCAN_SYMBOLS]
 
-    recommendations = []
-    for sym in symbols:
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_EVALS)
+
+    async def evaluate_symbol(sym: str) -> dict | None:
         try:
-            execution_decision = await asyncio.wait_for(
-                signal_pipeline.evaluate(
-                    symbol=sym,
-                    requested_agent_name="SmartAgent",
-                    requested_timeframe="H1",
-                    evaluation_mode="scan",
-                    bar_count=100,
-                ),
-                timeout=6.0,
-            )
+            async with semaphore:
+                execution_decision = await asyncio.wait_for(
+                    signal_pipeline.evaluate(
+                        symbol=sym,
+                        requested_agent_name="SmartAgent",
+                        requested_timeframe="H1",
+                        # Keep bulk dashboard scan deterministic and fast (no Gemini/news round-trip).
+                        evaluation_mode="manual",
+                        bar_count=100,
+                    ),
+                    timeout=PER_SYMBOL_TIMEOUT_SECONDS,
+                )
             signal_id = await signal_pipeline.persist_evaluation(execution_decision, "multi")
             signal = execution_decision.signal_decision.final_signal
             risk_decision = execution_decision.risk_evaluation
@@ -2007,15 +2109,48 @@ async def smart_evaluate(req: SmartEvaluateRequest):
             entry_price = execution_decision.entry_price
             category = context.symbol_info.category if context.symbol_info else "Other"
             description = context.symbol_info.description if context.symbol_info else ""
+            ready_to_execute = execution_decision.allow_execute
+            execution_reason = execution_decision.reason
+            if (
+                category == "Other"
+                and "inactive in the current mode" in str(execution_reason).lower()
+            ):
+                return None
 
-            recommendations.append({
+            if ready_to_execute and signal.action in {"BUY", "SELL"}:
+                preflight = await execution_service.preflight_for_context_signal(
+                    context=context,
+                    candidate_signal=signal,
+                    volume=max(risk_decision.adjusted_volume, risk_engine.settings.fixed_lot_size),
+                    reference_spread=context.tick.get("spread", 0.0) if context.tick else 0.0,
+                    evaluation_mode="manual",
+                )
+                if not preflight.approved:
+                    ready_to_execute = False
+                    execution_reason = preflight.reason
+                else:
+                    tick = market_data.get_tick(sym)
+                    sym_info = market_data.get_symbol_info(sym)
+                    dist_error = _sl_tp_distance_error(
+                        action=signal.action,
+                        tick=tick,
+                        symbol_info=sym_info,
+                        stop_loss=signal.stop_loss,
+                        take_profit=signal.take_profit,
+                        volume=max(risk_decision.adjusted_volume, risk_engine.settings.fixed_lot_size),
+                    )
+                    if dist_error:
+                        ready_to_execute = False
+                        execution_reason = dist_error
+
+            return {
                 "symbol": sym,
                 "signal": signal.to_trade_signal().model_dump(),
                 "signal_id": signal_id,
                 "risk_decision": risk_decision.model_dump(),
                 "entry_price_estimate": entry_price,
                 "explanation": signal.reason,
-                "ready_to_execute": execution_decision.allow_execute,
+                "ready_to_execute": ready_to_execute,
                 "category": category,
                 "description": description,
                 "degraded_reasons": execution_decision.signal_decision.degraded_reasons,
@@ -2025,37 +2160,15 @@ async def smart_evaluate(req: SmartEvaluateRequest):
                 "gemini_confirmation": execution_decision.signal_decision.gemini_confirmation.model_dump()
                 if execution_decision.signal_decision.gemini_confirmation
                 else None,
-                "execution_reason": execution_decision.reason,
-            })
+                "execution_reason": execution_reason,
+            }
         except Exception as exc:
-            logger.error("Smart evaluate error for %s: %s", sym, exc)
+            logger.error("Smart evaluate error for %s: %r", sym, exc, exc_info=True)
             symbol_info = symbol_lookup.get(sym, {})
-            recommendations.append({
-                "symbol": sym,
-                "signal": {
-                    "action": "HOLD",
-                    "confidence": 0.0,
-                    "stop_loss": None,
-                    "take_profit": None,
-                    "max_holding_minutes": None,
-                    "reason": "No executable market data right now.",
-                },
-                "signal_id": None,
-                "risk_decision": {
-                    "approved": False,
-                    "reason": "No executable market data right now.",
-                    "adjusted_volume": 0.0,
-                    "warnings": [],
-                },
-                "entry_price_estimate": float(symbol_info.get("bid") or 0.0),
-                "explanation": "Symbol is listed, but cannot be executed now (market closed or missing live quote/history).",
-                "ready_to_execute": False,
-                "category": universe_service.normalize_asset_class(symbol_info.get("category")),
-                "description": symbol_info.get("description", ""),
-                "degraded_reasons": ["scan_error"],
-                "gemini_confirmation": None,
-                "execution_reason": "Symbol unavailable for execution in current market conditions.",
-            })
+            return None
+
+    evaluations = await asyncio.gather(*(evaluate_symbol(sym) for sym in symbols))
+    recommendations = [item for item in evaluations if item is not None]
 
     recommendations.sort(
         key=lambda r: (
@@ -2099,31 +2212,41 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
 
     symbol = signal_data["symbol"]
     requested_agent_name = _requested_agent_from_final_name(signal_data.get("agent_name", "SmartAgent"))
-    decision = await signal_pipeline.evaluate(
+    action = str(signal_data.get("action", "")).upper()
+    if action not in ("BUY", "SELL"):
+        return {
+            "success": False,
+            "retcode": -1,
+            "retcode_desc": signal_data.get("reason") or "Signal is no longer executable.",
+            "ticket": None,
+            "volume": None,
+            "price": None,
+            "stop_loss": signal_data.get("stop_loss"),
+            "take_profit": signal_data.get("take_profit"),
+            "comment": "",
+        }
+
+    context = signal_pipeline.build_market_context(
         symbol=symbol,
-        requested_agent_name=requested_agent_name,
         requested_timeframe=signal_data.get("timeframe", "H1"),
         evaluation_mode="manual",
         bar_count=100,
     )
-    current_signal = decision.signal_decision.final_signal
-    action = current_signal.action
-    if action not in ("BUY", "SELL") or not decision.allow_execute:
-        return {
-            "success": False,
-            "retcode": -1,
-            "retcode_desc": decision.reason,
-            "ticket": None,
-            "volume": None,
-            "price": None,
-            "stop_loss": current_signal.stop_loss,
-            "take_profit": current_signal.take_profit,
-            "comment": "",
-        }
+    current_signal = TechnicalSignal(
+        agent_name=signal_data.get("agent_name", "SmartAgent"),
+        action=action,
+        confidence=float(signal_data.get("confidence", 0.0) or 0.0),
+        stop_loss=signal_data.get("stop_loss"),
+        take_profit=signal_data.get("take_profit"),
+        max_holding_minutes=signal_data.get("max_holding_minutes"),
+        reason=signal_data.get("reason", ""),
+        strategy="recommendation_snapshot",
+        metadata={"source": "signal_snapshot"},
+    )
 
     sl = req.custom_stop_loss if req.custom_stop_loss and req.custom_stop_loss > 0 else current_signal.stop_loss
     tp = req.custom_take_profit if req.custom_take_profit and req.custom_take_profit > 0 else current_signal.take_profit
-    volume = decision.risk_evaluation.adjusted_volume or risk_engine.settings.fixed_lot_size
+    volume = risk_engine.settings.fixed_lot_size
     sl_amount_for_comment: float | None = None
     tp_amount_for_comment: float | None = None
 
@@ -2131,6 +2254,18 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
     tick = market_data.get_tick(symbol)
     sym_info = market_data.get_symbol_info(symbol)
     if req.amount_usd and req.amount_usd > 0 and sym_info and tick:
+        decision_for_targets = None
+        try:
+            decision_for_targets = await signal_pipeline.evaluate(
+                symbol=symbol,
+                requested_agent_name=requested_agent_name,
+                requested_timeframe=signal_data.get("timeframe", "H1"),
+                evaluation_mode="manual",
+                bar_count=100,
+            )
+        except Exception as exc:
+            logger.warning("Could not refresh dynamic target context for recommendation %s: %s", symbol, exc)
+
         price = tick.ask if action == "BUY" else tick.bid
         contract_size = sym_info.get("trade_contract_size", 100000)
         vol_min = sym_info.get("volume_min", 0.01)
@@ -2153,7 +2288,7 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
                 sl_amount, tp_amount = await _derive_dynamic_amount_targets(
                     amount_usd=req.amount_usd,
                     action=action,
-                    decision=decision,
+                    decision=decision_for_targets,
                 )
                 sl_amount_for_comment = sl_amount
                 tp_amount_for_comment = tp_amount
@@ -2179,39 +2314,35 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
         if tp_amount_for_comment is None and tp is not None and tp > 0:
             tp_amount_for_comment = abs(tp - entry_ref_price) * volume * contract_size_for_comment
 
-    execution_guard = await _pre_execution_checks(
-        symbol=symbol,
-        action=action,
+    candidate_signal = current_signal.model_copy(
+        update={
+            "stop_loss": sl,
+            "take_profit": tp,
+        }
+    )
+    preflight = await execution_service.preflight_for_context_signal(
+        context=context,
+        candidate_signal=candidate_signal,
         volume=volume,
+        reference_spread=context.tick.get("spread", 0.0) if context.tick else 0.0,
+        evaluation_mode="manual",
+    )
+    if not preflight.approved:
+        raise HTTPException(status_code=409, detail=preflight.reason)
+
+    if preflight.risk_approval and preflight.risk_approval.risk_evaluation.adjusted_volume > 0:
+        volume = preflight.risk_approval.risk_evaluation.adjusted_volume
+
+    dist_error = _sl_tp_distance_error(
+        action=action,
+        tick=tick,
+        symbol_info=sym_info,
         stop_loss=sl,
         take_profit=tp,
-        reference_spread=decision.signal_decision.market_context.tick.get("spread", 0.0)
-        if decision.signal_decision.market_context.tick
-        else 0.0,
-        requested_agent_name=requested_agent_name,
+        volume=volume,
     )
-
-    # Validate SL/TP minimum distance (STOPLEVEL + spread)
-    if tick and sym_info:
-        exec_price = tick.ask if action == "BUY" else tick.bid
-        point = sym_info.get("point", 0.00001)
-        stops_level = sym_info.get("trade_stops_level", 0)
-        spread_points = tick.spread if tick.spread else 10
-        effective_stops = max(stops_level, spread_points, 10)
-        min_distance = effective_stops * point * 1.5
-        contract_size = sym_info.get("trade_contract_size", 100000)
-        if sl and abs(exec_price - sl) < min_distance:
-            min_sl_dollars = round(min_distance * volume * contract_size, 2)
-            raise HTTPException(
-                status_code=400,
-                detail=f"Stop Loss too close to price. Minimum ~${min_sl_dollars:.2f} for your position.",
-            )
-        if tp and abs(tp - exec_price) < min_distance:
-            min_tp_dollars = round(min_distance * volume * contract_size, 2)
-            raise HTTPException(
-                status_code=400,
-                detail=f"Take Profit too close to price. Minimum ~${min_tp_dollars:.2f} for your position.",
-            )
+    if dist_error:
+        raise HTTPException(status_code=400, detail=dist_error)
 
     amt_label = _build_trade_comment(req.amount_usd, sl_amount_for_comment, tp_amount_for_comment)
     order_req = OrderRequest(
@@ -2222,7 +2353,7 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
         take_profit=tp or 0.0,
         comment=amt_label,
     )
-    result = execution_service.place_order_if_approved(order_req, execution_guard["preflight"])
+    result = execution_service.place_order_if_approved(order_req, preflight)
 
     if db:
         await db.log_order(
@@ -2238,8 +2369,29 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
                 result.ticket, "opened", symbol,
                 f"{action} {order_req.volume} lots at {result.price}"
             )
+            decision = await signal_pipeline.evaluate(
+                symbol=symbol,
+                requested_agent_name=requested_agent_name,
+                requested_timeframe=signal_data.get("timeframe", "H1"),
+                evaluation_mode="manual",
+                bar_count=100,
+            )
             await _store_management_plan(result.ticket, req.signal_id, symbol, action, decision)
             await db.mark_evaluation_outcome(req.signal_id, "opened")
+            account = connector.refresh_account() if connector.connected else None
+            await db.mark_trade_candidate_execution(
+                signal_id=req.signal_id,
+                executed=True,
+                ticket=result.ticket,
+                fill_price=result.price,
+                slippage_estimate=0.0,
+                margin_snapshot={
+                    "balance": float(account.balance) if account else 0.0,
+                    "equity": float(account.equity) if account else 0.0,
+                    "margin": float(account.margin) if account else 0.0,
+                    "free_margin": float(account.free_margin) if account else 0.0,
+                },
+            )
 
     return result.model_dump()
 
@@ -2333,6 +2485,167 @@ async def holding_time_analytics(limit: int = 500):
         raise HTTPException(status_code=500, detail="Database not available")
     outcomes = await db.get_trade_outcomes(limit=limit)
     return analytics_service.holding_time_analysis(outcomes)
+
+
+def _get_research_cycle_service() -> ResearchCycleService:
+    if research_cycle_service is None:
+        raise HTTPException(status_code=500, detail="Research cycle service is unavailable")
+    return research_cycle_service
+
+
+def _require_research_enabled():
+    if not config.ENABLE_RESEARCH_CYCLE:
+        raise HTTPException(
+            status_code=403,
+            detail="Research cycle is disabled. Set ENABLE_RESEARCH_CYCLE=true to use research endpoints.",
+        )
+
+
+class DatasetRebuildRequest(BaseModel):
+    output_name: str = "trade_dataset"
+    limit: int = 100000
+    include_unexecuted: bool = True
+    parquet: bool = False
+
+
+class TrainModelRequest(BaseModel):
+    algorithm: Literal["logistic_regression", "gradient_boosting"] = "logistic_regression"
+    target_column: str = "profitable_after_costs_90m"
+    include_unexecuted: bool = True
+    min_rows: int = 30
+
+
+class ResearchReplayRequest(BaseModel):
+    version_id: str
+    score_threshold: float = 0.55
+    include_unexecuted: bool = True
+    limit: int = 200000
+
+
+class WalkForwardRequest(BaseModel):
+    algorithm: Literal["logistic_regression", "gradient_boosting"] = "logistic_regression"
+    target_column: str = "profitable_after_costs_90m"
+    score_threshold: float = 0.55
+    windows: int = 5
+    include_unexecuted: bool = True
+    limit: int = 200000
+
+
+class AttributionReportRequest(BaseModel):
+    report_type: str = "full"
+    limit: int = 2000
+
+
+@router.get("/research/status")
+async def research_status():
+    service = _get_research_cycle_service()
+    snapshot = await service.status_snapshot()
+    return {
+        "enabled": bool(config.ENABLE_RESEARCH_CYCLE),
+        "config": {
+            "AUTO_TRAIN_ON_DEMO": bool(config.AUTO_TRAIN_ON_DEMO),
+            "AUTO_PROMOTE_ON_DEMO": bool(config.AUTO_PROMOTE_ON_DEMO),
+            "MIN_TRADES_BEFORE_TRAINING": int(config.MIN_TRADES_BEFORE_TRAINING),
+            "TRAINING_WINDOW_DAYS": int(config.TRAINING_WINDOW_DAYS),
+            "WALK_FORWARD_WINDOWS": int(config.WALK_FORWARD_WINDOWS),
+        },
+        **snapshot,
+    }
+
+
+@router.post("/research/dataset/rebuild")
+async def research_rebuild_dataset(req: DatasetRebuildRequest):
+    _require_research_enabled()
+    service = _get_research_cycle_service()
+    return await service.rebuild_dataset(
+        output_name=req.output_name,
+        limit=max(100, min(req.limit, 500000)),
+        include_unexecuted=req.include_unexecuted,
+        parquet=req.parquet,
+    )
+
+
+@router.post("/research/model/train")
+async def research_train_model(req: TrainModelRequest):
+    _require_research_enabled()
+    service = _get_research_cycle_service()
+    return await service.train_candidate_model(
+        algorithm=req.algorithm,
+        target_column=req.target_column,
+        include_unexecuted=req.include_unexecuted,
+        min_rows=max(10, min(req.min_rows, 50000)),
+    )
+
+
+@router.post("/research/replay/run")
+async def research_run_replay(req: ResearchReplayRequest):
+    _require_research_enabled()
+    service = _get_research_cycle_service()
+    return await service.run_replay(
+        version_id=req.version_id,
+        score_threshold=max(0.0, min(req.score_threshold, 1.0)),
+        include_unexecuted=req.include_unexecuted,
+        limit=max(100, min(req.limit, 500000)),
+    )
+
+
+@router.post("/research/walk-forward/run")
+async def research_run_walk_forward(req: WalkForwardRequest):
+    _require_research_enabled()
+    service = _get_research_cycle_service()
+    return await service.run_walk_forward(
+        algorithm=req.algorithm,
+        target_column=req.target_column,
+        score_threshold=max(0.0, min(req.score_threshold, 1.0)),
+        windows=max(2, min(req.windows, 50)),
+        include_unexecuted=req.include_unexecuted,
+        limit=max(100, min(req.limit, 500000)),
+    )
+
+
+@router.get("/research/models")
+async def research_list_models(limit: int = 50):
+    service = _get_research_cycle_service()
+    return {
+        "models": await service.list_model_versions(limit=max(1, min(limit, 200))),
+    }
+
+
+@router.post("/research/models/{version_id}/approve")
+async def research_approve_model(version_id: str):
+    _require_research_enabled()
+    service = _get_research_cycle_service()
+    model = await service.approve_model(version_id)
+    activated = await service.activate_approved_model()
+    return {
+        "approved_model": model,
+        "activation": activated,
+    }
+
+
+@router.post("/research/models/activate-approved")
+async def research_activate_approved_model():
+    service = _get_research_cycle_service()
+    return await service.activate_approved_model()
+
+
+@router.post("/research/reports/attribution")
+async def research_generate_attribution(req: AttributionReportRequest):
+    _require_research_enabled()
+    service = _get_research_cycle_service()
+    return await service.generate_attribution_report(
+        report_type=req.report_type,
+        limit=max(100, min(req.limit, 100000)),
+    )
+
+
+@router.get("/research/reports")
+async def research_list_reports(limit: int = 20):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    return {
+        "reports": await db.list_attribution_reports(limit=max(1, min(limit, 100))),
+    }
 
 
 # --- Auto-Trade Routes ---

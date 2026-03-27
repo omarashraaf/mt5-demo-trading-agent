@@ -17,6 +17,12 @@ release/
 # Logs
 *.log
 
+# Research exports
+backend/research_exports/
+research_exports/
+backend/research_artifacts/
+research_artifacts/
+
 # IDE
 .idea/
 .vscode/

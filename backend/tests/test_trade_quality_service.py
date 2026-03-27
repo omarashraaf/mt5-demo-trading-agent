@@ -159,3 +159,46 @@ class TradeQualityServiceTests(unittest.TestCase):
         )
         result = self.service.assess(context, signal, None, portfolio_fit_score=0.7)
         self.assertFalse(any("Reward:risk deteriorated" in reason for reason in result.no_trade_reasons))
+
+    def test_spread_limit_is_converted_to_points(self):
+        context = self.context.model_copy(
+            update={
+                "symbol": "XPDUSD",
+                "symbol_info": self.context.symbol_info.model_copy(
+                    update={
+                        "name": "XPDUSD",
+                        "category": "Commodities",
+                        "point": 0.001,
+                        "digits": 3,
+                    }
+                ),
+                "profile": self.context.profile.model_copy(
+                    update={
+                        "profile_name": "Commodities",
+                        "category": "Commodities",
+                        "max_spread": 35.0,
+                    }
+                ),
+                "tick": {"bid": 1376.0, "ask": 1380.68, "spread": 4680.0},
+                "evaluation_mode": "manual",
+            }
+        )
+        signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="SELL",
+            confidence=0.7,
+            stop_loss=1385.0,
+            take_profit=1360.0,
+            metadata={
+                "h1_trend": "bearish",
+                "h4_trend": "bearish",
+                "momentum_score": 0.15,
+                "entry_score": 0.1,
+                "entry_signal": "sell",
+                "atr_pct": 0.5,
+                "position_in_range": 0.6,
+                "ema_distance_atr": 0.8,
+            },
+        )
+        result = self.service.assess(context, signal, None, portfolio_fit_score=0.7)
+        self.assertFalse(any("Spread too wide for Commodities" in reason for reason in result.no_trade_reasons))

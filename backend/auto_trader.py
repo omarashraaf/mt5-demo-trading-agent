@@ -127,8 +127,6 @@ class AutoTrader:
         logger.info("Auto-trade loop started")
         while self._running:
             try:
-                interval = self.risk_engine.settings.auto_trade_scan_interval_seconds
-                await asyncio.sleep(interval)
                 self._state.mark_heartbeat()
 
                 if not self._running:
@@ -145,10 +143,14 @@ class AutoTrader:
 
                 if not self.risk_engine.auto_trade_enabled:
                     logger.debug("Auto-trader: auto-trade disabled, skipping")
-                    continue
+                else:
+                    await self._scan_and_trade()
+                    self._state.mark_cycle()
 
-                await self._scan_and_trade()
-                self._state.mark_cycle()
+                if not self._running:
+                    break
+                interval = self.risk_engine.settings.auto_trade_scan_interval_seconds
+                await asyncio.sleep(interval)
 
             except asyncio.CancelledError:
                 break
@@ -264,10 +266,16 @@ class AutoTrader:
                 if not tick:
                     self._log_auto_trade(sym, signal, "Live tick unavailable at execution time", False, quality.final_trade_quality_score)
                     continue
+                symbol_point = context.symbol_info.point if context.symbol_info and context.symbol_info.point else 0.0
+                spread_limit_points = (
+                    (context.profile.max_spread / symbol_point)
+                    if context.profile and symbol_point > 0
+                    else settings.max_spread_threshold
+                )
                 if self.signal_pipeline.anti_churn_service.spread_deteriorated(
                     decision.signal_decision.market_context.tick.get("spread", 0.0) if decision.signal_decision.market_context.tick else 0.0,
                     tick.spread,
-                    context.profile.max_spread if context.profile else settings.max_spread_threshold,
+                    spread_limit_points,
                 ):
                     self._log_auto_trade(sym, signal, "Spread deteriorated before execution", False, quality.final_trade_quality_score)
                     continue
@@ -345,6 +353,20 @@ class AutoTrader:
                             plan=decision.position_management_plan.model_dump(),
                         )
                         await self.db.mark_evaluation_outcome(signal_id, "opened")
+                        account = self.connector.refresh_account() if self.connector.connected else None
+                        await self.db.mark_trade_candidate_execution(
+                            signal_id=signal_id,
+                            executed=True,
+                            ticket=result.ticket,
+                            fill_price=result.price,
+                            slippage_estimate=0.0,
+                            margin_snapshot={
+                                "balance": float(account.balance) if account else 0.0,
+                                "equity": float(account.equity) if account else 0.0,
+                                "margin": float(account.margin) if account else 0.0,
+                                "free_margin": float(account.free_margin) if account else 0.0,
+                            },
+                        )
 
                 if result.success:
                     logger.info("AUTO-TRADE SUCCESS: %s ticket=%s price=%s", sym, result.ticket, result.price)

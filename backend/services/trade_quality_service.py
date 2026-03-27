@@ -96,11 +96,24 @@ class TradeQualityService:
         entry_price = tick.get("ask", 0.0) if signal.action == "BUY" else tick.get("bid", 0.0)
         rr_ratio = self._reward_risk_ratio(entry_price, signal.stop_loss, signal.take_profit)
         atr_pct = float(meta.get("atr_pct", 0.0))
-        spread = float(tick.get("spread", 0.0))
+        spread_points = float(tick.get("spread", 0.0))
+        symbol_point = float(context.symbol_info.point) if context.symbol_info and context.symbol_info.point else 0.0
         policy_min_rr = float(user_policy.get("min_reward_risk", 1.8))
-        effective_min_rr = max(1.0, policy_min_rr)
+        effective_min_rr = max(0.8, policy_min_rr)
         profile_threshold = profile.quality_threshold if profile else 0.75
         threshold = round(min(0.95, profile_threshold + self._mode_threshold_adjustment(user_policy) + threshold_boost), 2)
+        mode = str(user_policy.get("mode", "balanced")).lower()
+        spread_mode_multiplier = {
+            "safe": 0.9,
+            "balanced": 1.0,
+            "aggressive": 2.0,
+        }.get(mode, 1.0)
+        profile_spread_limit_points = (
+            self._spread_limit_points(profile.max_spread, symbol_point)
+            if profile
+            else 20.0
+        )
+        profile_spread_limit_points *= spread_mode_multiplier
 
         h1_trend = meta.get("h1_trend", "flat")
         h4_trend = meta.get("h4_trend", "flat")
@@ -113,11 +126,11 @@ class TradeQualityService:
         entry_timing_score = _clamp(0.45 + float(meta.get("entry_score", 0.0)) * 3.0)
         volatility_quality_score = self._volatility_score(atr_pct, profile.min_atr_pct if profile else 0.2)
         reward_risk_score = self._reward_risk_score(rr_ratio, effective_min_rr)
-        spread_quality_score = self._spread_score(spread, profile.max_spread if profile else 20.0)
+        spread_quality_score = self._spread_score(spread_points, profile_spread_limit_points)
         news_alignment_score, contradiction_penalty = self._news_alignment(signal, gemini_assessment)
 
         no_trade_reasons: list[str] = []
-        if contradicting_structure:
+        if contradicting_structure and mode != "aggressive":
             no_trade_reasons.append("H1 and H4 structure disagree.")
         if not user_policy.get("allow_counter_trend_trades", False) and not aligned:
             no_trade_reasons.append("User policy blocks counter-trend or weakly aligned trades.")
@@ -125,9 +138,10 @@ class TradeQualityService:
             no_trade_reasons.append(
                 f"ATR regime too weak for {profile.profile_name} ({atr_pct:.2f}% < {profile.min_atr_pct:.2f}%)."
             )
-        if profile and spread > profile.max_spread:
+        if profile and spread_points > profile_spread_limit_points:
+            spread_price = spread_points * symbol_point if symbol_point > 0 else spread_points
             no_trade_reasons.append(
-                f"Spread too wide for {profile.profile_name} ({spread:.1f} > {profile.max_spread:.1f})."
+                f"Spread too wide for {profile.profile_name} ({spread_points:.1f} pts / {spread_price:.3f} > {profile.max_spread:.3f})."
             )
         if rr_ratio < effective_min_rr:
             no_trade_reasons.append(f"Reward:risk deteriorated to {rr_ratio:.2f}.")
@@ -196,7 +210,7 @@ class TradeQualityService:
         return {
             "safe": 0.05,
             "balanced": 0.0,
-            "aggressive": -0.03,
+            "aggressive": -0.08,
         }.get(mode, 0.0)
 
     def _reward_risk_ratio(
@@ -233,6 +247,13 @@ class TradeQualityService:
         if spread >= max_spread:
             return 0.0
         return round(_clamp(1.0 - spread / max(max_spread, 1.0)), 3)
+
+    def _spread_limit_points(self, max_spread: float, point: float) -> float:
+        # MT5 tick spread is in points, while profile limits are maintained in
+        # price terms. Convert to points before comparison.
+        if point <= 0:
+            return max_spread
+        return max_spread / point
 
     def _news_alignment(
         self,

@@ -90,6 +90,12 @@ class AppConfig(BaseModel):
             "BRENT": "commodities",
         }
     )
+    ENABLE_RESEARCH_CYCLE: bool = False
+    AUTO_TRAIN_ON_DEMO: bool = False
+    AUTO_PROMOTE_ON_DEMO: bool = False
+    MIN_TRADES_BEFORE_TRAINING: int = Field(default=50, ge=10, le=100000)
+    TRAINING_WINDOW_DAYS: int = Field(default=90, ge=7, le=3650)
+    WALK_FORWARD_WINDOWS: int = Field(default=5, ge=2, le=50)
 
     @field_validator("LOG_LEVEL")
     @classmethod
@@ -189,6 +195,12 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
                 }
             ),
         ),
+        "ENABLE_RESEARCH_CYCLE": _read_bool(source.get("ENABLE_RESEARCH_CYCLE"), False),
+        "AUTO_TRAIN_ON_DEMO": _read_bool(source.get("AUTO_TRAIN_ON_DEMO"), False),
+        "AUTO_PROMOTE_ON_DEMO": _read_bool(source.get("AUTO_PROMOTE_ON_DEMO"), False),
+        "MIN_TRADES_BEFORE_TRAINING": int(source.get("MIN_TRADES_BEFORE_TRAINING", "50")),
+        "TRAINING_WINDOW_DAYS": int(source.get("TRAINING_WINDOW_DAYS", "90")),
+        "WALK_FORWARD_WINDOWS": int(source.get("WALK_FORWARD_WINDOWS", "5")),
     }
     return AppConfig(**data)
 

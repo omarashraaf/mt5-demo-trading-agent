@@ -42,10 +42,39 @@ class ExecutionService:
             scan_window_id=scan_window_id,
         )
         context = decision.signal_decision.market_context
+        candidate_signal = self._candidate_signal(
+            base_signal=decision.signal_decision.final_signal,
+            action=action,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+        return await self.preflight_for_context_signal(
+            context=context,
+            candidate_signal=candidate_signal,
+            volume=volume,
+            reference_spread=reference_spread,
+            evaluation_mode=evaluation_mode,
+            scan_window_id=scan_window_id,
+        )
+
+    async def preflight_for_context_signal(
+        self,
+        *,
+        context,
+        candidate_signal: TechnicalSignal,
+        volume: float,
+        reference_spread: float,
+        evaluation_mode: str = "manual",
+        scan_window_id: str | None = None,
+    ) -> ExecutionPreflightAssessment:
+        action = candidate_signal.action
+        stop_loss = candidate_signal.stop_loss
+        take_profit = candidate_signal.take_profit
         profile = context.profile
         tick = context.tick or {}
         entry_price = tick.get("ask", 0.0) if action == "BUY" else tick.get("bid", 0.0)
-        current_spread = float(tick.get("spread", 0.0))
+        current_spread_points = float(tick.get("spread", 0.0))
+        symbol_point = float(context.symbol_info.point) if context.symbol_info and context.symbol_info.point else 0.0
 
         if not tick or entry_price <= 0:
             return ExecutionPreflightAssessment(
@@ -53,27 +82,37 @@ class ExecutionService:
                 reason="No live price available for execution.",
             )
 
+        profile_spread_limit_points = (
+            self._spread_limit_points(profile.max_spread, symbol_point)
+            if profile
+            else 0.0
+        )
+
         if (
             profile
             and self.signal_pipeline.anti_churn_service.spread_deteriorated(
                 reference_spread,
-                current_spread,
-                profile.max_spread,
+                current_spread_points,
+                profile_spread_limit_points,
             )
         ):
             return ExecutionPreflightAssessment(
                 approved=False,
                 reason="Spread deteriorated after evaluation.",
                 entry_price=entry_price,
-                current_spread=current_spread,
+                current_spread=current_spread_points,
             )
 
-        if profile and current_spread > profile.max_spread:
+        if profile and current_spread_points > profile_spread_limit_points:
+            spread_price = current_spread_points * symbol_point if symbol_point > 0 else current_spread_points
             return ExecutionPreflightAssessment(
                 approved=False,
-                reason=f"Spread {current_spread:.1f} is above the profile limit {profile.max_spread:.1f}.",
+                reason=(
+                    f"Spread {current_spread_points:.1f} pts / {spread_price:.3f} "
+                    f"is above the profile limit {profile.max_spread:.3f}."
+                ),
                 entry_price=entry_price,
-                current_spread=current_spread,
+                current_spread=current_spread_points,
             )
 
         reward_risk = self._reward_risk_ratio(entry_price, stop_loss, take_profit)
@@ -86,7 +125,7 @@ class ExecutionService:
                 approved=False,
                 reason=f"Reward:risk fell to {reward_risk:.2f}, below the required {required_rr:.2f}.",
                 entry_price=entry_price,
-                current_spread=current_spread,
+                current_spread=current_spread_points,
                 reward_risk=reward_risk,
             )
 
@@ -100,12 +139,6 @@ class ExecutionService:
             )
         margin_required = float(margin_required or 0.0)
 
-        candidate_signal = self._candidate_signal(
-            base_signal=decision.signal_decision.final_signal,
-            action=action,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-        )
         recent_outcomes = []
         recent_evaluations = []
         if self.db is not None:
@@ -124,7 +157,12 @@ class ExecutionService:
         risk_approval = self.risk_service.assess(
             context=context,
             signal=candidate_signal,
-            trade_quality=decision.trade_quality_assessment,
+            trade_quality=self.signal_pipeline.trade_quality_service.assess(
+                context=context,
+                signal=candidate_signal,
+                gemini_assessment=None,
+                portfolio_fit_score=self.risk_service.preview_portfolio_fit(context),
+            ),
             evaluation_mode=evaluation_mode,
             recent_outcomes=recent_outcomes,
             recent_evaluations=recent_evaluations,
@@ -136,7 +174,7 @@ class ExecutionService:
                 approved=False,
                 reason=risk_approval.reasons[0],
                 entry_price=entry_price,
-                current_spread=current_spread,
+                current_spread=current_spread_points,
                 reward_risk=reward_risk,
                 margin_required=margin_required,
                 risk_approval=risk_approval,
@@ -148,7 +186,7 @@ class ExecutionService:
                 approved=False,
                 reason="Symbol is not currently tradeable.",
                 entry_price=entry_price,
-                current_spread=current_spread,
+                current_spread=current_spread_points,
                 reward_risk=reward_risk,
                 margin_required=margin_required,
                 tradeability=tradeability,
@@ -159,12 +197,17 @@ class ExecutionService:
             approved=True,
             reason="Execution conditions still valid.",
             entry_price=entry_price,
-            current_spread=current_spread,
+            current_spread=current_spread_points,
             reward_risk=reward_risk,
             margin_required=margin_required,
             tradeability=tradeability,
             risk_approval=risk_approval,
         )
+
+    def _spread_limit_points(self, max_spread: float, point: float) -> float:
+        if point <= 0:
+            return max_spread
+        return max_spread / point
 
     def place_order_if_approved(
         self,

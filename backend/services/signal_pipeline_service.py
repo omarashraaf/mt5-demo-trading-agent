@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from agent.interface import AgentInput
@@ -28,6 +29,9 @@ from services.symbol_profile_service import SymbolProfileService
 from services.symbol_universe_service import SymbolUniverseService
 from services.trade_decision_service import TradeDecisionService
 from services.trade_quality_service import TradeQualityService
+from services.meta_model_service import MetaModelService
+from research.feature_builder import build_feature_snapshot
+from storage.research_repository import ResearchRepository
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,7 @@ class SignalPipelineService:
         gemini_news_analysis_service: Optional[GeminiNewsAnalysisService] = None,
         trade_decision_service: Optional[TradeDecisionService] = None,
         risk_service: Optional[RiskService] = None,
+        meta_model_service: Optional[MetaModelService] = None,
     ):
         self.connector = connector
         self.market_data = market_data
@@ -88,6 +93,8 @@ class SignalPipelineService:
             anti_churn_service=self.anti_churn_service,
             execution_engine=self.execution,
         )
+        self.meta_model_service = meta_model_service or MetaModelService(db=db)
+        self.research_repository = ResearchRepository(db) if db is not None else None
 
     def _session_allowed_for_symbol(self, symbol: str, market_symbols: list[dict]) -> bool:
         resolved = self.universe_service.resolve_requested_symbols([symbol], market_symbols)
@@ -119,6 +126,9 @@ class SignalPipelineService:
 
     def set_database(self, db):
         self.db = db
+        if self.meta_model_service is not None:
+            self.meta_model_service.set_database(db)
+        self.research_repository = ResearchRepository(db) if db is not None else None
 
     def _normalize_symbol_info(self, symbol: str, tick) -> Optional[NormalizedSymbolInfo]:
         canonical_symbol = self.universe_service.canonical_symbol(symbol)
@@ -761,6 +771,12 @@ class SignalPipelineService:
         input_data = self._build_agent_input(context, primary_agent_name)
         raw_signal = primary_agent.evaluate(input_data)
         primary_signal = TechnicalSignal.from_trade_signal(raw_signal, primary_agent_name)
+        if context.symbol_info:
+            signal_meta = dict(primary_signal.metadata or {})
+            signal_meta.setdefault("point", context.symbol_info.point)
+            signal_meta.setdefault("digits", context.symbol_info.digits)
+            signal_meta.setdefault("category", context.symbol_info.category)
+            primary_signal.metadata = signal_meta
 
         gemini_assessment: Optional[GeminiAssessment] = None
         if self._should_use_gemini(requested_agent_name, evaluation_mode, context):
@@ -785,7 +801,9 @@ class SignalPipelineService:
 
         recent_outcomes = []
         recent_evaluations = []
-        if self.db is not None:
+        # Manual dashboard scans should stay responsive; skip heavy learning-history
+        # lookups and use direct technical + risk evaluation only.
+        if self.db is not None and evaluation_mode != "manual":
             lookback_minutes = max(self.risk_engine.settings.cooldown_minutes_per_symbol, 1440)
             recent_outcomes = await self.db.get_recent_symbol_outcomes(
                 context.symbol,
@@ -822,6 +840,27 @@ class SignalPipelineService:
             policy_mode,
         )
         trade_decision = trade_decision.model_copy(update={"final_signal": scaled_signal})
+
+        meta_assessment = {
+            "active": False,
+            "changed_decision": False,
+            "blocked": False,
+            "profit_probability": 0.0,
+            "expected_edge": 0.0,
+            "no_trade_probability": 1.0,
+            "reason": "not_evaluated",
+        }
+        if self.meta_model_service is not None:
+            trade_decision, meta_assessment = await self.meta_model_service.assess_trade_decision(
+                context=context,
+                trade_decision=trade_decision,
+                gemini_assessment=gemini_assessment,
+                portfolio_risk_assessment=PortfolioRiskAssessment(
+                    portfolio_fit_score=preview_portfolio_fit,
+                ),
+                anti_churn_blocked=False,
+            )
+
         risk_approval = self.risk_service.assess(
             context=context,
             signal=trade_decision.final_signal,
@@ -847,6 +886,20 @@ class SignalPipelineService:
                 portfolio_fit_score=risk_approval.portfolio_risk_assessment.portfolio_fit_score,
                 threshold_boost=risk_approval.anti_churn_assessment.threshold_boost,
             )
+            scaled_signal = self._apply_mode_target_scaling(
+                trade_decision.final_signal,
+                entry_price,
+                policy_mode,
+            )
+            trade_decision = trade_decision.model_copy(update={"final_signal": scaled_signal})
+            if self.meta_model_service is not None:
+                trade_decision, meta_assessment = await self.meta_model_service.assess_trade_decision(
+                    context=context,
+                    trade_decision=trade_decision,
+                    gemini_assessment=gemini_assessment,
+                    portfolio_risk_assessment=risk_approval.portfolio_risk_assessment,
+                    anti_churn_blocked=risk_approval.anti_churn_assessment.blocked,
+                )
 
         blocking_reasons: list[str] = []
         if not trade_decision.trade:
@@ -870,6 +923,7 @@ class SignalPipelineService:
             **risk_evaluation.metrics_snapshot,
             "trade_quality_score": trade_decision.trade_quality_assessment.final_trade_quality_score,
             "trade_quality_threshold": trade_decision.trade_quality_assessment.threshold,
+            "meta_model": meta_assessment,
         }
 
         position_management_plan = self._build_position_management_plan(
@@ -885,9 +939,15 @@ class SignalPipelineService:
         signal_decision = SignalDecision(
             requested_agent_name=requested_agent_name or primary_agent_name,
             primary_agent_name=primary_agent_name,
-            final_agent_name="SmartAgent+Gemini"
-            if gemini_assessment and gemini_assessment.used and not gemini_assessment.degraded
-            else primary_agent_name,
+            final_agent_name=(
+                "SmartAgent+Gemini+MetaModel"
+                if gemini_assessment and gemini_assessment.used and not gemini_assessment.degraded and meta_assessment.get("active")
+                else "SmartAgent+MetaModel"
+                if meta_assessment.get("active")
+                else "SmartAgent+Gemini"
+                if gemini_assessment and gemini_assessment.used and not gemini_assessment.degraded
+                else primary_agent_name
+            ),
             market_context=context,
             primary_signal=primary_signal,
             final_signal=final_signal,
@@ -978,14 +1038,21 @@ class SignalPipelineService:
             if event_symbols:
                 eligible = _filter_session_eligible(event_symbols)
                 if eligible:
-                    if len(eligible) >= limit:
-                        return eligible[:limit]
-                    # If event feed is too narrow (for example only GOLD),
-                    # augment with curated symbols to avoid single-symbol lock-in.
                     fallback = self.universe_service.default_auto_trade_symbols(market_symbols, limit=limit)
                     discovered_commodities = _market_commodity_candidates(market_symbols)
                     fallback_eligible = _filter_session_eligible(fallback)
                     commodity_eligible = _filter_session_eligible(discovered_commodities)
+                    if len(eligible) >= limit:
+                        # Diversify: avoid full lock-in to event-only symbols (often a narrow
+                        # ETF/metals cluster) so auto-trader still evaluates broad liquid majors.
+                        event_quota = max(4, limit // 2)
+                        merged: list[str] = []
+                        for symbol in eligible[:event_quota] + commodity_eligible + fallback_eligible + eligible[event_quota:]:
+                            if symbol not in merged:
+                                merged.append(symbol)
+                        return merged[:limit]
+                    # If event feed is too narrow (for example only GOLD),
+                    # augment with curated symbols to avoid single-symbol lock-in.
                     merged: list[str] = []
                     for symbol in eligible + commodity_eligible + fallback_eligible:
                         if symbol not in merged:
@@ -1051,4 +1118,50 @@ class SignalPipelineService:
             position_management_plan=execution_decision.position_management_plan.model_dump(),
             signal_id=signal_id,
         )
+        if self.research_repository is not None:
+            context = execution_decision.signal_decision.market_context
+            final_signal = execution_decision.signal_decision.final_signal
+            meta = final_signal.metadata or {}
+            gemini = execution_decision.signal_decision.gemini_confirmation
+            sessions = ((context.user_policy or {}).get("session_filters") or [])
+            candidate_id = f"{context.symbol}-{signal_id}-{int(time.time()*1000)}"
+            rejection_reasons: list[str] = []
+            if not execution_decision.allow_execute:
+                rejection_reasons.append(execution_decision.reason)
+                rejection_reasons.extend(execution_decision.risk_evaluation.machine_reasons or [])
+
+            await self.research_repository.log_candidate_with_features(
+                candidate_id=candidate_id,
+                signal_id=signal_id,
+                candidate_payload={
+                    "symbol": context.symbol,
+                    "asset_class": context.symbol_info.category if context.symbol_info else "Other",
+                    "strategy_mode": str((context.user_policy or {}).get("mode", "balanced")),
+                    "session": ",".join(sessions),
+                    "day_of_week": time.gmtime().tm_wday,
+                    "technical_direction": final_signal.action,
+                    "smart_agent_summary": execution_decision.signal_decision.primary_signal.reason or "",
+                    "gemini_summary": (gemini.summary_reason if gemini else "") or "",
+                    "quality_score": execution_decision.trade_quality_assessment.final_trade_quality_score,
+                    "confidence_score": final_signal.confidence,
+                    "trend_h1": str(meta.get("h1_trend", "")),
+                    "trend_h4": str(meta.get("h4_trend", "")),
+                    "stop_loss": final_signal.stop_loss or 0.0,
+                    "take_profit": final_signal.take_profit or 0.0,
+                    "reward_risk": float(meta.get("reward_risk_ratio", 0.0) or 0.0),
+                    "spread_at_eval": float(context.tick.get("spread", 0.0)) if context.tick else 0.0,
+                    "atr_regime": str(meta.get("atr_regime", "")),
+                    "support_resistance_context": str(meta.get("sr_context", "")),
+                    "event_id": str((context.normalized_news[0].source if context.normalized_news else "")),
+                    "event_type": str((context.normalized_news[0].category if context.normalized_news else "")),
+                    "event_importance": str(getattr(gemini, "macro_relevance", "") if gemini else ""),
+                    "contradiction_flag": bool(getattr(gemini, "contradiction_flag", False)) if gemini else False,
+                    "risk_decision": execution_decision.risk_evaluation.reason,
+                    "rejection_reasons": list(dict.fromkeys([r for r in rejection_reasons if r])),
+                    "executed": bool(execution_decision.allow_execute),
+                    "gemini_changed_decision": bool(gemini and gemini.used),
+                    "meta_model_changed_decision": bool((meta.get("meta_model") or {}).get("changed_decision", False)),
+                },
+                feature_snapshot=build_feature_snapshot(execution_decision),
+            )
         return signal_id

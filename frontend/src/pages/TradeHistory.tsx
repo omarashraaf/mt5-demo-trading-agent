@@ -52,7 +52,6 @@ export default function TradeHistory({ connected }: { connected: boolean }) {
   const [limit, setLimit] = useState(100);
 
   const refresh = useCallback(async () => {
-    if (!connected) return;
     setLoading(true);
     try {
       const data = await api.getTradeHistory(limit);
@@ -68,15 +67,6 @@ export default function TradeHistory({ connected }: { connected: boolean }) {
     return () => clearInterval(t);
   }, [refresh]);
 
-  if (!connected) {
-    return (
-      <div className="card">
-        <h2>Trade History</h2>
-        <p style={{ color: 'var(--text-muted)' }}>Connect to MT5 to view history analytics.</p>
-      </div>
-    );
-  }
-
   const summary = history.summary;
 
   return (
@@ -85,7 +75,10 @@ export default function TradeHistory({ connected }: { connected: boolean }) {
         <div className="flex justify-between items-center">
           <div>
             <h2>Trade History</h2>
-            <p>Performance summary and per-trade analysis</p>
+            <p>
+              Performance summary and per-trade analysis
+              {!connected ? ' (showing local history while MT5 is disconnected)' : ''}
+            </p>
           </div>
           <div className="flex gap-2">
             <select

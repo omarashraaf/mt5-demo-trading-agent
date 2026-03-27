@@ -71,7 +71,7 @@ def build_policy_preset(mode: PolicyMode) -> UserPolicySettings:
             max_trades_per_symbol=3,
             max_margin_utilization=30.0,
             min_free_margin=45.0,
-            min_reward_risk=1.6,
+            min_reward_risk=0.8,
             allow_counter_trend_trades=True,
             allow_overnight_holding=False,
             gemini_role="advisory",
@@ -272,7 +272,9 @@ class RiskEngine:
             warnings.append(f"Low confidence ({signal.confidence:.0%}) - below {s.min_confidence_threshold:.0%} threshold")
 
         if spread > s.max_spread_threshold:
-            warnings.append(f"High spread ({spread}) - trading costs may be higher")
+            warnings.append(
+                f"High spread ({float(spread):.1f} pts) - trading costs may be higher"
+            )
 
         if s.require_stop_loss and signal.stop_loss is None:
             warnings.append("No stop loss set - your losses are not limited on this trade")
