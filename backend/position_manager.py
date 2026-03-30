@@ -8,7 +8,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from agent.interface import AgentInput
 from agent.smart_agent import get_asset_class, get_trade_params
@@ -53,9 +53,13 @@ class PositionManager:
         self._managed_tickets: set[int] = set()
         self._position_snapshots: dict[int, dict] = {}
         self._state = BackgroundServiceState(name="position_manager")
+        self._on_trade_closed: Optional[Callable[[dict], Awaitable[None]]] = None
 
     def set_database(self, db: Database):
         self.db = db
+
+    def set_trade_closed_callback(self, callback: Optional[Callable[[dict], Awaitable[None]]]):
+        self._on_trade_closed = callback
 
     @property
     def is_running(self) -> bool:
@@ -715,6 +719,16 @@ class PositionManager:
                 },
             )
             await self.db.mark_evaluation_outcome(signal_id, "closed")
+            if self._on_trade_closed is not None:
+                await self._on_trade_closed(
+                    {
+                        "ticket": pos.ticket,
+                        "symbol": pos.symbol,
+                        "exit_reason": exit_reason,
+                        "profit": pos.profit,
+                        "signal_id": signal_id,
+                    }
+                )
 
     def _bar_to_dict(self, bar) -> dict:
         return {

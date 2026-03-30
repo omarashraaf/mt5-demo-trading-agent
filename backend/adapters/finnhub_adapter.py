@@ -61,25 +61,56 @@ class FinnhubAdapter:
                 "reason": self._last_error,
             }
 
+        news_ok = False
+        calendar_ok = False
+        news_error = ""
+        calendar_error = ""
+        sample_count = 0
+        calendar_count = 0
+
         try:
             sample = self.get_market_news(category="general", limit=1)
-            return {
-                "provider": "finnhub",
-                "enabled": True,
-                "available": True,
-                "degraded": False,
-                "reason": "",
-                "sample_count": len(sample),
-            }
+            sample_count = len(sample)
+            news_ok = True
         except FinnhubAdapterError as exc:
-            self._last_error = str(exc)
-            return {
-                "provider": "finnhub",
-                "enabled": True,
-                "available": False,
-                "degraded": True,
-                "reason": self._last_error,
-            }
+            news_error = str(exc)
+
+        try:
+            from_date, to_date = self.default_date_range()
+            calendar_items = self.get_economic_calendar(from_date, to_date)
+            calendar_count = len(calendar_items)
+            calendar_ok = True
+        except FinnhubAdapterError as exc:
+            calendar_error = str(exc)
+
+        available = news_ok or calendar_ok
+        # Treat "news works but calendar unavailable" as partial/news-only mode,
+        # not a degraded outage.
+        partial_news_only = news_ok and not calendar_ok
+        degraded = (not available) or (not news_ok and calendar_ok)
+        reason_parts = []
+        if news_error:
+            reason_parts.append(f"news: {news_error}")
+        if calendar_error:
+            reason_parts.append(f"calendar: {calendar_error}")
+        reason = " | ".join(reason_parts)
+        self._last_error = reason or None
+
+        return {
+            "provider": "finnhub",
+            "enabled": True,
+            "available": available,
+            "degraded": degraded,
+            "partial_news_only": partial_news_only,
+            "status": "news_only" if partial_news_only else ("healthy" if available and not degraded else "degraded"),
+            "reason": reason,
+            "capabilities": {
+                "market_news": news_ok,
+                "economic_calendar": calendar_ok,
+            },
+            "sample_count": sample_count,
+            "calendar_count": calendar_count,
+        }
 
     def get_economic_calendar(self, from_date: str, to_date: str) -> list[dict[str, Any]]:
         payload = self._get(

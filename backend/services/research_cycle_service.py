@@ -32,6 +32,8 @@ class ResearchCycleService:
         self.walk_forward_runner = WalkForwardRunner(db)
         self.exports_dir = Path(exports_dir)
         self.exports_dir.mkdir(parents=True, exist_ok=True)
+        self._last_incremental_train_at: float = 0.0
+        self._last_incremental_closed_count: int = 0
 
     async def rebuild_dataset(
         self,
@@ -226,4 +228,73 @@ class ResearchCycleService:
             "last_walk_forward_run": latest_walk_forward,
             "best_candidate_model": best_candidate,
             "recent_attribution_reports": recent_reports,
+            "incremental_training": {
+                "last_run_at": self._last_incremental_train_at,
+                "last_closed_count": self._last_incremental_closed_count,
+            },
+        }
+
+    async def maybe_train_from_new_trade_outcome(
+        self,
+        *,
+        min_rows: int = 30,
+        cooldown_seconds: int = 180,
+        auto_approve: bool = True,
+        min_precision: float = 0.50,
+        min_f1: float = 0.45,
+    ) -> dict:
+        if not hasattr(self.db, "count_trade_outcomes"):
+            return {"trained": False, "reason": "count_trade_outcomes unavailable"}
+
+        closed_count = await self.db.count_trade_outcomes()
+        if closed_count < min_rows:
+            return {
+                "trained": False,
+                "reason": f"closed trades {closed_count} below minimum {min_rows}",
+                "closed_count": closed_count,
+            }
+        if closed_count <= self._last_incremental_closed_count:
+            return {
+                "trained": False,
+                "reason": "no new closed trades since last incremental training",
+                "closed_count": closed_count,
+            }
+        now = time.time()
+        if now - self._last_incremental_train_at < cooldown_seconds:
+            return {
+                "trained": False,
+                "reason": f"cooldown active ({cooldown_seconds}s)",
+                "closed_count": closed_count,
+            }
+
+        summary = await self.train_candidate_model(
+            algorithm="logistic_regression",
+            target_column="profitable_after_costs_90m",
+            include_unexecuted=False,
+            min_rows=min_rows,
+        )
+        self._last_incremental_train_at = now
+        self._last_incremental_closed_count = closed_count
+
+        version_id = str(summary.get("version_id", "")).strip()
+        evaluation = summary.get("evaluation", {}) or {}
+        precision = float(evaluation.get("precision", 0.0) or 0.0)
+        f1 = float(evaluation.get("f1", 0.0) or 0.0)
+        sample_count = int(evaluation.get("sample_count", 0) or 0)
+
+        approved = False
+        activated = False
+        if auto_approve and version_id and sample_count >= min_rows and precision >= min_precision and f1 >= min_f1:
+            await self.approve_model(version_id)
+            activation = await self.activate_approved_model()
+            approved = True
+            activated = bool(activation.get("activated", False))
+
+        return {
+            "trained": True,
+            "closed_count": closed_count,
+            "version_id": version_id,
+            "evaluation": evaluation,
+            "approved": approved,
+            "activated": activated,
         }

@@ -9,11 +9,13 @@ import re
 
 from adapters.finnhub_adapter import FinnhubAdapter
 from mt5.connector import MT5Connector, ConnectionParams
+from ibkr.connector import IBKRConnector, IBKRConnectionParams
 from mt5.market_data import MarketDataService
 from mt5.execution import ExecutionEngine, OrderRequest
 from agent.mock_agent import MockAgent
 from agent.sma_crossover_agent import SMACrossoverAgent
 from agent.smart_agent import SmartAgent
+from agent.interface import AgentInput
 from agent.gemini_agent import GeminiAgent
 from risk.rules import RiskEngine, UserPolicySettings
 from storage.db import Database
@@ -43,6 +45,7 @@ router = APIRouter()
 
 # Shared state
 connector = MT5Connector()
+ibkr_connector = IBKRConnector()
 market_data = MarketDataService()
 execution = ExecutionEngine()
 risk_engine = RiskEngine()
@@ -58,6 +61,7 @@ agents = {
     "SMA_Crossover": SMACrossoverAgent(),
 }
 active_agent_name = "SmartAgent"
+active_platform: Literal["mt5", "ibkr"] = "mt5"
 credential_vault = CredentialVault()
 gemini_adapter = GeminiAdapter(
     gemini_agent=gemini_agent,
@@ -130,6 +134,10 @@ DEFAULT_MARGIN_SL_PCT = 0.08
 DEFAULT_MARGIN_TP_PCT = 0.12
 
 
+async def _on_position_manager_trade_closed(_payload: dict):
+    _schedule_incremental_meta_training("position_manager_close")
+
+
 def set_database(database: Database):
     global db
     global research_cycle_service
@@ -142,6 +150,11 @@ def set_database(database: Database):
         database,
         meta_model_service=signal_pipeline.meta_model_service,
     )
+    auto_trader.position_manager.set_trade_closed_callback(_on_position_manager_trade_closed)
+
+
+def current_research_cycle_service() -> Optional[ResearchCycleService]:
+    return research_cycle_service
 
 
 def _runtime_state_payload() -> dict:
@@ -207,6 +220,29 @@ async def restore_runtime_state():
                     risk_engine.auto_trade_scan_interval_seconds)
     except Exception as exc:
         logger.warning("Failed to restore runtime state: %s", exc)
+
+
+def _schedule_incremental_meta_training(trigger: str):
+    if not config.AUTO_META_TRAINING_ENABLED:
+        return
+    service = current_research_cycle_service()
+    if service is None:
+        return
+
+    async def _runner():
+        try:
+            result = await service.maybe_train_from_new_trade_outcome(
+                min_rows=config.AUTO_META_TRAIN_MIN_CLOSED_TRADES,
+                cooldown_seconds=max(60, int(config.AUTO_META_TRAIN_INTERVAL_SECONDS // 2)),
+                auto_approve=config.AUTO_META_AUTO_APPROVE,
+                min_precision=config.AUTO_META_MIN_PRECISION,
+                min_f1=config.AUTO_META_MIN_F1,
+            )
+            logger.info("Incremental meta-training trigger=%s result=%s", trigger, result)
+        except Exception as exc:
+            logger.warning("Incremental meta-training failed after %s: %s", trigger, exc)
+
+    asyncio.create_task(_runner())
 
 
 def _requested_agent_from_final_name(agent_name: str) -> str:
@@ -296,10 +332,11 @@ def _minimum_sl_tp_distance(
     tick,
     symbol_info: dict,
 ) -> float:
-    point = symbol_info.get("point", 0.00001)
-    stops_level = symbol_info.get("trade_stops_level", 0)
-    spread_points = tick.spread if tick and tick.spread else 10
-    effective_stops = max(stops_level, spread_points, 10)
+    point = float(symbol_info.get("point", 0.00001) or 0.00001)
+    stops_level = float(symbol_info.get("trade_stops_level", 0) or 0)
+    freeze_level = float(symbol_info.get("trade_freeze_level", 0) or 0)
+    spread_points = float(getattr(tick, "spread", 0) or 0) if tick else 0
+    effective_stops = max(stops_level, freeze_level, spread_points, 10.0)
     return effective_stops * point * 1.5
 
 
@@ -327,6 +364,80 @@ def _sl_tp_distance_error(
         min_tp_dollars = round(min_distance * volume * contract_size, 2)
         return f"Take Profit too close to price. Minimum ~${min_tp_dollars:.2f} for your position."
     return None
+
+
+def _adjust_tp_for_min_rr(
+    *,
+    action: str,
+    entry_price: float,
+    stop_loss: float | None,
+    take_profit: float | None,
+    required_rr: float,
+    digits: int,
+) -> float | None:
+    """Keep SL fixed and adjust TP to satisfy minimum RR if needed."""
+    if (
+        entry_price <= 0
+        or stop_loss is None
+        or take_profit is None
+        or required_rr <= 0
+    ):
+        return take_profit
+    sl_distance = abs(entry_price - stop_loss)
+    if sl_distance <= 0:
+        return take_profit
+    current_rr = abs(take_profit - entry_price) / sl_distance
+    if current_rr >= required_rr:
+        return take_profit
+    action_upper = (action or "").upper()
+    target_distance = sl_distance * required_rr
+    if action_upper == "BUY":
+        return round(entry_price + target_distance, digits)
+    return round(entry_price - target_distance, digits)
+
+
+def _clamp_sl_tp_to_broker_min_distance(
+    *,
+    action: str,
+    tick,
+    symbol_info: dict | None,
+    stop_loss: float | None,
+    take_profit: float | None,
+) -> tuple[float | None, float | None]:
+    """Ensure SL/TP respects current broker min stop distance.
+
+    Returns possibly adjusted (stop_loss, take_profit). If market data is unavailable,
+    returns inputs unchanged.
+    """
+    if not tick or not symbol_info:
+        return stop_loss, take_profit
+
+    digits = int(symbol_info.get("digits", 5) or 5)
+    point = float(symbol_info.get("point", 0.00001) or 0.00001)
+    min_distance = _minimum_sl_tp_distance(tick=tick, symbol_info=symbol_info)
+    # Add one extra point as a safety cushion for fast-moving spreads.
+    required = max(min_distance + point, point)
+
+    side = (action or "").upper()
+    exec_price = tick.ask if side == "BUY" else tick.bid
+    if not exec_price or exec_price <= 0:
+        return stop_loss, take_profit
+
+    sl = stop_loss
+    tp = take_profit
+
+    if side == "BUY":
+        if sl and sl >= exec_price - required:
+            sl = round(exec_price - required, digits)
+        if tp and tp <= exec_price + required:
+            tp = round(exec_price + required, digits)
+    else:
+        if sl and sl <= exec_price + required:
+            sl = round(exec_price + required, digits)
+        if tp and tp >= exec_price - required:
+            tp = round(exec_price - required, digits)
+
+    return sl, tp
 
 
 async def _persist_credentials_if_requested(
@@ -399,6 +510,317 @@ def _policy_settings_response() -> dict:
     }
 
 
+def _active_platform_connected() -> bool:
+    if active_platform == "ibkr":
+        return bool(ibkr_connector.connected)
+    return bool(connector.connected)
+
+
+def _require_active_platform_connection():
+    if not _active_platform_connected():
+        raise HTTPException(status_code=400, detail="Not connected")
+
+
+def _ibkr_market_symbols(include_inactive: bool = False) -> list[dict]:
+    summary = universe_service.summary_dict()
+    candidates = summary.get("enabled_symbols") or summary.get("auto_trade_fallback_symbols") or []
+    symbols: list[dict] = []
+    for raw in candidates:
+        canonical = universe_service.canonical_symbol(raw)
+        category = universe_service.expected_category_for_symbol(canonical) or "Stocks"
+        if not include_inactive and not universe_service.is_symbol_active(canonical, category):
+            continue
+        symbols.append({
+            "name": canonical,
+            "description": f"{canonical} via IBKR",
+            "path": "IBKR",
+            "category": category,
+            "visible": True,
+            "trade_mode": 4,
+            "spread": 0,
+            "digits": 2,
+            "point": 0.01,
+            "volume_min": 1.0,
+            "trade_enabled": True,
+            "bid": 1.0,
+            "ask": 1.0,
+        })
+    return symbols
+
+
+async def _evaluate_ibkr_symbol_recommendation(sym: str) -> dict:
+    category = universe_service.expected_category_for_symbol(sym) or "Stocks"
+    snapshot = ibkr_connector.get_snapshot(sym)
+    bid = float((snapshot or {}).get("bid", 0.0) or 0.0)
+    ask = float((snapshot or {}).get("ask", 0.0) or 0.0)
+    mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else (bid or ask or 0.0)
+    spread = max(0.0, ask - bid) if ask > 0 and bid > 0 else 0.0
+
+    bars_m15 = ibkr_connector.get_bars(sym, "M15", 96)
+    bars_h1 = ibkr_connector.get_bars(sym, "H1", 96)
+    bars_h4 = ibkr_connector.get_bars(sym, "H4", 72)
+    if len(bars_h4) < 52:
+        bars_h4 = bars_h1
+    if mid <= 0 and bars_m15:
+        last_close = float(bars_m15[-1].get("close", 0.0) or 0.0)
+        if last_close > 0:
+            mid = last_close
+    if spread <= 0 and mid > 0:
+        recent_range = 0.0
+        if bars_m15:
+            hi = float(max((b.get("high", 0.0) or 0.0) for b in bars_m15[-12:]) or 0.0)
+            lo = float(min((b.get("low", 0.0) or 0.0) for b in bars_m15[-12:]) or 0.0)
+            recent_range = max(0.0, hi - lo)
+        spread = max(mid * 0.0005, recent_range * 0.02) if mid > 0 else 0.0
+        if bid <= 0 and ask <= 0 and mid > 0:
+            bid = mid - spread / 2.0
+            ask = mid + spread / 2.0
+    spread_pct = (spread / mid) if mid > 0 else 1.0
+
+    signal_payload = {
+        "action": "HOLD",
+        "confidence": 0.0,
+        "stop_loss": None,
+        "take_profit": None,
+        "max_holding_minutes": None,
+        "reason": "Waiting for enough IBKR market data.",
+        "strategy": "ibkr_wait_data",
+        "metadata": {},
+    }
+
+    if len(bars_h1) >= 52 and len(bars_m15) >= 22:
+        account = ibkr_connector.account_info
+        agent_input = AgentInput(
+            symbol=sym,
+            timeframe="H1",
+            bars=bars_h1,
+            spread=spread,
+            account_equity=float(account.equity) if account else 0.0,
+            open_positions=[],
+            multi_tf_bars={"M15": bars_m15, "H1": bars_h1, "H4": bars_h4},
+        )
+        smart_agent = agents.get("SmartAgent")
+        model_signal = smart_agent.evaluate(agent_input) if smart_agent else None
+        if model_signal:
+            signal_payload = {
+                "action": model_signal.action,
+                "confidence": float(model_signal.confidence or 0.0),
+                "stop_loss": model_signal.stop_loss,
+                "take_profit": model_signal.take_profit,
+                "max_holding_minutes": model_signal.max_holding_minutes,
+                "reason": model_signal.reason,
+                "strategy": model_signal.strategy or "ibkr_smart_agent",
+                "metadata": dict(model_signal.metadata or {}),
+            }
+
+    action = str(signal_payload.get("action", "HOLD")).upper()
+    confidence = float(signal_payload.get("confidence", 0.0) or 0.0)
+    event_context = {
+        "news_items": 0,
+        "bias": "neutral",
+        "event_risk": "low",
+        "confidence_adjustment": 0.0,
+        "contradiction_flag": False,
+        "event_ids": [],
+    }
+    if event_ingestion_service is not None and action in {"BUY", "SELL"}:
+        try:
+            stored_news = await event_ingestion_service.recent_symbol_news(
+                sym,
+                universe_service=universe_service,
+                limit=8,
+            )
+            if stored_news:
+                direction = "bullish" if action == "BUY" else "bearish"
+                weights = {"high": 1.0, "medium": 0.6, "low": 0.3}
+                risk_rank = {"low": 0, "medium": 1, "high": 2}
+                bias_score = 0.0
+                total_w = 0.0
+                strongest_risk = "low"
+                event_ids: list[str] = []
+                for item in stored_news:
+                    meta = item.metadata or {}
+                    event_id = str(meta.get("external_event_id", "") or "")
+                    if event_id:
+                        event_ids.append(event_id)
+                    bias = str(meta.get("gemini_bias", "neutral")).lower()
+                    risk = str(meta.get("gemini_event_risk", "low")).lower()
+                    if risk not in {"low", "medium", "high"}:
+                        risk = "low"
+                    w = weights.get(risk, 0.3)
+                    total_w += w
+                    if bias == direction:
+                        bias_score += 1.0 * w
+                    elif bias not in {"neutral", ""}:
+                        bias_score -= 1.0 * w
+                    if risk_rank[risk] > risk_rank[strongest_risk]:
+                        strongest_risk = risk
+                normalized_bias = (bias_score / total_w) if total_w > 0 else 0.0
+                if normalized_bias > 0.15:
+                    bias_label = direction
+                elif normalized_bias < -0.15:
+                    bias_label = "bearish" if direction == "bullish" else "bullish"
+                else:
+                    bias_label = "neutral"
+                contradiction_flag = bias_label not in {direction, "neutral"}
+                confidence_adj = max(-0.08, min(0.08, normalized_bias * 0.06))
+                if strongest_risk == "high":
+                    confidence_adj = min(confidence_adj, 0.0) - 0.01
+                confidence = round(max(0.0, min(0.95, confidence + confidence_adj)), 2)
+                event_context = {
+                    "news_items": len(stored_news),
+                    "bias": bias_label,
+                    "event_risk": strongest_risk,
+                    "confidence_adjustment": round(confidence_adj, 3),
+                    "contradiction_flag": contradiction_flag,
+                    "event_ids": list(dict.fromkeys(event_ids)),
+                }
+        except Exception:
+            pass
+    signal_payload["confidence"] = confidence
+    signal_meta = dict(signal_payload.get("metadata") or {})
+    signal_meta["event_context"] = event_context
+    signal_payload["metadata"] = signal_meta
+
+    min_conf = float(risk_engine.settings.auto_trade_min_confidence or 0.7)
+    rr = _reward_risk_ratio(mid, signal_payload.get("stop_loss"), signal_payload.get("take_profit"))
+    min_rr = float(risk_engine.user_policy.min_reward_risk or 1.6)
+
+    max_spread_pct = 0.004 if category in {"Stocks", "Indices"} else 0.006
+    spread_ok = spread_pct <= max_spread_pct
+    confidence_ok = confidence >= min_conf
+    rr_ok = rr >= min_rr if action in {"BUY", "SELL"} else False
+    has_price = mid > 0
+
+    ready_to_execute = bool(
+        action in {"BUY", "SELL"}
+        and has_price
+        and spread_ok
+        and confidence_ok
+        and rr_ok
+    )
+
+    if ready_to_execute:
+        reason = "Ready for execution."
+        status = "pass"
+        machine_reasons: list[str] = []
+    else:
+        blockers: list[str] = []
+        if action not in {"BUY", "SELL"}:
+            blockers.append("signal_hold")
+        if not has_price:
+            blockers.append("no_price")
+        if not spread_ok:
+            blockers.append("spread_too_wide")
+        if not confidence_ok:
+            blockers.append("confidence_below_threshold")
+        if action in {"BUY", "SELL"} and not rr_ok:
+            blockers.append("reward_risk_below_min")
+        if event_context.get("contradiction_flag"):
+            blockers.append("event_context_contradiction")
+        machine_reasons = blockers
+        reason = ", ".join(blockers) if blockers else "Blocked by IBKR pre-checks."
+        status = "block"
+
+    signal_id = None
+    if db is not None:
+        signal_id = await db.log_signal(
+            agent_name="SmartAgent",
+            symbol=sym,
+            timeframe="H1",
+            action=action,
+            confidence=confidence,
+            stop_loss=signal_payload.get("stop_loss"),
+            take_profit=signal_payload.get("take_profit"),
+            max_holding_minutes=signal_payload.get("max_holding_minutes"),
+            reason=signal_payload.get("reason") or "",
+        )
+
+    return {
+        "symbol": sym,
+        "signal": signal_payload,
+        "signal_id": signal_id,
+        "risk_decision": {
+            "approved": ready_to_execute,
+            "reason": reason,
+            "adjusted_volume": float(risk_engine.settings.fixed_lot_size or 1.0),
+            "warnings": [],
+            "status": status,
+            "machine_reasons": machine_reasons,
+            "metrics_snapshot": {
+                "platform": "ibkr",
+                "spread": spread,
+                "spread_pct": spread_pct,
+                "reward_risk": rr,
+                "confidence": confidence,
+                "confidence_threshold": min_conf,
+            },
+        },
+        "entry_price_estimate": mid,
+        "explanation": signal_payload.get("reason") or "IBKR technical scan.",
+        "ready_to_execute": ready_to_execute,
+        "category": category,
+        "description": f"{sym} via IBKR",
+        "degraded_reasons": [],
+        "trade_quality": {
+            "trend_alignment_score": confidence,
+            "momentum_quality_score": confidence,
+            "entry_timing_score": confidence,
+            "volatility_quality_score": 1.0 if len(bars_h1) >= 52 else 0.0,
+            "reward_risk_score": min(1.0, rr / max(min_rr, 0.1)) if action in {"BUY", "SELL"} else 0.0,
+            "spread_quality_score": max(0.0, 1.0 - min(1.0, spread_pct / max_spread_pct)),
+            "portfolio_fit_score": 1.0,
+            "news_alignment_score": (
+                0.8 if event_context.get("bias") in {"bullish", "bearish"} and not event_context.get("contradiction_flag")
+                else 0.3 if event_context.get("contradiction_flag")
+                else 0.5
+            ),
+            "contradiction_penalty": 0.12 if event_context.get("contradiction_flag") else 0.0,
+            "final_trade_quality_score": confidence,
+            "threshold": min_conf,
+            "no_trade_zone": not ready_to_execute,
+            "no_trade_reasons": machine_reasons,
+            "summary": reason,
+        },
+        "portfolio_risk": {
+            "status": "pass" if ready_to_execute else "block",
+            "allow_execute": ready_to_execute,
+            "reason": reason,
+            "blocking_reasons": machine_reasons,
+            "warnings": [],
+            "metrics_snapshot": {
+                "platform": "ibkr",
+                "spread_pct": spread_pct,
+                "reward_risk": rr,
+            },
+            "correlated_symbols": [],
+            "margin_required": 0.0,
+            "projected_margin_utilization_pct": 0.0,
+            "projected_free_margin_pct": 100.0,
+            "portfolio_fit_score": 1.0 if ready_to_execute else 0.0,
+        },
+        "anti_churn": {
+            "blocked": False,
+            "threshold_boost": 0.0,
+            "reasons": [],
+            "metadata": {"platform": "ibkr"},
+        },
+        "gemini_confirmation": None,
+        "execution_reason": reason,
+    }
+
+
+async def _ibkr_reference_price(symbol: str) -> float:
+    snap = ibkr_connector.get_snapshot(symbol)
+    price = float((snap or {}).get("last") or (snap or {}).get("ask") or (snap or {}).get("bid") or 0.0)
+    if price > 0:
+        return price
+    bars = ibkr_connector.get_bars(symbol, "H1", 5)
+    if bars:
+        price = float(bars[-1].get("close", 0.0) or 0.0)
+    return price if price > 0 else 0.0
+
+
 def _extract_json_object(raw_text: str) -> dict:
     text = (raw_text or "").strip()
     if not text:
@@ -445,18 +867,144 @@ def _simple_trade_intent_fallback(message: str) -> dict:
     }
 
 
+def _is_gemini_availability_query(message: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not lowered:
+        return False
+
+    direct_phrases = {
+        "are you available",
+        "are u available",
+        "are you online",
+        "are you working",
+        "gemini available",
+        "is gemini available",
+        "gemini status",
+    }
+    if lowered in direct_phrases:
+        return True
+
+    if "available" in lowered and ("gemini" in lowered or "you" in lowered):
+        return True
+    if "status" in lowered and "gemini" in lowered:
+        return True
+    if "online" in lowered and "gemini" in lowered:
+        return True
+    return False
+
+
+def _current_gemini_status() -> dict:
+    def _normalize_error(msg: str | None) -> str | None:
+        text = (msg or "").strip()
+        if not text:
+            return None
+        upper = text.upper()
+        if "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper or "429" in upper:
+            return "Quota exhausted / rate limited. Using technical logic only until quota resets."
+        if len(text) > 240:
+            return text[:240].rstrip() + "..."
+        return text
+
+    available = bool(gemini_agent.available)
+    degraded = bool(
+        gemini_adapter.degraded
+        or getattr(gemini_agent, "degraded", False)
+        or (getattr(gemini_agent, "unavailable_reason", "") and not available)
+    )
+    last_error = _normalize_error(
+        gemini_adapter.last_error
+        or getattr(gemini_agent, "runtime_last_error", "")
+        or (getattr(gemini_agent, "unavailable_reason", "") if not available else "")
+        or None
+    )
+
+    if available and not degraded:
+        reply = "Yes. Gemini is available and healthy right now."
+        state = "available"
+    elif available and degraded:
+        reply = f"Gemini is connected but degraded right now. Reason: {last_error or 'Unknown error'}"
+        state = "degraded"
+    else:
+        reply = f"No. Gemini is not available right now. Reason: {last_error or 'Not configured'}"
+        state = "unavailable"
+
+    return {
+        "state": state,
+        "available": available,
+        "degraded": degraded,
+        "last_error": last_error,
+        "reply": reply,
+    }
+
+
 # --- Connection Routes ---
 
 class ConnectRequest(BaseModel):
-    account: int
-    password: str
-    server: str
+    platform: Literal["mt5", "ibkr"] = "mt5"
+    account: Optional[int] = None
+    password: str = ""
+    server: str = ""
     terminal_path: Optional[str] = None
     save_credentials: bool = False
+    ibkr_host: Optional[str] = None
+    ibkr_port: Optional[int] = None
+    ibkr_client_id: Optional[int] = None
+    ibkr_account_id: Optional[str] = None
 
 
 @router.post("/connect")
 async def connect(req: ConnectRequest):
+    global active_platform
+    requested_platform = (req.platform or "mt5").lower()
+    if requested_platform == "ibkr":
+        try:
+            ibkr_params = IBKRConnectionParams(
+                host=(req.ibkr_host or "127.0.0.1").strip(),
+                port=int(req.ibkr_port or 7497),
+                client_id=int(req.ibkr_client_id or 1),
+                account_id=(req.ibkr_account_id or "").strip() or None,
+            )
+            success = ibkr_connector.connect(ibkr_params)
+            if not success:
+                if db:
+                    await db.log_error("connection", ibkr_connector.last_error or "IBKR connection failed")
+                raise HTTPException(status_code=400, detail=ibkr_connector.last_error or "IBKR connection failed")
+            if success and not ibkr_connector.is_demo() and (risk_engine.user_policy.demo_only_default or not config.LIVE_TRADING_ENABLED):
+                ibkr_connector.disconnect()
+                raise HTTPException(
+                    status_code=403,
+                    detail="IBKR live account rejected by policy. Use paper account or enable live trading.",
+                )
+            if connector.connected:
+                connector.disconnect()
+            active_platform = "ibkr"
+            live_account = ibkr_connector.refresh_account()
+            if db:
+                await db.log_connection_event(
+                    "connected",
+                    account=0,
+                    server=f"IBKR {ibkr_params.host}:{ibkr_params.port}",
+                    details=f"platform=ibkr client_id={ibkr_params.client_id}",
+                )
+            return {
+                "connected": True,
+                "platform": active_platform,
+                "account": live_account.model_dump() if live_account else (ibkr_connector.account_info.model_dump() if ibkr_connector.account_info else None),
+                "is_demo": ibkr_connector.is_demo(),
+                "credential_status": {"requested": False, "saved": False, "reason": "IBKR credentials are not stored in this flow."},
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if db:
+                await db.log_error("connection", f"IBKR connection route failure: {exc}")
+            raise HTTPException(
+                status_code=400,
+                detail=ibkr_connector.last_error or f"IBKR connection failed: {exc}",
+            )
+
+    if req.account is None or not req.password.strip() or not req.server.strip():
+        raise HTTPException(status_code=400, detail="MT5 requires account, password, and server.")
     raw_path = (req.terminal_path or config.DEFAULT_TERMINAL_PATH).strip().strip('"').strip("'")
     params = ConnectionParams(
         account=req.account,
@@ -480,6 +1028,7 @@ async def connect(req: ConnectRequest):
 
     if success and db:
         await db.log_connection_event("connected", req.account, req.server)
+        active_platform = "mt5"
 
         # Set daily start equity for risk engine
         if connector.account_info:
@@ -504,6 +1053,7 @@ async def connect(req: ConnectRequest):
 
     return {
         "connected": True,
+        "platform": active_platform,
         "account": connector.account_info.model_dump() if connector.account_info else None,
         "is_demo": connector.is_demo(),
         "credential_status": credential_status,
@@ -512,7 +1062,11 @@ async def connect(req: ConnectRequest):
 
 @router.post("/disconnect")
 async def disconnect():
-    success = connector.disconnect()
+    global active_platform
+    mt5_success = connector.disconnect() if connector.connected else True
+    ibkr_success = ibkr_connector.disconnect() if ibkr_connector.connected else True
+    success = bool(mt5_success and ibkr_success)
+    active_platform = "mt5"
     if db:
         await db.log_connection_event("disconnected")
     return {"disconnected": success}
@@ -520,12 +1074,35 @@ async def disconnect():
 
 @router.get("/status")
 async def status():
-    account = connector.refresh_account()
-    terminal = connector.get_terminal_info()
+    def _normalize_error(msg: str | None) -> str | None:
+        text = (msg or "").strip()
+        if not text:
+            return None
+        upper = text.upper()
+        if "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper or "429" in upper:
+            return "Quota exhausted / rate limited. Using technical logic only until quota resets."
+        if len(text) > 240:
+            return text[:240].rstrip() + "..."
+        return text
+
+    if active_platform == "ibkr" and ibkr_connector.connected:
+        account = ibkr_connector.refresh_account()
+        terminal = ibkr_connector.get_terminal_info()
+        connected_flag = bool(ibkr_connector.connected)
+        last_error = ibkr_connector.last_error
+        is_demo = ibkr_connector.is_demo()
+        positions_snapshot = ibkr_connector.get_positions()
+    else:
+        account = connector.refresh_account()
+        terminal = connector.get_terminal_info()
+        connected_flag = bool(connector.connected)
+        last_error = connector.last_error
+        is_demo = connector.is_demo()
+        positions_snapshot = execution.get_positions()
     portfolio_snapshot = signal_pipeline.portfolio_risk_service.snapshot(
         account,
-        execution.get_positions(),
-    ) if connector.connected else {
+        positions_snapshot,
+    ) if connected_flag else {
         "margin_utilization_pct": 0.0,
         "free_margin_pct": 0.0,
         "open_positions_total": 0,
@@ -536,18 +1113,29 @@ async def status():
         "stocks_equity_exposure_pct": 0.0,
     }
     return {
-        "connected": connector.connected,
+        "connected": connected_flag,
+        "platform": active_platform,
+        "platforms_supported": ["mt5", "ibkr"],
         "account": account.model_dump() if account else None,
         "terminal": terminal.model_dump() if terminal else None,
-        "last_error": connector.last_error,
-        "is_demo": connector.is_demo(),
+        "last_error": last_error,
+        "is_demo": is_demo,
         "live_trading_enabled": config.LIVE_TRADING_ENABLED,
         "panic_stop": risk_engine.panic_stopped,
         "active_agent": active_agent_name,
         "credential_storage_available": credential_vault.available,
         "gemini_available": gemini_agent.available,
-        "gemini_degraded": gemini_adapter.degraded,
-        "gemini_last_error": gemini_adapter.last_error,
+        "gemini_degraded": bool(
+            gemini_adapter.degraded
+            or getattr(gemini_agent, "degraded", False)
+            or (getattr(gemini_agent, "unavailable_reason", "") and not gemini_agent.available)
+        ),
+        "gemini_last_error": _normalize_error(
+            gemini_adapter.last_error
+            or getattr(gemini_agent, "runtime_last_error", "")
+            or (getattr(gemini_agent, "unavailable_reason", "") if not gemini_agent.available else "")
+            or None
+        ),
         "user_policy": risk_engine.user_policy.model_dump(),
         "runtime_controls": risk_engine.runtime_controls(),
         "universe": universe_service.summary_dict(),
@@ -559,12 +1147,23 @@ async def status():
 
 @router.get("/account")
 async def account():
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    if active_platform == "ibkr" and ibkr_connector.connected:
+        info = ibkr_connector.refresh_account()
+        if info is None:
+            raise HTTPException(status_code=500, detail="Failed to get IBKR account info")
+        return info.model_dump()
+    _require_active_platform_connection()
     info = connector.refresh_account()
     if info is None:
         raise HTTPException(status_code=500, detail="Failed to get account info")
     return info.model_dump()
+
+
+@router.get("/ibkr/debug/account-summary")
+async def ibkr_debug_account_summary():
+    if active_platform != "ibkr" or not ibkr_connector.connected:
+        raise HTTPException(status_code=400, detail="IBKR is not connected")
+    return ibkr_connector.debug_account_summary()
 
 
 class VerifyTerminalRequest(BaseModel):
@@ -594,8 +1193,19 @@ async def select_symbols(req: SymbolSelectRequest):
 
 @router.get("/market/tick/{symbol}")
 async def get_tick(symbol: str):
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        snap = ibkr_connector.get_stock_snapshot(symbol)
+        if not snap:
+            raise HTTPException(status_code=404, detail=f"No IBKR tick data for {symbol}")
+        spread = max(0.0, float(snap["ask"]) - float(snap["bid"]))
+        return {
+            "symbol": snap["symbol"],
+            "bid": float(snap["bid"]),
+            "ask": float(snap["ask"]),
+            "spread": spread,
+            "time": int(time.time()),
+        }
     tick = market_data.get_tick(_resolve_market_symbol(symbol))
     if tick is None:
         raise HTTPException(status_code=404, detail=f"No tick data for {symbol}")
@@ -604,16 +1214,37 @@ async def get_tick(symbol: str):
 
 @router.get("/market/bars/{symbol}")
 async def get_bars(symbol: str, timeframe: str = "H1", count: int = 100):
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        raise HTTPException(
+            status_code=501,
+            detail="IBKR historical bars are not wired into this endpoint yet.",
+        )
     bars = market_data.get_bars(_resolve_market_symbol(symbol), timeframe, count)
     return [b.model_dump() for b in bars]
 
 
 @router.get("/market/symbol-info/{symbol}")
 async def get_symbol_info(symbol: str):
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        canonical = universe_service.canonical_symbol(symbol)
+        category = universe_service.expected_category_for_symbol(canonical) or "Stocks"
+        return {
+            "name": canonical,
+            "description": f"{canonical} via IBKR",
+            "path": "IBKR",
+            "point": 0.01,
+            "digits": 2,
+            "trade_contract_size": 1.0,
+            "volume_min": 1.0,
+            "volume_max": 100000.0,
+            "volume_step": 1.0,
+            "trade_mode": 4,
+            "visible": True,
+            "trade_stops_level": 0,
+            "category": category,
+        }
     info = market_data.get_symbol_info(_resolve_market_symbol(symbol))
     if info is None:
         raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
@@ -627,10 +1258,10 @@ async def get_available_symbols(
     include_inactive: bool = False,
 ):
     """Get all symbols available on the MT5 terminal, optionally filtered by category."""
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
-
-    if tradeable_only:
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        symbols = _ibkr_market_symbols(include_inactive=include_inactive)
+    elif tradeable_only:
         symbols = market_data.get_tradeable_symbols()
     else:
         symbols = market_data.get_all_symbols()
@@ -664,11 +1295,13 @@ async def get_available_symbols(
 @router.post("/market/auto-detect-symbols")
 async def auto_detect_symbols(categories: Optional[list[str]] = None):
     """Auto-detect tradeable symbols and update allowed_symbols list."""
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
 
     target_categories = [universe_service.normalize_asset_class(item) for item in (categories or universe_service.summary().active_asset_classes)]
-    tradeable = market_data.get_tradeable_symbols()
+    if active_platform == "ibkr":
+        tradeable = _ibkr_market_symbols(include_inactive=False)
+    else:
+        tradeable = market_data.get_tradeable_symbols()
     filtered_tradeable = universe_service.filter_market_symbols(tradeable)
     matched = [s["name"] for s in filtered_tradeable if s["category"] in target_categories]
 
@@ -774,8 +1407,28 @@ class EvaluateRequest(BaseModel):
 
 @router.post("/agent/evaluate")
 async def evaluate_signal(req: EvaluateRequest):
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        rec = await _evaluate_ibkr_symbol_recommendation(req.symbol)
+        return {
+            "signal": rec["signal"],
+            "signal_id": rec.get("signal_id"),
+            "risk_decision": rec["risk_decision"],
+            "agent_name": "SmartAgent",
+            "degraded_reasons": rec.get("degraded_reasons", []),
+            "gemini_confirmation": None,
+            "trade_quality": rec.get("trade_quality"),
+            "portfolio_risk": rec.get("portfolio_risk"),
+            "anti_churn": rec.get("anti_churn"),
+            "execution_reason": rec.get("execution_reason", rec["risk_decision"]["reason"]),
+            "position_management_plan": {
+                "manage_position": True,
+                "strategy": rec["signal"].get("strategy"),
+                "max_holding_minutes": rec["signal"].get("max_holding_minutes"),
+                "planned_hold_minutes": rec["signal"].get("max_holding_minutes"),
+                "notes": ["IBKR route uses deterministic technical plan."],
+            },
+        }
 
     agent_name = req.agent_name or active_agent_name
     if agent_name not in agents:
@@ -839,8 +1492,25 @@ async def calculate_volume(symbol: str, amount_usd: float):
     The amount_usd is treated as margin: with leverage, it controls a larger position.
     volume = amount_usd * leverage / (price * contract_size)
     """
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        price = await _ibkr_reference_price(symbol)
+        if price <= 0:
+            raise HTTPException(status_code=400, detail=f"Invalid IBKR quote for {symbol}")
+        # For IBKR stocks/ETFs, volume is shares. Keep at least 1 share.
+        qty = max(1.0, round(amount_usd / price, 4))
+        return {
+            "symbol": symbol,
+            "amount_usd": amount_usd,
+            "volume": qty,
+            "actual_cost": round(qty * price, 2),
+            "price": price,
+            "contract_size": 1.0,
+            "volume_min": 1.0,
+            "volume_max": 1_000_000.0,
+            "min_sl_tp_dollars": 0.0,
+            "stops_level": 0,
+        }
 
     resolved_symbol = _resolve_market_symbol(symbol)
     tick = market_data.get_tick(resolved_symbol)
@@ -1189,8 +1859,41 @@ class QuickBuyRequest(BaseModel):
 @router.post("/trade/quick-buy")
 async def quick_buy(req: QuickBuyRequest):
     """Buy or Sell any symbol with a dollar amount. Auto-calculates volume, SL, and TP."""
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        if risk_engine.panic_stopped:
+            raise HTTPException(status_code=403, detail="Trading is paused")
+        account = ibkr_connector.account_info
+        if account and account.trade_mode != 0 and not config.LIVE_TRADING_ENABLED:
+            raise HTTPException(status_code=403, detail="Live trading is disabled")
+        price = await _ibkr_reference_price(req.symbol)
+        if price <= 0:
+            raise HTTPException(status_code=400, detail=f"Invalid IBKR quote for {req.symbol}")
+        quantity = max(1.0, round(req.amount_usd / price, 4))
+        result = ibkr_connector.place_order(
+            req.symbol,
+            req.action.upper(),
+            quantity,
+            req.custom_stop_loss,
+            req.custom_take_profit,
+            _build_trade_comment(req.amount_usd, None, None),
+        )
+        if db:
+            await db.log_order(
+                signal_id=None,
+                symbol=req.symbol,
+                action=req.action.upper(),
+                volume=quantity,
+                price=result.get("price"),
+                stop_loss=req.custom_stop_loss,
+                take_profit=req.custom_take_profit,
+                ticket=result.get("ticket"),
+                retcode=result.get("retcode", -1),
+                retcode_desc=result.get("retcode_desc", ""),
+                success=bool(result.get("success")),
+                comment=result.get("comment", ""),
+            )
+        return result
     if risk_engine.panic_stopped:
         raise HTTPException(status_code=403, detail="Trading is paused")
 
@@ -1273,23 +1976,41 @@ async def quick_buy(req: QuickBuyRequest):
     if tp_amount_for_comment is None and tp is not None and tp > 0:
         tp_amount_for_comment = abs(tp - price) * volume * contract_size
 
-    # Validate SL/TP minimum distance (STOPLEVEL + spread)
-    point = sym_info.get("point", 0.00001)
-    stops_level = sym_info.get("trade_stops_level", 0)
-    spread_points = tick.spread if tick else 10
-    effective_stops = max(stops_level, spread_points, 10)
-    min_distance = effective_stops * point * 1.5  # 50% buffer for spread fluctuation
-    if sl and abs(price - sl) < min_distance:
-        min_sl_dollars = round(min_distance * volume * contract_size, 2)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Stop Loss too close to price. Minimum ~${min_sl_dollars:.2f} for your position. Try a larger SL amount."
+    # Auto-clamp SL/TP to broker minimum distance to avoid manual-trade rejections.
+    sl, tp = _clamp_sl_tp_to_broker_min_distance(
+        action=action,
+        tick=tick,
+        symbol_info=sym_info,
+        stop_loss=sl,
+        take_profit=tp,
+    )
+    required_rr = max(1.0, float(risk_engine.user_policy.min_reward_risk or 1.0))
+    tp = _adjust_tp_for_min_rr(
+        action=action,
+        entry_price=price,
+        stop_loss=sl,
+        take_profit=tp,
+        required_rr=required_rr,
+        digits=digits,
+    )
+    # Final SL/TP refresh at send-time to avoid last-tick invalid-stops rejections.
+    latest_tick = market_data.get_tick(symbol)
+    if latest_tick:
+        sl, tp = _clamp_sl_tp_to_broker_min_distance(
+            action=action,
+            tick=latest_tick,
+            symbol_info=sym_info,
+            stop_loss=sl,
+            take_profit=tp,
         )
-    if tp and abs(tp - price) < min_distance:
-        min_tp_dollars = round(min_distance * volume * contract_size, 2)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Take Profit too close to price. Minimum ~${min_tp_dollars:.2f} for your position. Try a larger TP amount."
+        latest_price = latest_tick.ask if action == "BUY" else latest_tick.bid
+        tp = _adjust_tp_for_min_rr(
+            action=action,
+            entry_price=latest_price,
+            stop_loss=sl,
+            take_profit=tp,
+            required_rr=required_rr,
+            digits=digits,
         )
 
     # Log signal
@@ -1406,6 +2127,25 @@ async def chat_message(req: ChatRequest):
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
 
+    if _is_gemini_availability_query(message):
+        gemini_status = _current_gemini_status()
+        reply = gemini_status["reply"]
+
+        persisted_history = [item.model_dump() for item in req.history]
+        persisted_history.append({"role": "user", "content": message})
+        persisted_history.append({"role": "assistant", "content": reply})
+        await _save_chat_history(persisted_history)
+
+        return {
+            "reply": reply,
+            "intent": "chat",
+            "trade_request": None,
+            "trade_preview": None,
+            "order_result": None,
+            "executed": False,
+            "gemini_status": gemini_status,
+        }
+
     system_prompt = """
 You are an AI trading copilot inside a demo trading app.
 Return STRICT JSON only:
@@ -1468,8 +2208,10 @@ Never promise guaranteed profits.
         symbol = _resolve_market_symbol(trade_req.symbol)
         normalized_trade_request = {**trade_req.model_dump(), "symbol": symbol}
 
-        if not connector.connected:
-            reply = "Trade request detected, but MT5 is not connected. Connect first, then confirm execution."
+        if not _active_platform_connected():
+            reply = "Trade request detected, but no active trading platform is connected. Connect first, then confirm execution."
+        elif active_platform == "ibkr":
+            reply = "IBKR chat execution is not wired yet in this route. Use MT5 for chat-driven execution currently."
         else:
             tick = market_data.get_tick(symbol)
             sym_info = market_data.get_symbol_info(symbol)
@@ -1572,8 +2314,38 @@ class ExecuteTradeRequest(BaseModel):
 
 @router.post("/trade/execute")
 async def execute_trade(req: ExecuteTradeRequest):
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        if risk_engine.panic_stopped:
+            raise HTTPException(status_code=403, detail="Panic stop is active")
+        account = ibkr_connector.account_info
+        if account and account.trade_mode != 0 and not config.LIVE_TRADING_ENABLED:
+            raise HTTPException(status_code=403, detail="Live trading is disabled")
+
+        result = ibkr_connector.place_order(
+            req.symbol,
+            req.action.upper(),
+            req.volume,
+            req.stop_loss,
+            req.take_profit,
+            "",
+        )
+        if db:
+            await db.log_order(
+                signal_id=req.signal_id,
+                symbol=req.symbol,
+                action=req.action,
+                volume=req.volume,
+                price=result.get("price"),
+                stop_loss=req.stop_loss,
+                take_profit=req.take_profit,
+                ticket=result.get("ticket"),
+                retcode=result.get("retcode", -1),
+                retcode_desc=result.get("retcode_desc", ""),
+                success=bool(result.get("success")),
+                comment=result.get("comment", ""),
+            )
+        return result
 
     if not connector.is_demo() and (risk_engine.user_policy.demo_only_default or not config.LIVE_TRADING_ENABLED):
         raise HTTPException(status_code=403, detail="Live trading is disabled")
@@ -1662,8 +2434,9 @@ async def execute_trade(req: ExecuteTradeRequest):
 
 @router.get("/positions")
 async def get_positions(symbol: Optional[str] = None):
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        return ibkr_connector.get_positions(symbol)
     positions = execution.get_positions(symbol)
     return [p.model_dump() for p in positions]
 
@@ -1674,8 +2447,26 @@ class ClosePositionRequest(BaseModel):
 
 @router.post("/positions/close")
 async def close_position(req: ClosePositionRequest):
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        result = ibkr_connector.close_position(req.ticket)
+        if db:
+            await db.log_order(
+                signal_id=None,
+                symbol="",
+                action="CLOSE",
+                volume=result.get("volume") or 0.0,
+                price=result.get("price"),
+                stop_loss=None,
+                take_profit=None,
+                ticket=result.get("ticket"),
+                retcode=result.get("retcode", -1),
+                retcode_desc=result.get("retcode_desc", ""),
+                success=bool(result.get("success")),
+            )
+        if bool(result.get("success")):
+            _schedule_incremental_meta_training("ibkr_manual_close")
+        return result
 
     existing_positions = execution.get_positions()
     existing_position = next((p for p in existing_positions if p.ticket == req.ticket), None)
@@ -1720,6 +2511,7 @@ async def close_position(req: ClosePositionRequest):
                 },
             )
             await db.mark_evaluation_outcome(signal_id, "closed")
+            _schedule_incremental_meta_training("mt5_manual_close")
 
     return result.model_dump()
 
@@ -1763,6 +2555,30 @@ async def get_logs(limit: int = 100, log_type: str = "all"):
 
 @router.get("/trade-history")
 async def get_trade_history(limit: int = 50):
+    if active_platform == "ibkr" and ibkr_connector.connected:
+        broker_trades = ibkr_connector.get_recent_executions(limit=max(limit, 50))
+        closed = [t for t in broker_trades if t.get("status") == "closed"]
+        summary = {
+            "total_trades": len(broker_trades),
+            "closed_trades": len(closed),
+            "open_trades": len([t for t in broker_trades if t.get("status") != "closed"]),
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "breakeven_trades": 0,
+            "win_rate_pct": 0.0,
+            "total_profit_usd": 0.0,
+            "avg_profit_per_closed_trade_usd": 0.0,
+            "total_started_capital_usd": 0.0,
+            "roi_pct": None,
+            "best_trade_usd": 0.0,
+            "worst_trade_usd": 0.0,
+        }
+        return {
+            "summary": summary,
+            "trades": broker_trades[:limit],
+            "source": "ibkr_broker_executions",
+        }
+
     if db is None:
         return {
             "summary": {
@@ -2014,6 +2830,7 @@ async def delete_credentials(account_id: int):
 @router.get("/credentials/auto-connect")
 async def auto_connect(account_id: Optional[int] = None):
     """Try to connect using the most recently used saved credentials."""
+    global active_platform
     if db is None:
         return {"connected": False, "reason": "No database"}
     if connector.connected:
@@ -2032,6 +2849,7 @@ async def auto_connect(account_id: Optional[int] = None):
     params = _build_saved_connection_params(best)
     success = connector.connect(params)
     if success:
+        active_platform = "mt5"
         await db.log_connection_event("auto_connected", best["account"], best["server"])
         await db.update_credential_last_used(best["account"])
         if not connector.is_demo() and (risk_engine.user_policy.demo_only_default or not config.LIVE_TRADING_ENABLED):
@@ -2043,6 +2861,7 @@ async def auto_connect(account_id: Optional[int] = None):
             task_orchestrator.start_auto_trade()
         return {
             "connected": True,
+            "platform": active_platform,
             "account": connector.account_info.model_dump() if connector.account_info else None,
         }
     return {"connected": False, "reason": connector.last_error}
@@ -2057,13 +2876,48 @@ class SmartEvaluateRequest(BaseModel):
 @router.post("/agent/smart-evaluate")
 async def smart_evaluate(req: SmartEvaluateRequest):
     """Scan multiple symbols. Uses fast local analysis for bulk scan, Gemini for top picks."""
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+
+    if active_platform == "ibkr":
+        symbols = req.symbols or risk_engine.settings.allowed_symbols
+        market_universe = universe_service.filter_market_symbols(
+            _ibkr_market_symbols(include_inactive=False),
+            include_inactive=False,
+        )
+        if not symbols:
+            symbols = universe_service.candidate_universe(market_universe)[:8]
+        else:
+            symbols = (universe_service.restrict_symbols(symbols))[:8]
+        semaphore = asyncio.Semaphore(1)
+
+        async def _eval_ibkr_symbol(sym: str) -> dict:
+            async with semaphore:
+                return await _evaluate_ibkr_symbol_recommendation(sym)
+
+        recommendations: list[dict] = []
+        for sym in symbols:
+            recommendations.append(await _eval_ibkr_symbol(sym))
+        recommendations.sort(
+            key=lambda r: (
+                float(r.get("signal", {}).get("confidence", 0.0) or 0.0),
+                float((r.get("trade_quality") or {}).get("final_trade_quality_score", 0.0) or 0.0),
+                bool(r.get("ready_to_execute")),
+            ),
+            reverse=True,
+        )
+
+        return {
+            "recommendations": recommendations,
+            "scanned_at": time.time(),
+        }
 
     # Keep scan wide enough so categories (especially commodities) are represented.
     MAX_SCAN_SYMBOLS = 30
-    PER_SYMBOL_TIMEOUT_SECONDS = 4.0
-    MAX_CONCURRENT_EVALS = 4
+    # Keep per-symbol scan strict so the dashboard doesn't stall with all rows pending.
+    PER_SYMBOL_TIMEOUT_SECONDS = 2.5
+    # Hard cap the full scan so UI gets partial results quickly instead of waiting on stragglers.
+    TOTAL_SCAN_TIMEOUT_SECONDS = 12.0
+    MAX_CONCURRENT_EVALS = 8
     symbols = req.symbols or risk_engine.settings.allowed_symbols
     market_universe = universe_service.filter_market_symbols(
         market_data.get_tradeable_symbols(),
@@ -2167,14 +3021,31 @@ async def smart_evaluate(req: SmartEvaluateRequest):
             symbol_info = symbol_lookup.get(sym, {})
             return None
 
-    evaluations = await asyncio.gather(*(evaluate_symbol(sym) for sym in symbols))
+    tasks = [asyncio.create_task(evaluate_symbol(sym)) for sym in symbols]
+    done, pending = await asyncio.wait(tasks, timeout=TOTAL_SCAN_TIMEOUT_SECONDS)
+    for task in pending:
+        task.cancel()
+    if pending:
+        logger.warning(
+            "Smart evaluate timed out for %d/%d symbols after %.1fs; returning partial results.",
+            len(pending),
+            len(tasks),
+            TOTAL_SCAN_TIMEOUT_SECONDS,
+        )
+    evaluations = []
+    for task in done:
+        try:
+            evaluations.append(task.result())
+        except Exception as exc:
+            logger.error("Smart evaluate task failed: %r", exc, exc_info=True)
+            evaluations.append(None)
     recommendations = [item for item in evaluations if item is not None]
 
     recommendations.sort(
         key=lambda r: (
-            r["ready_to_execute"],
-            r.get("trade_quality", {}).get("final_trade_quality_score", 0.0),
             r["signal"]["confidence"],
+            r.get("trade_quality", {}).get("final_trade_quality_score", 0.0),
+            r["ready_to_execute"],
         ),
         reverse=True,
     )
@@ -2195,8 +3066,61 @@ class ExecuteRecommendationRequest(BaseModel):
 @router.post("/trade/execute-recommendation")
 async def execute_recommendation(req: ExecuteRecommendationRequest):
     """Execute a trade from a previously generated recommendation by signal_id."""
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        if risk_engine.panic_stopped:
+            raise HTTPException(status_code=403, detail="Panic stop is active")
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+        signal_data = await db.get_signal_by_id(req.signal_id)
+        if signal_data is None:
+            raise HTTPException(status_code=404, detail="Signal not found")
+        action = str(signal_data.get("action", "HOLD")).upper()
+        if action not in {"BUY", "SELL"}:
+            return {
+                "success": False,
+                "retcode": -1,
+                "retcode_desc": signal_data.get("reason") or "Signal is not executable.",
+                "ticket": None,
+                "volume": None,
+                "price": None,
+                "stop_loss": signal_data.get("stop_loss"),
+                "take_profit": signal_data.get("take_profit"),
+                "comment": "",
+            }
+        symbol = signal_data["symbol"]
+        quantity = float(risk_engine.settings.fixed_lot_size or 1.0)
+        if req.amount_usd and req.amount_usd > 0:
+            px = await _ibkr_reference_price(symbol)
+            if px > 0:
+                quantity = max(1.0, round(req.amount_usd / px, 4))
+        sl = req.custom_stop_loss if req.custom_stop_loss and req.custom_stop_loss > 0 else signal_data.get("stop_loss")
+        tp = req.custom_take_profit if req.custom_take_profit and req.custom_take_profit > 0 else signal_data.get("take_profit")
+        result = ibkr_connector.place_order(
+            symbol,
+            action,
+            quantity,
+            sl,
+            tp,
+            _build_trade_comment(req.amount_usd, None, None),
+        )
+        await db.log_order(
+            signal_id=req.signal_id,
+            symbol=symbol,
+            action=action,
+            volume=quantity,
+            price=result.get("price"),
+            stop_loss=sl,
+            take_profit=tp,
+            ticket=result.get("ticket"),
+            retcode=result.get("retcode", -1),
+            retcode_desc=result.get("retcode_desc", ""),
+            success=bool(result.get("success")),
+            comment=result.get("comment", ""),
+        )
+        if result.get("success"):
+            await db.mark_evaluation_outcome(req.signal_id, "opened")
+        return result
     if risk_engine.panic_stopped:
         raise HTTPException(status_code=403, detail="Panic stop is active")
     if not connector.is_demo() and (risk_engine.user_policy.demo_only_default or not config.LIVE_TRADING_ENABLED):
@@ -2306,20 +3230,57 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
                 if req.custom_take_profit is None:
                     tp = default_tp
 
+    entry_ref_price = tick.ask if action == "BUY" else tick.bid
     if req.amount_usd and req.amount_usd > 0 and tick and sym_info:
-        entry_ref_price = tick.ask if action == "BUY" else tick.bid
         contract_size_for_comment = float(sym_info.get("trade_contract_size", 100000) or 100000)
         if sl_amount_for_comment is None and sl is not None and sl > 0:
             sl_amount_for_comment = abs(entry_ref_price - sl) * volume * contract_size_for_comment
         if tp_amount_for_comment is None and tp is not None and tp > 0:
             tp_amount_for_comment = abs(tp - entry_ref_price) * volume * contract_size_for_comment
 
+    # Ensure SL/TP remains valid at execution-time prices right before preflight.
+    sl, tp = _clamp_sl_tp_to_broker_min_distance(
+        action=action,
+        tick=tick,
+        symbol_info=sym_info,
+        stop_loss=sl,
+        take_profit=tp,
+    )
+    required_rr = max(1.0, float((context.user_policy or {}).get("min_reward_risk", risk_engine.user_policy.min_reward_risk or 1.0)))
+    tp = _adjust_tp_for_min_rr(
+        action=action,
+        entry_price=entry_ref_price,
+        stop_loss=sl,
+        take_profit=tp,
+        required_rr=required_rr,
+        digits=int(sym_info.get("digits", 5) if sym_info else 5),
+    )
+    # Final SL/TP refresh at send-time to avoid last-tick invalid-stops rejections.
+    latest_tick = market_data.get_tick(symbol)
+    if latest_tick:
+        sl, tp = _clamp_sl_tp_to_broker_min_distance(
+            action=action,
+            tick=latest_tick,
+            symbol_info=sym_info,
+            stop_loss=sl,
+            take_profit=tp,
+        )
+        latest_price = latest_tick.ask if action == "BUY" else latest_tick.bid
+        tp = _adjust_tp_for_min_rr(
+            action=action,
+            entry_price=latest_price,
+            stop_loss=sl,
+            take_profit=tp,
+            required_rr=required_rr,
+            digits=int(sym_info.get("digits", 5) if sym_info else 5),
+        )
     candidate_signal = current_signal.model_copy(
         update={
             "stop_loss": sl,
             "take_profit": tp,
         }
     )
+
     preflight = await execution_service.preflight_for_context_signal(
         context=context,
         candidate_signal=candidate_signal,
@@ -2332,17 +3293,6 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
 
     if preflight.risk_approval and preflight.risk_approval.risk_evaluation.adjusted_volume > 0:
         volume = preflight.risk_approval.risk_evaluation.adjusted_volume
-
-    dist_error = _sl_tp_distance_error(
-        action=action,
-        tick=tick,
-        symbol_info=sym_info,
-        stop_loss=sl,
-        take_profit=tp,
-        volume=volume,
-    )
-    if dist_error:
-        raise HTTPException(status_code=400, detail=dist_error)
 
     amt_label = _build_trade_comment(req.amount_usd, sl_amount_for_comment, tp_amount_for_comment)
     order_req = OrderRequest(
@@ -2404,8 +3354,12 @@ class ReplayRequest(BaseModel):
 
 @router.post("/replay/run")
 async def run_replay(req: ReplayRequest):
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        raise HTTPException(
+            status_code=409,
+            detail="Replay currently supports MT5 data pipeline only.",
+        )
 
     steps = max(5, min(req.steps, 60))
     m15_bars = [b.model_dump() for b in market_data.get_bars(req.symbol, "M15", 140 + steps)]
@@ -2661,10 +3615,29 @@ async def auto_trade_status():
     """Get auto-trading status and recent activity."""
     settings = risk_engine.settings
     service_status = task_orchestrator.status_snapshot()
-    portfolio_snapshot = signal_pipeline.portfolio_risk_service.snapshot(
-        connector.refresh_account(),
-        execution.get_positions(),
-    ) if connector.connected else {}
+    if active_platform == "ibkr" and ibkr_connector.connected:
+        account_snapshot = ibkr_connector.refresh_account()
+        positions_snapshot = ibkr_connector.get_positions()
+        portfolio_snapshot = signal_pipeline.portfolio_risk_service.snapshot(
+            account_snapshot,
+            positions_snapshot,
+        )
+    elif connector.connected:
+        portfolio_snapshot = signal_pipeline.portfolio_risk_service.snapshot(
+            connector.refresh_account(),
+            execution.get_positions(),
+        )
+    else:
+        portfolio_snapshot = {
+            "margin_utilization_pct": 0.0,
+            "free_margin_pct": 0.0,
+            "open_positions_total": 0,
+            "exposure_by_symbol": {},
+            "exposure_by_category": {},
+            "exposure_by_sector": {},
+            "usd_beta_exposure_pct": 0.0,
+            "stocks_equity_exposure_pct": 0.0,
+        }
     return {
         "running": auto_trader.is_running,
         "enabled": risk_engine.auto_trade_enabled,
@@ -2680,8 +3653,17 @@ async def auto_trade_status():
         "portfolio": portfolio_snapshot,
         "gemini": {
             "available": gemini_agent.available,
-            "degraded": gemini_adapter.degraded,
-            "last_error": gemini_adapter.last_error,
+            "degraded": bool(
+                gemini_adapter.degraded
+                or getattr(gemini_agent, "degraded", False)
+                or (getattr(gemini_agent, "unavailable_reason", "") and not gemini_agent.available)
+            ),
+            "last_error": (
+                gemini_adapter.last_error
+                or getattr(gemini_agent, "runtime_last_error", "")
+                or (getattr(gemini_agent, "unavailable_reason", "") if not gemini_agent.available else "")
+                or None
+            ),
         },
         "event_providers": {
             "finnhub": finnhub_adapter.healthcheck(),
@@ -2715,8 +3697,12 @@ async def auto_trade_activity(limit: int = 50):
 @router.post("/auto-trade/start")
 async def auto_trade_start():
     """Enable and start auto-trading (includes position manager)."""
-    if not connector.connected:
-        raise HTTPException(status_code=400, detail="Not connected to MT5")
+    _require_active_platform_connection()
+    if active_platform == "ibkr":
+        raise HTTPException(
+            status_code=409,
+            detail="IBKR auto-trading loop is not wired yet. Use MT5 for auto-trade currently.",
+        )
     if not connector.is_demo() and (risk_engine.user_policy.demo_only_default or not config.LIVE_TRADING_ENABLED):
         raise HTTPException(status_code=403, detail="Auto-trading only allowed on demo accounts")
 

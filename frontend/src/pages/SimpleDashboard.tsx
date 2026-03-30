@@ -20,6 +20,25 @@ function compactReasons(reasons?: string[], fallback?: string) {
   return fallback ? [fallback] : [];
 }
 
+function summarizeGeminiError(error?: string | null) {
+  const raw = (error || '').trim();
+  if (!raw) return null;
+  const lowered = raw.toLowerCase();
+  if (lowered.includes('resource_exhausted') || lowered.includes('quota exceeded')) {
+    return 'Quota exhausted. Gemini is temporarily unavailable.';
+  }
+  if (lowered.includes('api key') && lowered.includes('not set')) {
+    return 'Gemini API key is missing.';
+  }
+  if (lowered.includes('timeout')) {
+    return 'Gemini request timed out.';
+  }
+  if (lowered.includes('permission') || lowered.includes('forbidden') || lowered.includes('403')) {
+    return 'Gemini permission was denied.';
+  }
+  return raw.length > 140 ? `${raw.slice(0, 140)}...` : raw;
+}
+
 // Beginner-friendly recommendation card
 function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecuted: () => void; currency: string }) {
   const [loading, setLoading] = useState(false);
@@ -58,8 +77,10 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
         setVolumePreview(preview);
         // Default SL/TP = 10% of investment, but at least the minimum required
         const defaultSlTp = Math.max(Math.round(num * 0.10), Math.ceil(preview.min_sl_tp_dollars));
+        // Default to >= 2:1 reward:risk so manual orders don't get blocked by RR policy.
+        const defaultTp = Math.max(Math.ceil(defaultSlTp * 2), defaultSlTp + 1);
         setSlDollar(String(defaultSlTp));
-        setTpDollar(String(defaultSlTp));
+        setTpDollar(String(defaultTp));
       } catch {}
     } else {
       setSlDollar('');
@@ -116,7 +137,9 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
   const strength = getSignalStrength(rec.signal.confidence);
   const symbolName = getSymbolName(rec.symbol);
   const emoji = getSymbolEmoji(rec.symbol);
-  const qualityScore = rec.trade_quality?.final_trade_quality_score ?? 0;
+  const qualityScore = rec.trade_quality?.final_trade_quality_score && rec.trade_quality.final_trade_quality_score > 0
+    ? rec.trade_quality.final_trade_quality_score
+    : (rec.signal.confidence || 0);
   const qualityThreshold = rec.trade_quality?.threshold ?? 0;
   const blockReasons = compactReasons(
     [
@@ -722,9 +745,8 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
     }
   }, [rec.symbol]);
 
-  // Refresh tick when expanded
+  // Refresh tick in the row so collapsed lists don't look permanently "Loading...".
   useEffect(() => {
-    if (!expanded) return;
     let cancelled = false;
     const fetchTick = async () => {
       try {
@@ -733,15 +755,20 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
       } catch {}
     };
     fetchTick();
-    const t = setInterval(fetchTick, 5000);
+    const t = setInterval(fetchTick, 15000);
     return () => { cancelled = true; clearInterval(t); };
-  }, [expanded, rec.symbol]);
+  }, [rec.symbol]);
 
   const name = getSymbolName(rec.symbol);
   const emoji = getSymbolEmoji(rec.symbol);
   const conf = Math.round(rec.signal.confidence * 100);
   const strength = getSignalStrength(rec.signal.confidence);
-  const qualityScore = Math.round((rec.trade_quality?.final_trade_quality_score || 0) * 100);
+  const pendingEvaluation = !rec.signal_id && conf === 0;
+  const qualityScore = Math.round((
+    (rec.trade_quality?.final_trade_quality_score && rec.trade_quality.final_trade_quality_score > 0)
+      ? rec.trade_quality.final_trade_quality_score
+      : (rec.signal.confidence || 0)
+  ) * 100);
   const qualityThreshold = Math.round((rec.trade_quality?.threshold || 0) * 100);
   const holdReasons = compactReasons(
     [
@@ -777,8 +804,10 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
         setVolumeInfo(info);
         // Default SL/TP = 10% of investment, but at least the minimum required
         const defaultSlTp = Math.max(Math.round(num * 0.10), Math.ceil(info.min_sl_tp_dollars));
+        // Default to >= 2:1 reward:risk so manual orders don't get blocked by RR policy.
+        const defaultTp = Math.max(Math.ceil(defaultSlTp * 2), defaultSlTp + 1);
         setSlDollar(String(defaultSlTp));
-        setTpDollar(String(defaultSlTp));
+        setTpDollar(String(defaultTp));
       } catch {}
     } else {
       setSlDollar('');
@@ -840,15 +869,17 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
               </div>
             </div>
           ) : (
-            <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Loading...</span>
+            <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>--</span>
           )}
         </div>
 
         <div className="flex items-center gap-2" style={{ width: 100, flexShrink: 0 }}>
           <div style={{ flex: 1, height: 5, background: 'var(--bg-primary)', borderRadius: 3, overflow: 'hidden' }}>
-            <div style={{ width: `${conf}%`, height: '100%', background: strength.color, borderRadius: 3 }} />
+            <div style={{ width: `${pendingEvaluation ? 4 : conf}%`, height: '100%', background: pendingEvaluation ? 'var(--text-muted)' : strength.color, borderRadius: 3 }} />
           </div>
-          <span style={{ fontSize: 10, color: strength.color, fontWeight: 600 }}>{conf}%</span>
+          <span style={{ fontSize: 10, color: pendingEvaluation ? 'var(--text-muted)' : strength.color, fontWeight: 600 }}>
+            {pendingEvaluation ? '...' : `${conf}%`}
+          </span>
         </div>
 
         <div style={{ width: 72, textAlign: 'right', fontSize: 10, fontWeight: 700, color: qualityScore >= qualityThreshold ? 'var(--accent-green)' : 'var(--accent-red)' }}>
@@ -1020,6 +1051,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   const [analyzedCount, setAnalyzedCount] = useState(0);
   const [positions, setPositions] = useState<PositionInfo[]>([]);
   const [scanning, setScanning] = useState(false);
+  const scanningRef = useRef(false);
   const [lastScan, setLastScan] = useState<number | null>(null);
   const [error, setError] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
@@ -1047,6 +1079,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   const connected = status?.connected ?? false;
   const account = status?.account;
   const currency = account?.currency || 'USD';
+  const geminiErrorSummary = summarizeGeminiError(geminiState.last_error);
 
   useEffect(() => {
     if (status?.portfolio) setPortfolioSnapshot(status.portfolio);
@@ -1067,7 +1100,8 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
 
 
   const scanMarkets = useCallback(async () => {
-    if (!connected || scanning) return;
+    if (!connected || scanningRef.current) return;
+    scanningRef.current = true;
     setScanning(true);
     setError('');
     try {
@@ -1155,9 +1189,10 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
         setError(e.message);
       }
     } finally {
+      scanningRef.current = false;
       setScanning(false);
     }
-  }, [connected, scanning]);
+  }, [connected]);
 
   useEffect(() => {
     refreshPositions();
@@ -1464,10 +1499,27 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
               <div style={{ fontWeight: 700, color: geminiState.degraded ? 'var(--accent-yellow)' : geminiState.available ? 'var(--accent-green)' : 'var(--accent-red)' }}>
                 {geminiState.degraded ? 'Degraded' : geminiState.available ? 'Online' : 'Offline'}
               </div>
-              {geminiState.last_error && (
-                <div style={{ fontSize: 10, color: 'var(--text-muted)', maxWidth: 220 }}>
-                  {geminiState.last_error}
+              {geminiErrorSummary && (
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', maxWidth: 260, whiteSpace: 'normal' }}>
+                  {geminiErrorSummary}
                 </div>
+              )}
+              {geminiState.last_error && (
+                <details style={{ marginTop: 4, maxWidth: 260 }}>
+                  <summary style={{ fontSize: 10, color: 'var(--text-muted)', cursor: 'pointer' }}>Details</summary>
+                  <div
+                    style={{
+                      fontSize: 10,
+                      color: 'var(--text-muted)',
+                      marginTop: 4,
+                      whiteSpace: 'normal',
+                      wordBreak: 'break-word',
+                      overflowWrap: 'anywhere',
+                    }}
+                  >
+                    {geminiState.last_error}
+                  </div>
+                </details>
               )}
             </div>
           </div>
@@ -1605,7 +1657,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                   </span>
                   {log.quality_score != null && (
                     <span className="text-muted">
-                      Q {Math.round(log.quality_score * 100)}%
+                      Q {Math.round(((log.quality_score && log.quality_score > 0) ? log.quality_score : log.confidence) * 100)}%
                     </span>
                   )}
                   <span style={{ color: log.success ? 'var(--accent-green)' : 'var(--accent-red)', flex: 1, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>

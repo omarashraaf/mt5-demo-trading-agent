@@ -96,6 +96,12 @@ class AppConfig(BaseModel):
     MIN_TRADES_BEFORE_TRAINING: int = Field(default=50, ge=10, le=100000)
     TRAINING_WINDOW_DAYS: int = Field(default=90, ge=7, le=3650)
     WALK_FORWARD_WINDOWS: int = Field(default=5, ge=2, le=50)
+    AUTO_META_TRAINING_ENABLED: bool = True
+    AUTO_META_TRAIN_INTERVAL_SECONDS: int = Field(default=900, ge=60, le=86400)
+    AUTO_META_TRAIN_MIN_CLOSED_TRADES: int = Field(default=30, ge=10, le=100000)
+    AUTO_META_AUTO_APPROVE: bool = True
+    AUTO_META_MIN_PRECISION: float = Field(default=0.50, ge=0.0, le=1.0)
+    AUTO_META_MIN_F1: float = Field(default=0.45, ge=0.0, le=1.0)
 
     @field_validator("LOG_LEVEL")
     @classmethod
@@ -201,6 +207,12 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
         "MIN_TRADES_BEFORE_TRAINING": int(source.get("MIN_TRADES_BEFORE_TRAINING", "50")),
         "TRAINING_WINDOW_DAYS": int(source.get("TRAINING_WINDOW_DAYS", "90")),
         "WALK_FORWARD_WINDOWS": int(source.get("WALK_FORWARD_WINDOWS", "5")),
+        "AUTO_META_TRAINING_ENABLED": _read_bool(source.get("AUTO_META_TRAINING_ENABLED"), True),
+        "AUTO_META_TRAIN_INTERVAL_SECONDS": int(source.get("AUTO_META_TRAIN_INTERVAL_SECONDS", "900")),
+        "AUTO_META_TRAIN_MIN_CLOSED_TRADES": int(source.get("AUTO_META_TRAIN_MIN_CLOSED_TRADES", "30")),
+        "AUTO_META_AUTO_APPROVE": _read_bool(source.get("AUTO_META_AUTO_APPROVE"), True),
+        "AUTO_META_MIN_PRECISION": float(source.get("AUTO_META_MIN_PRECISION", "0.50")),
+        "AUTO_META_MIN_F1": float(source.get("AUTO_META_MIN_F1", "0.45")),
     }
     return AppConfig(**data)
 

@@ -2,6 +2,7 @@ import aiosqlite
 import json
 import time
 import logging
+import sqlite3
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -351,6 +352,12 @@ class Database:
 
     async def initialize(self):
         self._db = await aiosqlite.connect(self.path)
+        # SQLite durability/concurrency settings to reduce lock contention in
+        # concurrent scanner + auto-trader write bursts.
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA foreign_keys=ON")
+        await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.executescript(SCHEMA)
         await self._migrate_schema()
         await self._db.commit()
@@ -486,26 +493,57 @@ class Database:
         success: bool,
         comment: str = "",
     ):
-        await self._db.execute(
-            """INSERT INTO orders
-            (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, comment, success)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                time.time(),
+        payload = (
+            time.time(),
+            signal_id,
+            symbol,
+            action,
+            volume,
+            price,
+            stop_loss,
+            take_profit,
+            ticket,
+            retcode,
+            retcode_desc,
+            comment or "",
+            int(success),
+        )
+        try:
+            await self._db.execute(
+                """INSERT INTO orders
+                (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, comment, success)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                payload,
+            )
+        except sqlite3.IntegrityError as exc:
+            # Keep trading flow alive if a stale/missing signal FK appears under
+            # concurrent scanner activity; fall back to nullable signal_id.
+            logger.warning(
+                "log_order FK failed for signal_id=%s symbol=%s, retrying without signal link: %s",
                 signal_id,
                 symbol,
-                action,
-                volume,
-                price,
-                stop_loss,
-                take_profit,
-                ticket,
-                retcode,
-                retcode_desc,
-                comment or "",
-                int(success),
-            ),
-        )
+                exc,
+            )
+            await self._db.execute(
+                """INSERT INTO orders
+                (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, comment, success)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    time.time(),
+                    None,
+                    symbol,
+                    action,
+                    volume,
+                    price,
+                    stop_loss,
+                    take_profit,
+                    ticket,
+                    retcode,
+                    retcode_desc,
+                    comment or "",
+                    int(success),
+                ),
+            )
         await self._db.commit()
 
     async def log_position_change(
@@ -1110,6 +1148,11 @@ class Database:
         rows = await cursor.fetchall()
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in rows]
+
+    async def count_trade_outcomes(self) -> int:
+        cursor = await self._db.execute("SELECT COUNT(*) FROM trade_outcomes")
+        row = await cursor.fetchone()
+        return int(row[0] or 0)
 
     async def log_event_fetch_run(
         self,

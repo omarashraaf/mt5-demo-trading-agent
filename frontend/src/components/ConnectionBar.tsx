@@ -11,7 +11,6 @@ interface Props {
 export default function ConnectionBar({ status, onRefresh }: Props) {
   const [credentials, setCredentials] = useState<SavedCredentials[]>([]);
   const [loading, setLoading] = useState(false);
-  const [autoConnectAttempted, setAutoConnectAttempted] = useState(false);
   const [error, setError] = useState('');
 
   const connected = status?.connected ?? false;
@@ -19,13 +18,6 @@ export default function ConnectionBar({ status, onRefresh }: Props) {
   useEffect(() => {
     api.getCredentials().then(setCredentials).catch(() => {});
   }, []);
-
-  useEffect(() => {
-    if (!autoConnectAttempted && !connected && credentials.length > 0) {
-      setAutoConnectAttempted(true);
-      handleAutoConnect();
-    }
-  }, [credentials, connected, autoConnectAttempted]);
 
   const handleAutoConnect = async () => {
     setLoading(true);

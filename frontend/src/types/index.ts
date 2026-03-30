@@ -45,8 +45,58 @@ export interface ProviderHealth {
   enabled: boolean;
   available: boolean;
   degraded: boolean;
+  partial_news_only?: boolean;
+  status?: 'healthy' | 'news_only' | 'degraded';
   reason?: string;
   sample_count?: number;
+  calendar_count?: number;
+  capabilities?: {
+    market_news?: boolean;
+    economic_calendar?: boolean;
+  };
+}
+
+export interface ExternalEventRecord {
+  id: number;
+  source: string;
+  source_event_id: string;
+  title: string;
+  summary: string;
+  timestamp_utc: number;
+  event_type: string;
+  category: string;
+  country: string;
+  importance: string;
+  affected_assets: string[];
+}
+
+export interface EventAssetMappingRecord {
+  id: number;
+  external_event_id: number;
+  symbol: string;
+  baseline_bias: string;
+  needs_gemini_clarification: number;
+  tradable: number;
+  mapping_score: number;
+  reason: string;
+  created_at: number;
+}
+
+export interface GeminiEventAssessmentRecord {
+  id: number;
+  external_event_id: number;
+  event_type: string;
+  affected_assets_json: string;
+  importance: string;
+  bias_by_asset_json: string;
+  persistence_horizon: string;
+  event_risk: string;
+  confidence_adjustment: number;
+  contradiction_flag: number;
+  summary_reason: string;
+  degraded: number;
+  error: string | null;
+  created_at: number;
 }
 
 export type PolicyMode = 'safe' | 'balanced' | 'aggressive';
@@ -88,6 +138,8 @@ export interface PolicySettingsResponse {
 
 export interface StatusResponse {
   connected: boolean;
+  platform?: 'mt5' | 'ibkr';
+  platforms_supported?: Array<'mt5' | 'ibkr'>;
   account: AccountInfo | null;
   terminal: TerminalInfo | null;
   last_error: string | null;

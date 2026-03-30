@@ -91,6 +91,8 @@ class GeminiAgent(TradingAgent):
         self._client = None
         self._last_call_time: float = 0.0
         self._unavailable_reason: str = ""
+        self._runtime_last_error: str = ""
+        self._quota_block_until: float = 0.0
         self._init_client()
 
     def _init_client(self):
@@ -136,6 +138,30 @@ class GeminiAgent(TradingAgent):
     def unavailable_reason(self) -> str:
         return self._unavailable_reason or "Gemini advisor unavailable."
 
+    @property
+    def runtime_last_error(self) -> str:
+        return self._runtime_last_error
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self._runtime_last_error)
+
+    def mark_runtime_error(self, error: str):
+        self._runtime_last_error = str(error or "").strip()
+
+    def clear_runtime_error(self):
+        self._runtime_last_error = ""
+
+    def _quota_block_message(self) -> str:
+        remaining = max(0, int(self._quota_block_until - time.time()))
+        return f"Gemini temporarily blocked after quota exhaustion. Retry in ~{remaining}s."
+
+    def _is_quota_blocked(self) -> bool:
+        return self._quota_block_until > time.time()
+
+    def _mark_quota_exhausted(self, cooldown_seconds: int = 300):
+        self._quota_block_until = max(self._quota_block_until, time.time() + cooldown_seconds)
+
     def evaluate(self, input_data: AgentInput) -> TradeSignal:
         assessment = self.assess(input_data)
         return TradeSignal(
@@ -162,6 +188,17 @@ class GeminiAgent(TradingAgent):
                     reason=f"Gemini unavailable. {self.unavailable_reason}",
                 )
 
+        if self._is_quota_blocked():
+            message = self._quota_block_message()
+            return GeminiAssessment(
+                used=True,
+                available=False,
+                degraded=True,
+                summary_reason="Gemini quota exhausted; using technical logic only.",
+                reason="Gemini quota exhausted; using technical logic only.",
+                error=message,
+            )
+
         try:
             now = time.time()
             if now - self._last_call_time < 4.5:
@@ -185,13 +222,16 @@ class GeminiAgent(TradingAgent):
             assessment.used = True
             assessment.available = True
             assessment.raw_payload = {"raw_text": text}
+            self.clear_runtime_error()
             return assessment
         except Exception as exc:
             error_str = str(exc)
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 logger.warning("Gemini rate limited for %s", input_data.symbol)
+                self._mark_quota_exhausted()
             else:
                 logger.error("Gemini advisory failed for %s: %s", input_data.symbol, exc)
+            self.mark_runtime_error(error_str)
             return GeminiAssessment(
                 used=True,
                 available=False,
@@ -220,6 +260,18 @@ class GeminiAgent(TradingAgent):
                     affected_symbols=[context.symbol],
                 )
 
+        if self._is_quota_blocked():
+            message = self._quota_block_message()
+            return GeminiAssessment(
+                used=True,
+                available=False,
+                degraded=True,
+                summary_reason="Gemini quota exhausted; using technical logic only.",
+                reason="Gemini quota exhausted; using technical logic only.",
+                error=message,
+                affected_symbols=[context.symbol],
+            )
+
         try:
             now = time.time()
             if now - self._last_call_time < 4.5:
@@ -245,10 +297,14 @@ class GeminiAgent(TradingAgent):
                 "raw_text": text,
                 "normalized_news_count": len(normalized_news),
             }
+            self.clear_runtime_error()
             return assessment
         except Exception as exc:
             error_str = str(exc)
             logger.error("Gemini normalized-news assessment failed for %s: %s", context.symbol, exc)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                self._mark_quota_exhausted()
+            self.mark_runtime_error(error_str)
             return GeminiAssessment(
                 used=True,
                 available=False,

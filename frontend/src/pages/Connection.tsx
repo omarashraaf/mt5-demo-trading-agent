@@ -8,31 +8,71 @@ interface Props {
   onRefresh: () => void;
 }
 
+type SavedIbkrAccount = {
+  id: string;
+  host: string;
+  accountType: 'paper' | 'live';
+  clientId: string;
+  accountId: string;
+  label: string;
+  createdAt: number;
+};
+
+const SAVED_IBKR_KEY = 'trading_saved_ibkr_accounts_v1';
+
 export default function Connection({ status, onRefresh }: Props) {
+  const [platform, setPlatform] = useState<'mt5' | 'ibkr'>((status?.platform as 'mt5' | 'ibkr') || 'mt5');
   const [account, setAccount] = useState('');
   const [password, setPassword] = useState('');
   const [server, setServer] = useState('');
   const [terminalPath, setTerminalPath] = useState('');
+  const [ibkrHost, setIbkrHost] = useState('127.0.0.1');
+  const [ibkrAccountType, setIbkrAccountType] = useState<'paper' | 'live'>('paper');
+  const [ibkrClientId, setIbkrClientId] = useState('1');
+  const [ibkrAccountId, setIbkrAccountId] = useState('');
   const [rememberCredentials, setRememberCredentials] = useState(false);
+  const [rememberIbkrSettings, setRememberIbkrSettings] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [verifyResult, setVerifyResult] = useState<any>(null);
   const [savedCreds, setSavedCreds] = useState<SavedCredentials[]>([]);
+  const [savedIbkrAccounts, setSavedIbkrAccounts] = useState<SavedIbkrAccount[]>([]);
 
   const connected = status?.connected ?? false;
+  const connectedPlatform = (status?.platform as 'mt5' | 'ibkr') || 'mt5';
+
+  useEffect(() => {
+    if (status?.platform) {
+      setPlatform(status.platform);
+    }
+  }, [status?.platform]);
+
+  const ibkrPort = ibkrAccountType === 'live' ? '7496' : '7497';
 
   useEffect(() => {
     api.getCredentials().then((creds) => {
       setSavedCreds(creds);
-      if (creds.length > 0 && !account) {
-        const c = creds[0];
-        setAccount(String(c.account));
-        setServer(c.server);
-        setTerminalPath(c.terminal_path || '');
-      }
     }).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SAVED_IBKR_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as SavedIbkrAccount[];
+      if (Array.isArray(parsed)) {
+        setSavedIbkrAccounts(parsed);
+      }
+    } catch {
+      // ignore malformed local cache
+    }
+  }, []);
+
+  const persistIbkrAccounts = (accounts: SavedIbkrAccount[]) => {
+    setSavedIbkrAccounts(accounts);
+    localStorage.setItem(SAVED_IBKR_KEY, JSON.stringify(accounts));
+  };
 
   const handleDeleteCredentials = async (acct: number) => {
     try {
@@ -41,19 +81,86 @@ export default function Connection({ status, onRefresh }: Props) {
     } catch {}
   };
 
-  const handleConnect = async () => {
+  const handleDeleteIbkrSettings = (id: string) => {
+    persistIbkrAccounts(savedIbkrAccounts.filter((item) => item.id !== id));
+  };
+
+  const handleLoadIbkrSettings = (saved: SavedIbkrAccount) => {
+    setPlatform('ibkr');
+    setIbkrHost(saved.host || '127.0.0.1');
+    setIbkrAccountType(saved.accountType || 'paper');
+    setIbkrClientId(saved.clientId || '1');
+    setIbkrAccountId(saved.accountId || '');
+  };
+
+  const handleAutoConnectIbkr = async (saved: SavedIbkrAccount) => {
     setLoading(true);
     setError('');
     try {
       const result = await api.connect({
-        account: parseInt(account),
-        password,
-        server,
-        terminal_path: terminalPath || undefined,
-        save_credentials: rememberCredentials,
+        platform: 'ibkr',
+        ibkr_host: saved.host || '127.0.0.1',
+        ibkr_port: saved.accountType === 'live' ? 7496 : 7497,
+        ibkr_client_id: parseInt(saved.clientId || '1', 10),
+        ibkr_account_id: saved.accountId || undefined,
       });
+      if (!result?.connected) {
+        setError('Auto-connect failed');
+      } else {
+        onRefresh();
+      }
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleConnect = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const result = await api.connect(
+        platform === 'mt5'
+          ? {
+              platform: 'mt5',
+              account: parseInt(account),
+              password,
+              server,
+              terminal_path: terminalPath || undefined,
+              save_credentials: rememberCredentials,
+            }
+          : {
+              platform: 'ibkr',
+              ibkr_host: ibkrHost.trim() || '127.0.0.1',
+              ibkr_port: parseInt(ibkrPort, 10),
+              ibkr_client_id: parseInt(ibkrClientId || '1'),
+              ibkr_account_id: ibkrAccountId.trim() || undefined,
+            }
+      );
       if (rememberCredentials && result?.credential_status?.saved === false) {
         setError(result.credential_status.reason || 'Connected, but credentials could not be saved securely.');
+      }
+      if (platform === 'ibkr' && rememberIbkrSettings) {
+        const normalizedHost = ibkrHost.trim() || '127.0.0.1';
+        const normalizedClientId = String(parseInt(ibkrClientId || '1', 10));
+        const normalizedAccount = ibkrAccountId.trim();
+        const deduped = savedIbkrAccounts.filter((item) => !(
+          item.host === normalizedHost
+          && item.accountType === ibkrAccountType
+          && item.clientId === normalizedClientId
+          && item.accountId === normalizedAccount
+        ));
+        const entry: SavedIbkrAccount = {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          host: normalizedHost,
+          accountType: ibkrAccountType,
+          clientId: normalizedClientId,
+          accountId: normalizedAccount,
+          label: normalizedAccount || `${ibkrAccountType.toUpperCase()} @ ${normalizedHost}`,
+          createdAt: Date.now(),
+        };
+        persistIbkrAccounts([entry, ...deduped].slice(0, 30));
       }
       onRefresh();
     } catch (e: any) {
@@ -108,12 +215,11 @@ export default function Connection({ status, onRefresh }: Props) {
   return (
     <div style={{ maxWidth: 700, margin: '0 auto' }}>
       <div className="page-header">
-        <h2>Connect to MetaTrader 5</h2>
-        <p>Enter your demo account details to get started</p>
+        <h2>Connect to Trading Platform</h2>
+        <p>Select MT5 or IBKR and connect with the required details</p>
       </div>
 
-      {/* Help box for beginners */}
-      {!connected && (
+      {!connected && platform === 'mt5' && (
         <div style={{
           background: 'rgba(59, 130, 246, 0.06)',
           border: '1px solid rgba(59, 130, 246, 0.15)',
@@ -137,14 +243,39 @@ export default function Connection({ status, onRefresh }: Props) {
         </div>
       )}
 
-      {/* Connected state */}
+      {!connected && platform === 'ibkr' && (
+        <div style={{
+          background: 'rgba(16, 185, 129, 0.06)',
+          border: '1px solid rgba(16, 185, 129, 0.15)',
+          borderRadius: 8,
+          padding: '16px 20px',
+          marginBottom: 20,
+          fontSize: 13,
+          color: 'var(--text-secondary)',
+          lineHeight: 1.6,
+        }}>
+          <div className="flex items-center gap-2" style={{ fontWeight: 600, marginBottom: 8, color: 'var(--accent-green)' }}>
+            <HelpCircle size={14} />
+            IBKR connection checklist
+          </div>
+          <ol style={{ paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <li>Open <strong>TWS</strong> or <strong>IB Gateway</strong> on your PC</li>
+            <li>Enable API: <strong>Configure &gt; API &gt; Settings &gt; Enable ActiveX and Socket Clients</strong></li>
+            <li>Use port <strong>7497</strong> for Paper, <strong>7496</strong> for Live (unless customized)</li>
+            <li>Use a unique <strong>Client ID</strong> (example: 1)</li>
+          </ol>
+        </div>
+      )}
+
       {connected && status?.account && (
         <div className="card" style={{ marginBottom: 20 }}>
           <div className="flex items-center gap-3" style={{ marginBottom: 16 }}>
             <CheckCircle size={24} style={{ color: 'var(--accent-green)' }} />
             <div>
               <div style={{ fontWeight: 600, fontSize: 16 }}>Connected Successfully!</div>
-              <div className="text-muted" style={{ fontSize: 13 }}>Your MT5 demo account is ready</div>
+              <div className="text-muted" style={{ fontSize: 13 }}>
+                Your {connectedPlatform.toUpperCase()} account is ready
+              </div>
             </div>
           </div>
           <div style={{
@@ -170,8 +301,8 @@ export default function Connection({ status, onRefresh }: Props) {
               <span style={{ fontWeight: 600 }}>{status.account.balance.toFixed(2)} {status.account.currency}</span>
             </div>
             <div>
-              <span className="text-muted">Type: </span>
-              <span className="badge badge-green">DEMO</span>
+              <span className="text-muted">Platform: </span>
+              <span className="badge badge-green">{connectedPlatform.toUpperCase()}</span>
             </div>
           </div>
           <div className="flex gap-2">
@@ -185,7 +316,6 @@ export default function Connection({ status, onRefresh }: Props) {
         </div>
       )}
 
-      {/* Login form */}
       {!connected && (
         <div className="card">
           <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>Account Details</h3>
@@ -197,99 +327,181 @@ export default function Connection({ status, onRefresh }: Props) {
           )}
 
           <div className="form-group">
-            <label>Account Number</label>
-            <input
+            <label>Platform</label>
+            <select
               className="form-input"
-              type="text"
-              placeholder="e.g. 12345678"
-              value={account}
-              onChange={(e) => setAccount(e.target.value)}
-              style={{ fontSize: 15, padding: '12px 16px' }}
-            />
+              value={platform}
+              onChange={(e) => setPlatform(e.target.value as 'mt5' | 'ibkr')}
+            >
+              <option value="mt5">MetaTrader 5 (MT5)</option>
+              <option value="ibkr">Interactive Brokers (IBKR)</option>
+            </select>
           </div>
 
-          <div className="form-group">
-            <label>Password</label>
-            <input
-              className="form-input"
-              type="password"
-              placeholder="Your MT5 password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              style={{ fontSize: 15, padding: '12px 16px' }}
-            />
-          </div>
+          {platform === 'mt5' ? (
+            <>
+              <div className="form-group">
+                <label>Account Number</label>
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="e.g. 12345678"
+                  value={account}
+                  onChange={(e) => setAccount(e.target.value)}
+                  style={{ fontSize: 15, padding: '12px 16px' }}
+                />
+              </div>
 
-          <div className="form-group">
-            <label>Server</label>
-            <input
-              className="form-input"
-              type="text"
-              placeholder="e.g. MetaQuotes-Demo"
-              value={server}
-              onChange={(e) => setServer(e.target.value)}
-              style={{ fontSize: 15, padding: '12px 16px' }}
-            />
-          </div>
+              <div className="form-group">
+                <label>Password</label>
+                <input
+                  className="form-input"
+                  type="password"
+                  placeholder="Your MT5 password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  style={{ fontSize: 15, padding: '12px 16px' }}
+                />
+              </div>
 
-          <label className="flex items-center gap-2" style={{ fontSize: 13, marginBottom: 16 }}>
-            <input
-              type="checkbox"
-              checked={rememberCredentials}
-              onChange={(e) => setRememberCredentials(e.target.checked)}
-              disabled={status?.credential_storage_available === false}
-            />
-            Remember this account on this device
-          </label>
-          {status?.credential_storage_available === false && (
+              <div className="form-group">
+                <label>Server</label>
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="e.g. MetaQuotes-Demo"
+                  value={server}
+                  onChange={(e) => setServer(e.target.value)}
+                  style={{ fontSize: 15, padding: '12px 16px' }}
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="form-group">
+                <label>IBKR Host</label>
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="127.0.0.1"
+                  value={ibkrHost}
+                  onChange={(e) => setIbkrHost(e.target.value)}
+                  style={{ fontSize: 15, padding: '12px 16px' }}
+                />
+              </div>
+              <div className="form-group">
+                <label>Account Type</label>
+                <select
+                  className="form-input"
+                  value={ibkrAccountType}
+                  onChange={(e) => setIbkrAccountType(e.target.value as 'paper' | 'live')}
+                  style={{ fontSize: 15, padding: '12px 16px' }}
+                >
+                  <option value="paper">Paper Trading (Port 7497)</option>
+                  <option value="live">Live Account (Port 7496)</option>
+                </select>
+                <div className="text-muted" style={{ fontSize: 12, marginTop: 6 }}>
+                  Port is set automatically to <strong>{ibkrPort}</strong> based on account type.
+                </div>
+              </div>
+              <div className="form-group">
+                <label>Client ID</label>
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="1"
+                  value={ibkrClientId}
+                  onChange={(e) => setIbkrClientId(e.target.value)}
+                  style={{ fontSize: 15, padding: '12px 16px' }}
+                />
+              </div>
+              <div className="form-group">
+                <label>Account ID (optional)</label>
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="DUxxxxxxx"
+                  value={ibkrAccountId}
+                  onChange={(e) => setIbkrAccountId(e.target.value)}
+                  style={{ fontSize: 15, padding: '12px 16px' }}
+                />
+              </div>
+            </>
+          )}
+
+          {platform === 'mt5' && (
+            <label className="flex items-center gap-2" style={{ fontSize: 13, marginBottom: 16 }}>
+              <input
+                type="checkbox"
+                checked={rememberCredentials}
+                onChange={(e) => setRememberCredentials(e.target.checked)}
+                disabled={status?.credential_storage_available === false}
+              />
+              Remember this account on this device
+            </label>
+          )}
+          {platform === 'ibkr' && (
+            <label className="flex items-center gap-2" style={{ fontSize: 13, marginBottom: 16 }}>
+              <input
+                type="checkbox"
+                checked={rememberIbkrSettings}
+                onChange={(e) => setRememberIbkrSettings(e.target.checked)}
+              />
+              Save account settings on this device
+            </label>
+          )}
+          {status?.credential_storage_available === false && platform === 'mt5' && (
             <div className="warning-banner" style={{ fontSize: 11, padding: '8px 12px', marginBottom: 12 }}>
               <AlertTriangle size={12} />
               Secure credential storage is unavailable, so saved login is disabled.
             </div>
           )}
 
-          {/* Advanced settings - hidden by default */}
-          <button
-            onClick={() => setShowAdvanced(!showAdvanced)}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: 'var(--text-muted)',
-              fontSize: 12,
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 4,
-              padding: '8px 0',
-              marginBottom: showAdvanced ? 8 : 0,
-            }}
-          >
-            {showAdvanced ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-            Advanced settings
-          </button>
-
-          {showAdvanced && (
+          {platform === 'mt5' && (
             <>
-              <div className="form-group">
-                <label>Terminal Path (usually auto-detected)</label>
-                <input
-                  className="form-input"
-                  type="text"
-                  placeholder="Leave empty for auto-detect"
-                  value={terminalPath}
-                  onChange={(e) => setTerminalPath(e.target.value)}
-                />
-              </div>
-              <button className="btn btn-secondary btn-sm mb-4" onClick={handleVerify} disabled={loading}>
-                <Search size={12} /> Verify Terminal
+              <button
+                onClick={() => setShowAdvanced(!showAdvanced)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: 'var(--text-muted)',
+                  fontSize: 12,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 4,
+                  padding: '8px 0',
+                  marginBottom: showAdvanced ? 8 : 0,
+                }}
+              >
+                {showAdvanced ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                Advanced settings
               </button>
-              {verifyResult && (
-                <div className={`text-sm ${verifyResult.ok ? 'text-green' : 'text-red'}`} style={{ marginBottom: 12 }}>
-                  {verifyResult.ok
-                    ? `Found: ${verifyResult.name} (Build ${verifyResult.build})`
-                    : `Not found: ${verifyResult.error}`
-                  }
-                </div>
+
+              {showAdvanced && (
+                <>
+                  <div className="form-group">
+                    <label>Terminal Path (usually auto-detected)</label>
+                    <input
+                      className="form-input"
+                      type="text"
+                      placeholder="Leave empty for auto-detect"
+                      value={terminalPath}
+                      onChange={(e) => setTerminalPath(e.target.value)}
+                    />
+                  </div>
+                  <button className="btn btn-secondary btn-sm mb-4" onClick={handleVerify} disabled={loading}>
+                    <Search size={12} /> Verify Terminal
+                  </button>
+                  {verifyResult && (
+                    <div className={`text-sm ${verifyResult.ok ? 'text-green' : 'text-red'}`} style={{ marginBottom: 12 }}>
+                      {verifyResult.ok
+                        ? `Found: ${verifyResult.name} (Build ${verifyResult.build})`
+                        : `Not found: ${verifyResult.error}`
+                      }
+                    </div>
+                  )}
+                </>
               )}
             </>
           )}
@@ -297,37 +509,43 @@ export default function Connection({ status, onRefresh }: Props) {
           <button
             className="btn btn-primary"
             onClick={handleConnect}
-            disabled={loading || !account || !password || !server}
+            disabled={
+              loading
+              || (platform === 'mt5' && (!account || !password || !server))
+              || (platform === 'ibkr' && (!ibkrHost || !ibkrClientId))
+            }
             style={{ fontSize: 15, padding: '14px 32px', width: '100%', justifyContent: 'center', marginTop: 8 }}
           >
             {loading ? <span className="loading-spinner" /> : <Plug size={16} />}
-            Connect to MT5
+            {platform === 'mt5' ? 'Connect to MT5' : 'Connect to IBKR'}
           </button>
         </div>
       )}
 
-      {/* Saved credentials */}
-      {savedCreds.length > 0 && !connected && (
+      {(savedCreds.length > 0 || savedIbkrAccounts.length > 0) && !connected && (
         <div className="card mt-4">
           <h3 style={{ fontSize: 13, fontWeight: 600, marginBottom: 12 }}>Saved Accounts</h3>
           <div className="warning-banner" style={{ fontSize: 11, padding: '8px 12px' }}>
             <CheckCircle size={12} />
             Passwords are stored outside SQLite and are never returned to the UI.
           </div>
+
           {savedCreds.map((c) => (
-            <div key={c.account} className="flex justify-between items-center" style={{
+            <div key={`mt5-${c.account}`} className="flex justify-between items-center" style={{
               padding: '10px 0',
               borderBottom: '1px solid var(--border)',
               fontSize: 13,
             }}>
-              <div>
+              <div className="flex items-center gap-2">
+                <span className="badge badge-blue" style={{ fontSize: 10 }}>MT5</span>
                 <span style={{ fontWeight: 600 }}>{c.account}</span>
-                <span className="text-muted"> on {c.server}</span>
+                <span className="text-muted">on {c.server}</span>
               </div>
               <div className="flex gap-2">
                 <button
                   className="btn btn-primary btn-sm"
                   onClick={() => {
+                    setPlatform('mt5');
                     setAccount(String(c.account));
                     setServer(c.server);
                     setTerminalPath(c.terminal_path || '');
@@ -339,6 +557,34 @@ export default function Connection({ status, onRefresh }: Props) {
                   Auto Connect
                 </button>
                 <button className="btn btn-secondary btn-sm" onClick={() => handleDeleteCredentials(c.account)}>
+                  <Trash2 size={10} />
+                </button>
+              </div>
+            </div>
+          ))}
+
+          {savedIbkrAccounts.map((saved) => (
+            <div key={`ibkr-${saved.id}`} className="flex justify-between items-center" style={{
+              padding: '10px 0',
+              borderBottom: '1px solid var(--border)',
+              fontSize: 13,
+            }}>
+              <div className="flex items-center gap-2">
+                <span className="badge badge-purple" style={{ fontSize: 10 }}>IBKR</span>
+                <span style={{ fontWeight: 600 }}>{saved.accountId || `${saved.accountType.toUpperCase()} account`}</span>
+                <span className="text-muted">on {saved.host}:{saved.accountType === 'live' ? 7496 : 7497}</span>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  className="btn btn-primary btn-sm"
+                  onClick={() => handleLoadIbkrSettings(saved)}
+                >
+                  Load
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={() => handleAutoConnectIbkr(saved)}>
+                  Auto Connect
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={() => handleDeleteIbkrSettings(saved.id)}>
                   <Trash2 size={10} />
                 </button>
               </div>

@@ -127,7 +127,11 @@ class TradeQualityService:
         volatility_quality_score = self._volatility_score(atr_pct, profile.min_atr_pct if profile else 0.2)
         reward_risk_score = self._reward_risk_score(rr_ratio, effective_min_rr)
         spread_quality_score = self._spread_score(spread_points, profile_spread_limit_points)
-        news_alignment_score, contradiction_penalty = self._news_alignment(signal, gemini_assessment)
+        news_alignment_score, contradiction_penalty = self._news_alignment(
+            context=context,
+            signal=signal,
+            assessment=gemini_assessment,
+        )
 
         no_trade_reasons: list[str] = []
         if contradicting_structure and mode != "aggressive":
@@ -257,11 +261,13 @@ class TradeQualityService:
 
     def _news_alignment(
         self,
+        *,
+        context: MarketContext,
         signal: TechnicalSignal,
         assessment: GeminiAssessment | None,
     ) -> tuple[float, float]:
         if not assessment or not assessment.used or assessment.degraded:
-            return 0.55, 0.0
+            return self._event_alignment_from_context(context, signal)
 
         direction = "bullish" if signal.action == "BUY" else "bearish"
         base = 0.55
@@ -276,6 +282,48 @@ class TradeQualityService:
         contradiction_penalty = 0.12 if assessment.contradiction_flag else 0.0
         alignment = _clamp(base - risk_penalty)
         return alignment, contradiction_penalty
+
+    def _event_alignment_from_context(
+        self,
+        context: MarketContext,
+        signal: TechnicalSignal,
+    ) -> tuple[float, float]:
+        if not context.normalized_news:
+            return 0.55, 0.0
+
+        direction = "bullish" if signal.action == "BUY" else "bearish"
+        weights = {"high": 1.0, "medium": 0.6, "low": 0.3}
+        risk_order = {"low": 0, "medium": 1, "high": 2}
+        bias_score = 0.0
+        contradiction = 0.0
+        total_w = 0.0
+        strongest_risk = "low"
+
+        for item in context.normalized_news[:8]:
+            meta = item.metadata or {}
+            bias = str(meta.get("gemini_bias", "neutral")).lower()
+            event_risk = str(meta.get("gemini_event_risk", "low")).lower()
+            if event_risk not in {"low", "medium", "high"}:
+                event_risk = "low"
+            w = weights.get(event_risk, 0.3)
+            total_w += w
+            if bias == direction:
+                bias_score += 1.0 * w
+            elif bias == "neutral":
+                bias_score += 0.0
+            else:
+                bias_score -= 1.0 * w
+                contradiction += 0.10 * w
+            if risk_order[event_risk] > risk_order[strongest_risk]:
+                strongest_risk = event_risk
+
+        if total_w <= 0:
+            return 0.55, 0.0
+
+        normalized_bias = bias_score / total_w  # -1..1
+        alignment = _clamp(0.55 + normalized_bias * 0.30)
+        risk_penalty = {"low": 0.0, "medium": 0.03, "high": 0.08}.get(strongest_risk, 0.0)
+        return _clamp(alignment - risk_penalty), _clamp(contradiction, 0.0, 0.18)
 
     def _is_choppy(self, meta: dict) -> bool:
         position_in_range = float(meta.get("position_in_range", 0.5))

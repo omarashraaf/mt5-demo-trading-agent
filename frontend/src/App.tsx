@@ -14,7 +14,7 @@ import {
   ChevronDown,
   ChevronRight,
   Settings,
-  FlaskConical,
+  Newspaper,
 } from 'lucide-react';
 import { api } from './utils/api';
 import type { StatusResponse } from './types';
@@ -28,7 +28,7 @@ import Logs from './pages/Logs';
 import AIActivityPage from './pages/AIActivity';
 import ChatPage from './pages/Chat';
 import TradeHistoryPage from './pages/TradeHistory';
-import ResearchPage from './pages/Research';
+import EventsPage from './pages/Events';
 
 const ADVANCED_NAV = [
   { path: '/chat', label: 'Gemini Chat', icon: MessageSquare },
@@ -38,7 +38,7 @@ const ADVANCED_NAV = [
   { path: '/risk', label: 'Risk Settings', icon: Shield },
   { path: '/execution', label: 'Execution', icon: Zap },
   { path: '/trade-history', label: 'Trade History', icon: History },
-  { path: '/research', label: 'Research Lab', icon: FlaskConical },
+  { path: '/events', label: 'News Feed', icon: Newspaper },
   { path: '/logs', label: 'Logs', icon: ScrollText },
 ];
 
@@ -53,7 +53,8 @@ export default function App() {
       const s = await api.getStatus();
       setStatus(s);
     } catch {
-      setStatus(null);
+      // Keep last known status on transient API timeouts to avoid UI flicker
+      // between dashboard and connection state.
     }
   }, []);
 
@@ -175,7 +176,7 @@ export default function App() {
           <Route path="/ai-activity" element={<AIActivityPage status={status} />} />
           <Route path="/chat" element={<ChatPage connected={connected} />} />
           <Route path="/logs" element={<Logs />} />
-          <Route path="/research" element={<ResearchPage />} />
+          <Route path="/events" element={<EventsPage />} />
         </Routes>
       </main>
     </div>

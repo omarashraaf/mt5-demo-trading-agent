@@ -6,6 +6,22 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_mt5_comment(comment: str, max_len: int = 31) -> str:
+    # MT5 comments are broker-sensitive; keep short ASCII-safe text.
+    raw = (comment or "TradingAgent").strip()
+    ascii_only = "".join(ch for ch in raw if 32 <= ord(ch) <= 126)
+    compact = " ".join(ascii_only.split())
+    safe_chars = []
+    for ch in compact:
+        if ch.isalnum() or ch in {" ", "_", "-"}:
+            safe_chars.append(ch)
+        else:
+            safe_chars.append("_")
+    compact = "".join(safe_chars)
+    safe = compact[:max_len].strip()
+    return safe or "TradingAgent"
+
+
 class OrderRequest(BaseModel):
     symbol: str
     action: str  # BUY or SELL
@@ -152,7 +168,7 @@ class ExecutionEngine:
             "tp": req.take_profit,
             "deviation": 20,
             "magic": 234000,
-            "comment": req.comment,
+            "comment": _sanitize_mt5_comment(req.comment),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling_type,
         }

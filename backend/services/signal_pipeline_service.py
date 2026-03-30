@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from agent.interface import AgentInput
@@ -21,6 +22,7 @@ from domain.models import (
 )
 from services.anti_churn_service import AntiChurnService
 from services.gemini_news_analysis_service import GeminiNewsAnalysisService
+from services.gemini_strategy_advisor_service import GeminiStrategyAdvisorService
 from services.news_ingestion_service import NewsIngestionService
 from services.event_ingestion_service import EventIngestionService
 from services.portfolio_risk_service import PortfolioRiskService
@@ -54,6 +56,7 @@ class SignalPipelineService:
         news_ingestion_service: Optional[NewsIngestionService] = None,
         event_ingestion_service: Optional[EventIngestionService] = None,
         gemini_news_analysis_service: Optional[GeminiNewsAnalysisService] = None,
+        gemini_strategy_advisor_service: Optional[GeminiStrategyAdvisorService] = None,
         trade_decision_service: Optional[TradeDecisionService] = None,
         risk_service: Optional[RiskService] = None,
         meta_model_service: Optional[MetaModelService] = None,
@@ -84,6 +87,10 @@ class SignalPipelineService:
                 timeout_seconds=getattr(gemini_adapter, "timeout_seconds", 12.0),
                 max_retries=getattr(gemini_adapter, "max_retries", 1),
             ) if gemini_agent is not None else None
+        self.gemini_strategy_advisor_service = gemini_strategy_advisor_service or GeminiStrategyAdvisorService(
+            timeout_seconds=getattr(gemini_adapter, "timeout_seconds", 12.0),
+            max_retries=getattr(gemini_adapter, "max_retries", 1),
+        )
         self.trade_decision_service = trade_decision_service or TradeDecisionService(
             trade_quality_service=self.trade_quality_service,
         )
@@ -330,6 +337,121 @@ class SignalPipelineService:
             return "SmartAgent"
         return requested_agent_name
 
+    def _max_tick_age_seconds(self, context: MarketContext) -> int:
+        category = (context.symbol_info.category if context.symbol_info else "").lower()
+        if category == "stocks":
+            return 600
+        if category in {"commodities", "indices"}:
+            return 900
+        return 1200
+
+    def _market_live_guard_reason(self, context: MarketContext) -> str | None:
+        category = (context.symbol_info.category if context.symbol_info else "").lower()
+        # Explicit weekend guard for non-24/7 markets to avoid showing tradable-looking
+        # confidence while venues are closed.
+        if category in {"stocks", "indices", "commodities"}:
+            utc_weekday = datetime.now(timezone.utc).weekday()  # 5=Sat, 6=Sun
+            if utc_weekday in {5, 6}:
+                return f"Market closed for weekend ({category.title()})."
+
+        if context.symbol_info and not context.symbol_info.trade_enabled:
+            return "Market closed or trading disabled for this symbol."
+        if not context.tick:
+            return "No live tick available for this symbol."
+
+        bid = float(context.tick.get("bid", 0.0) or 0.0)
+        ask = float(context.tick.get("ask", 0.0) or 0.0)
+        tick_time = float(context.tick.get("time", 0.0) or 0.0)
+        if bid <= 0 or ask <= 0:
+            return "Market closed (no executable live bid/ask)."
+        if tick_time <= 0:
+            return "Market data timestamp unavailable."
+
+        age_seconds = max(0.0, time.time() - tick_time)
+        max_age = self._max_tick_age_seconds(context)
+        if age_seconds > max_age:
+            return (
+                f"Market appears closed or stale for {context.symbol} "
+                f"(last tick {int(age_seconds)}s ago)."
+            )
+        return None
+
+    def _market_unavailable_decision(
+        self,
+        context: MarketContext,
+        requested_agent_name: str,
+        reason: str,
+    ) -> ExecutionDecision:
+        hold_signal = TechnicalSignal(
+            agent_name="MarketGuard",
+            action="HOLD",
+            confidence=0.0,
+            reason=reason,
+            strategy="market_unavailable",
+            metadata={"blocked_by": "market_live_guard"},
+        )
+        trade_quality = self.trade_quality_service.assess(
+            context=context,
+            signal=hold_signal,
+            gemini_assessment=None,
+            portfolio_fit_score=0.0,
+        )
+        risk_evaluation = RiskEvaluation(
+            approved=False,
+            reason=reason,
+            adjusted_volume=0.0,
+            warnings=[],
+            mode=context.evaluation_mode,
+            status="block",
+            machine_reasons=[reason],
+            metrics_snapshot={"blocked_by": "market_live_guard"},
+        )
+        portfolio_risk = PortfolioRiskAssessment(
+            status="block",
+            allow_execute=False,
+            reason=reason,
+            blocking_reasons=[reason],
+            warnings=[],
+            metrics_snapshot={"blocked_by": "market_live_guard"},
+        )
+        anti_churn = AntiChurnAssessment(blocked=False)
+        position_management_plan = PositionManagementPlan(
+            manage_position=False,
+            strategy="market_unavailable",
+            initial_thesis=reason,
+            time_stop_rule="No trade opened.",
+            notes=["Trading blocked before signal generation because market appears closed or stale."],
+            metadata={"blocked_by": "market_live_guard"},
+        )
+        signal_decision = SignalDecision(
+            requested_agent_name=requested_agent_name,
+            primary_agent_name="MarketGuard",
+            final_agent_name="MarketGuard",
+            market_context=context,
+            primary_signal=hold_signal,
+            final_signal=hold_signal,
+            gemini_confirmation=None,
+            degraded_reasons=list(dict.fromkeys(context.degraded_reasons + [reason])),
+        )
+        return ExecutionDecision(
+            allow_execute=False,
+            reason=reason,
+            signal_decision=signal_decision,
+            trade_decision_assessment=TradeDecisionAssessment(
+                trade=False,
+                final_direction="HOLD",
+                final_signal=hold_signal,
+                trade_quality_assessment=trade_quality,
+                reasons=[reason],
+            ),
+            risk_evaluation=risk_evaluation,
+            trade_quality_assessment=trade_quality,
+            portfolio_risk_assessment=portfolio_risk,
+            anti_churn_assessment=anti_churn,
+            position_management_plan=position_management_plan,
+            entry_price=0.0,
+        )
+
     def _should_use_gemini(
         self,
         requested_agent_name: Optional[str],
@@ -340,11 +462,15 @@ class SignalPipelineService:
         gemini_role = str(user_policy.get("gemini_role", "advisory")).lower()
         if gemini_role == "off":
             return False
+        # Protect free-tier Gemini quota: avoid per-symbol Gemini calls in bulk
+        # scan/auto loops unless the user explicitly requires confirmation mode.
+        if evaluation_mode in {"scan", "auto"} and gemini_role != "confirmation-required":
+            return False
         if gemini_role == "confirmation-required":
             return True
         if requested_agent_name == "GeminiAgent":
             return True
-        return evaluation_mode in {"scan", "auto", "replay"}
+        return evaluation_mode in {"manual", "replay"}
 
     async def _assess_news(
         self,
@@ -361,6 +487,217 @@ class SignalPipelineService:
         if self.gemini_adapter is not None and hasattr(self.gemini_adapter, "confirm"):
             return await self.gemini_adapter.confirm(input_data, primary_signal)
         return None
+
+    def _extract_event_context(self, context: MarketContext, signal: TechnicalSignal) -> dict:
+        if not context.normalized_news:
+            return {
+                "news_items": 0,
+                "bias": "neutral",
+                "event_risk": "low",
+                "confidence_adjustment": 0.0,
+                "contradiction_flag": False,
+                "event_ids": [],
+            }
+
+        direction = "bullish" if signal.action == "BUY" else "bearish"
+        risk_rank = {"low": 0, "medium": 1, "high": 2}
+        bias_score = 0.0
+        weight_total = 0.0
+        strongest_risk = "low"
+        event_ids: list[str] = []
+
+        for item in context.normalized_news[:8]:
+            meta = item.metadata or {}
+            event_id = str(meta.get("external_event_id", "") or "")
+            if event_id:
+                event_ids.append(event_id)
+            bias = str(meta.get("gemini_bias", "neutral")).lower()
+            risk = str(meta.get("gemini_event_risk", "low")).lower()
+            if risk not in {"low", "medium", "high"}:
+                risk = "low"
+            w = {"high": 1.0, "medium": 0.6, "low": 0.3}.get(risk, 0.3)
+            weight_total += w
+            if bias == direction:
+                bias_score += 1.0 * w
+            elif bias == "neutral":
+                bias_score += 0.0
+            else:
+                bias_score -= 1.0 * w
+            if risk_rank[risk] > risk_rank[strongest_risk]:
+                strongest_risk = risk
+
+        if weight_total <= 0:
+            return {
+                "news_items": len(context.normalized_news),
+                "bias": "neutral",
+                "event_risk": strongest_risk,
+                "confidence_adjustment": 0.0,
+                "contradiction_flag": False,
+                "event_ids": list(dict.fromkeys(event_ids)),
+            }
+
+        normalized_bias = bias_score / weight_total
+        if normalized_bias > 0.15:
+            bias = direction
+        elif normalized_bias < -0.15:
+            bias = "bearish" if direction == "bullish" else "bullish"
+        else:
+            bias = "neutral"
+
+        contradiction_flag = bias not in {direction, "neutral"}
+        base_adjustment = max(-0.06, min(0.06, normalized_bias * 0.06))
+        if strongest_risk == "high":
+            base_adjustment = min(base_adjustment, 0.0)
+            base_adjustment -= 0.01
+        return {
+            "news_items": len(context.normalized_news),
+            "bias": bias,
+            "event_risk": strongest_risk,
+            "confidence_adjustment": round(max(-0.08, min(0.08, base_adjustment)), 3),
+            "contradiction_flag": contradiction_flag,
+            "event_ids": list(dict.fromkeys(event_ids)),
+        }
+
+    def _apply_event_context_advisory(
+        self,
+        context: MarketContext,
+        signal: TechnicalSignal,
+    ) -> TechnicalSignal:
+        event_ctx = self._extract_event_context(context, signal)
+        adjusted = signal.model_copy(deep=True)
+        adjusted.confidence = round(
+            max(0.0, min(0.95, adjusted.confidence + float(event_ctx.get("confidence_adjustment", 0.0)))),
+            2,
+        )
+        meta = dict(adjusted.metadata or {})
+        meta["event_context"] = event_ctx
+        adjusted.metadata = meta
+        if event_ctx.get("news_items", 0) <= 0:
+            return adjusted
+        if event_ctx.get("contradiction_flag"):
+            adjusted.reason = (
+                f"{adjusted.reason} Event context contradicts direction; confidence reduced."
+            )
+        elif event_ctx.get("bias") in {"bullish", "bearish"}:
+            adjusted.reason = (
+                f"{adjusted.reason} Event context aligns {event_ctx.get('bias')}."
+            )
+        return adjusted
+
+    def _should_use_strategy_advisor(
+        self,
+        *,
+        context: MarketContext,
+        signal: TechnicalSignal,
+        evaluation_mode: str,
+    ) -> bool:
+        if signal.action not in {"BUY", "SELL"}:
+            return False
+        if signal.confidence < 0.52:
+            return False
+        policy = context.user_policy or {}
+        if str(policy.get("gemini_role", "advisory")).lower() == "off":
+            return False
+        # Keep scan loops responsive and quota-friendly.
+        if evaluation_mode == "scan":
+            return False
+        return True
+
+    def _clamp_strategy_advisory(self, context: MarketContext, advisory: dict) -> dict:
+        mode = str((context.user_policy or {}).get("mode", "balanced")).lower()
+        mode_bounds = {
+            "safe": {"sl_min": 0.9, "sl_max": 1.8, "tp_min": 1.8, "tp_max": 3.0, "hold_max": 180},
+            "balanced": {"sl_min": 0.9, "sl_max": 2.2, "tp_min": 1.8, "tp_max": 3.6, "hold_max": 240},
+            "aggressive": {"sl_min": 0.8, "sl_max": 2.6, "tp_min": 1.6, "tp_max": 4.2, "hold_max": 360},
+        }.get(mode, {"sl_min": 0.9, "sl_max": 2.2, "tp_min": 1.8, "tp_max": 3.6, "hold_max": 240})
+        min_rr = float((context.user_policy or {}).get("min_reward_risk", 1.8) or 1.8)
+
+        clamped = dict(advisory or {})
+        clamped["sl_atr_multiplier"] = max(
+            mode_bounds["sl_min"],
+            min(mode_bounds["sl_max"], float(clamped.get("sl_atr_multiplier", 1.5) or 1.5)),
+        )
+        clamped["tp_atr_multiplier"] = max(
+            mode_bounds["tp_min"],
+            min(mode_bounds["tp_max"], float(clamped.get("tp_atr_multiplier", 2.5) or 2.5)),
+        )
+        clamped["max_hold_minutes"] = max(
+            30,
+            min(mode_bounds["hold_max"], int(float(clamped.get("max_hold_minutes", 120) or 120))),
+        )
+        clamped["confidence_adjustment"] = max(
+            -0.08,
+            min(0.05, float(clamped.get("confidence_adjustment", 0.0) or 0.0)),
+        )
+        # Never let advisory reduce configured minimum reward:risk discipline.
+        if clamped["tp_atr_multiplier"] < clamped["sl_atr_multiplier"] * min_rr:
+            clamped["tp_atr_multiplier"] = round(clamped["sl_atr_multiplier"] * min_rr, 3)
+        return clamped
+
+    def _apply_strategy_advisory(
+        self,
+        *,
+        context: MarketContext,
+        signal: TechnicalSignal,
+        advisory: dict,
+    ) -> TechnicalSignal:
+        adjusted = signal.model_copy(deep=True)
+        clamped = self._clamp_strategy_advisory(context, advisory)
+
+        adjusted.confidence = round(
+            max(0.0, min(0.95, adjusted.confidence + float(clamped.get("confidence_adjustment", 0.0)))),
+            2,
+        )
+
+        metadata = dict(adjusted.metadata or {})
+        metadata["strategy_advisory"] = clamped
+        adjusted.metadata = metadata
+
+        if adjusted.action not in {"BUY", "SELL"}:
+            return adjusted
+        if not context.tick:
+            return adjusted
+
+        entry = self._entry_price(context, adjusted.action)
+        if entry <= 0:
+            return adjusted
+        if adjusted.stop_loss is None or adjusted.take_profit is None:
+            adjusted.max_holding_minutes = int(clamped.get("max_hold_minutes", adjusted.max_holding_minutes or 120))
+            return adjusted
+
+        current_sl_dist = abs(entry - float(adjusted.stop_loss))
+        current_tp_dist = abs(float(adjusted.take_profit) - entry)
+        atr = float(metadata.get("atr", 0.0) or 0.0)
+        if atr <= 0:
+            atr = current_sl_dist
+
+        target_sl_dist = atr * float(clamped.get("sl_atr_multiplier", 1.5))
+        target_tp_dist = atr * float(clamped.get("tp_atr_multiplier", 2.5))
+
+        # Keep advisory conservative: do not loosen stop distance materially.
+        max_sl_dist = current_sl_dist * 1.05 if current_sl_dist > 0 else target_sl_dist
+        min_sl_dist = current_sl_dist * 0.70 if current_sl_dist > 0 else target_sl_dist
+        sl_dist = max(min_sl_dist, min(max_sl_dist, target_sl_dist))
+
+        min_rr = float((context.user_policy or {}).get("min_reward_risk", 1.8) or 1.8)
+        tp_dist = max(target_tp_dist, sl_dist * min_rr)
+        if current_tp_dist > 0:
+            tp_dist = max(tp_dist, current_tp_dist * 0.9)
+
+        digits = int(metadata.get("digits", 5) or 5)
+        if adjusted.action == "BUY":
+            adjusted.stop_loss = round(entry - sl_dist, digits)
+            adjusted.take_profit = round(entry + tp_dist, digits)
+        else:
+            adjusted.stop_loss = round(entry + sl_dist, digits)
+            adjusted.take_profit = round(entry - tp_dist, digits)
+
+        adjusted.max_holding_minutes = int(clamped.get("max_hold_minutes", adjusted.max_holding_minutes or 120))
+        if clamped.get("summary_reason"):
+            adjusted.reason = f"{adjusted.reason} Strategy advisor: {clamped.get('summary_reason')}"
+        if bool(clamped.get("contradiction_flag", False)):
+            adjusted.reason = f"{adjusted.reason} Advisor flagged contradiction risk."
+        return adjusted
 
     def _build_agent_input(
         self,
@@ -763,6 +1100,11 @@ class SignalPipelineService:
                 requested_agent_name=requested_agent_name or "SmartAgent",
                 reason=reason,
             )
+        market_guard_reason: str | None = None
+        if evaluation_mode in {"manual", "scan", "auto"}:
+            # Keep technical analysis running so UI still gets confidence/quality,
+            # but block execution later when market is closed/stale.
+            market_guard_reason = self._market_live_guard_reason(context)
         primary_agent_name = self._resolve_primary_agent_name(requested_agent_name)
         primary_agent = self.agents.get(primary_agent_name)
         if primary_agent is None:
@@ -783,7 +1125,9 @@ class SignalPipelineService:
             if self.event_ingestion_service is not None:
                 await self.event_ingestion_service.maybe_refresh_latest(
                     min_interval_seconds=300.0 if evaluation_mode in {"auto", "scan"} else 900.0,
-                    classify_with_gemini=True,
+                    # Keep evaluation responsive: background refresh should not block
+                    # per-symbol decisions on bulk Gemini event classification.
+                    classify_with_gemini=False,
                 )
                 stored_news = await self.event_ingestion_service.recent_symbol_news(
                     context.symbol,
@@ -798,6 +1142,31 @@ class SignalPipelineService:
                 context = context.model_copy(update={"normalized_news": normalized_news})
                 input_data = self._build_agent_input(context, primary_agent_name)
             gemini_assessment = await self._assess_news(context, input_data, primary_signal)
+        # Deterministic event-aware advisory path (used even when Gemini is off).
+        primary_signal = self._apply_event_context_advisory(context, primary_signal)
+        strategy_advisory: dict = {
+            "used": False,
+            "available": bool(getattr(self.gemini_strategy_advisor_service, "available", False)),
+            "degraded": False,
+            "summary_reason": "Strategy advisor skipped.",
+        }
+        if self._should_use_strategy_advisor(
+            context=context,
+            signal=primary_signal,
+            evaluation_mode=evaluation_mode,
+        ):
+            event_context = (primary_signal.metadata or {}).get("event_context", {})
+            strategy_advisory = await self.gemini_strategy_advisor_service.assess(
+                context=context,
+                technical_signal=primary_signal,
+                gemini_assessment=gemini_assessment,
+                event_context=event_context,
+            )
+            primary_signal = self._apply_strategy_advisory(
+                context=context,
+                signal=primary_signal,
+                advisory=strategy_advisory,
+            )
 
         recent_outcomes = []
         recent_evaluations = []
@@ -902,6 +1271,8 @@ class SignalPipelineService:
                 )
 
         blocking_reasons: list[str] = []
+        if market_guard_reason:
+            blocking_reasons.append(market_guard_reason)
         if not trade_decision.trade:
             blocking_reasons.extend(
                 trade_decision.trade_quality_assessment.no_trade_reasons or trade_decision.reasons
@@ -912,6 +1283,15 @@ class SignalPipelineService:
         final_signal = trade_decision.final_signal
         if blocking_reasons and final_signal.action in {"BUY", "SELL"}:
             final_signal = self._downgrade_signal(final_signal, blocking_reasons)
+        if market_guard_reason:
+            # Closed/stale market must never appear as a tradable confidence setup.
+            final_signal = final_signal.model_copy(
+                update={
+                    "action": "HOLD",
+                    "confidence": 0.0,
+                    "reason": f"{final_signal.reason} Market closed guard: {market_guard_reason}",
+                }
+            )
 
         risk_evaluation = risk_approval.risk_evaluation
         risk_evaluation.approved = risk_approval.approved and trade_decision.trade
@@ -936,18 +1316,21 @@ class SignalPipelineService:
             update={"max_holding_minutes": position_management_plan.max_holding_minutes}
         )
 
+        strategy_advisor_used = bool(
+            ((final_signal.metadata or {}).get("strategy_advisory") or {}).get("used")
+        )
+        final_agent_parts: list[str] = [primary_agent_name]
+        if gemini_assessment and gemini_assessment.used and not gemini_assessment.degraded:
+            final_agent_parts.append("Gemini")
+        if strategy_advisor_used:
+            final_agent_parts.append("StrategyAdvisor")
+        if meta_assessment.get("active"):
+            final_agent_parts.append("MetaModel")
+
         signal_decision = SignalDecision(
             requested_agent_name=requested_agent_name or primary_agent_name,
             primary_agent_name=primary_agent_name,
-            final_agent_name=(
-                "SmartAgent+Gemini+MetaModel"
-                if gemini_assessment and gemini_assessment.used and not gemini_assessment.degraded and meta_assessment.get("active")
-                else "SmartAgent+MetaModel"
-                if meta_assessment.get("active")
-                else "SmartAgent+Gemini"
-                if gemini_assessment and gemini_assessment.used and not gemini_assessment.degraded
-                else primary_agent_name
-            ),
+            final_agent_name="+".join(final_agent_parts),
             market_context=context,
             primary_signal=primary_signal,
             final_signal=final_signal,
@@ -1028,7 +1411,8 @@ class SignalPipelineService:
         if self.event_ingestion_service is not None:
             await self.event_ingestion_service.maybe_refresh_latest(
                 min_interval_seconds=300.0,
-                classify_with_gemini=True,
+                # Candidate discovery should stay lightweight and non-blocking.
+                classify_with_gemini=False,
             )
             event_symbols = await self.event_ingestion_service.latest_candidate_symbols(
                 universe_service=self.universe_service,
@@ -1152,10 +1536,18 @@ class SignalPipelineService:
                     "spread_at_eval": float(context.tick.get("spread", 0.0)) if context.tick else 0.0,
                     "atr_regime": str(meta.get("atr_regime", "")),
                     "support_resistance_context": str(meta.get("sr_context", "")),
-                    "event_id": str((context.normalized_news[0].source if context.normalized_news else "")),
+                    "event_id": (
+                        ",".join((meta.get("event_context") or {}).get("event_ids", []))
+                        or str(((context.normalized_news[0].metadata or {}).get("external_event_id", "") if context.normalized_news else ""))
+                    ),
                     "event_type": str((context.normalized_news[0].category if context.normalized_news else "")),
                     "event_importance": str(getattr(gemini, "macro_relevance", "") if gemini else ""),
                     "contradiction_flag": bool(getattr(gemini, "contradiction_flag", False)) if gemini else False,
+                    "event_bias": str((meta.get("event_context") or {}).get("bias", "neutral")),
+                    "event_risk": str((meta.get("event_context") or {}).get("event_risk", "low")),
+                    "event_confidence_adjustment": float((meta.get("event_context") or {}).get("confidence_adjustment", 0.0) or 0.0),
+                    "strategy_advisor_used": bool((meta.get("strategy_advisory") or {}).get("used", False)),
+                    "strategy_advisor_summary": str((meta.get("strategy_advisory") or {}).get("summary_reason", "")),
                     "risk_decision": execution_decision.risk_evaluation.reason,
                     "rejection_reasons": list(dict.fromkeys([r for r in rejection_reasons if r])),
                     "executed": bool(execution_decision.allow_execute),

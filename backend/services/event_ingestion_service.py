@@ -53,12 +53,32 @@ class EventIngestionService:
         gemini_assessments_total = 0
         raw_item_count = 0
         error = ""
+        degraded_reasons: list[str] = []
 
         try:
-            calendar_items, news_items = await asyncio.gather(
-                asyncio.to_thread(self.finnhub_adapter.get_economic_calendar, from_date, to_date),
-                asyncio.to_thread(self.finnhub_adapter.get_market_news, news_category),
-            )
+            calendar_items: list[dict[str, Any]] = []
+            news_items: list[dict[str, Any]] = []
+
+            try:
+                calendar_items = await asyncio.to_thread(
+                    self.finnhub_adapter.get_economic_calendar,
+                    from_date,
+                    to_date,
+                )
+            except FinnhubAdapterError as exc:
+                degraded_reasons.append(f"economic_calendar: {exc}")
+
+            try:
+                news_items = await asyncio.to_thread(
+                    self.finnhub_adapter.get_market_news,
+                    news_category,
+                )
+            except FinnhubAdapterError as exc:
+                degraded_reasons.append(f"market_news: {exc}")
+
+            if not calendar_items and not news_items and degraded_reasons:
+                raise FinnhubAdapterError(" | ".join(degraded_reasons))
+
             raw_item_count = len(calendar_items) + len(news_items)
             events = [
                 *self.normalization_service.normalize_economic_calendar(calendar_items),
@@ -72,6 +92,8 @@ class EventIngestionService:
                 gemini_assessments_total += 1 if stored.get("gemini_assessment") else 0
 
             success = True
+            if degraded_reasons:
+                error = " | ".join(degraded_reasons)
         except FinnhubAdapterError as exc:
             logger.warning("Finnhub ingestion degraded: %s", exc)
             error = str(exc)
@@ -100,7 +122,8 @@ class EventIngestionService:
             "stored_event_count": len(stored_events),
             "mapped_assets_count": mapped_assets_total,
             "gemini_assessment_count": gemini_assessments_total,
-            "degraded": not success,
+            "degraded": (not success) or bool(degraded_reasons),
+            "degraded_reasons": degraded_reasons,
             "from_date": from_date,
             "to_date": to_date,
         }

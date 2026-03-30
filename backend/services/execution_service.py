@@ -67,6 +67,7 @@ class ExecutionService:
         evaluation_mode: str = "manual",
         scan_window_id: str | None = None,
     ) -> ExecutionPreflightAssessment:
+        symbol = context.symbol
         action = candidate_signal.action
         stop_loss = candidate_signal.stop_loss
         take_profit = candidate_signal.take_profit

@@ -294,7 +294,23 @@ class AutoTrader:
                     amount_usd=max(float(investment), 1.0),
                     digits=symbol_info.digits if symbol_info else 5,
                 )
-                comment = f"TA:${float(investment):.2f}|SLA:${float(sl_amount_usd):.2f}|TPA:${float(tp_amount_usd):.2f}"
+                normalized_sl, normalized_tp = self._normalize_live_stops(
+                    symbol=sym,
+                    action=signal.action,
+                    stop_loss=normalized_sl,
+                    take_profit=normalized_tp,
+                )
+                min_rr = max(1.0, float(getattr(self.risk_engine.user_policy, "min_reward_risk", 1.6) or 1.6))
+                sl_distance = abs(entry_price - normalized_sl)
+                tp_distance = abs(normalized_tp - entry_price)
+                if sl_distance > 0 and (tp_distance / sl_distance) < min_rr:
+                    target_tp_distance = sl_distance * min_rr
+                    if signal.action == "BUY":
+                        normalized_tp = round(entry_price + target_tp_distance, symbol_info.digits if symbol_info else 5)
+                    else:
+                        normalized_tp = round(entry_price - target_tp_distance, symbol_info.digits if symbol_info else 5)
+                # Keep broker comment ultra-safe.
+                comment = f"TA{int(max(float(investment), 1.0))}"
 
                 order_req = OrderRequest(
                     symbol=sym,
@@ -396,6 +412,44 @@ class AutoTrader:
 
     def _clamp(self, value: float, minimum: float, maximum: float) -> float:
         return max(minimum, min(maximum, value))
+
+    def _normalize_live_stops(
+        self,
+        *,
+        symbol: str,
+        action: str,
+        stop_loss: float,
+        take_profit: float,
+    ) -> tuple[float, float]:
+        """Clamp SL/TP to broker minimum distance using latest tick."""
+        tick = self.market_data.get_tick(symbol)
+        info = self.market_data.get_symbol_info(symbol)
+        if not tick or not info:
+            return stop_loss, take_profit
+
+        digits = int(info.get("digits", 5) or 5)
+        point = float(info.get("point", 0.00001) or 0.00001)
+        stops_level = float(info.get("trade_stops_level", 0) or 0)
+        spread_points = float(tick.spread or 10)
+        min_distance = max(stops_level, spread_points, 10.0) * point * 1.5
+        required = max(min_distance + point, point)
+        exec_price = float(tick.ask if action == "BUY" else tick.bid)
+        if exec_price <= 0:
+            return stop_loss, take_profit
+
+        sl = float(stop_loss)
+        tp = float(take_profit)
+        if action == "BUY":
+            if abs(exec_price - sl) < required:
+                sl = round(exec_price - required, digits)
+            if abs(tp - exec_price) < required:
+                tp = round(exec_price + required, digits)
+        else:
+            if abs(sl - exec_price) < required:
+                sl = round(exec_price + required, digits)
+            if abs(exec_price - tp) < required:
+                tp = round(exec_price - required, digits)
+        return sl, tp
 
     async def _dynamic_amount_based_targets(
         self,
@@ -607,7 +661,11 @@ class AutoTrader:
             data = json.loads(text)
             sl_delta = self._clamp(float(data.get("sl_delta_pct", 0.0)), -0.02, 0.03)
             tp_delta = self._clamp(float(data.get("tp_delta_pct", 0.0)), -0.03, 0.06)
+            if hasattr(gemini, "clear_runtime_error"):
+                gemini.clear_runtime_error()
             return sl_delta, tp_delta
         except Exception as exc:
+            if hasattr(gemini, "mark_runtime_error"):
+                gemini.mark_runtime_error(str(exc))
             logger.warning("Auto-trader Gemini SL/TP adjustment skipped: %s", exc)
             return 0.0, 0.0

@@ -2,9 +2,9 @@ import { runtimeConfig } from '../config';
 
 const BASE_URL = runtimeConfig.apiBaseUrl;
 const LOCAL_PORT_FALLBACK_URL = BASE_URL.includes('127.0.0.1:8000')
-  ? BASE_URL.replace('127.0.0.1:8000', '127.0.0.1:8002')
+  ? null
   : BASE_URL.includes('localhost:8000')
-    ? BASE_URL.replace('localhost:8000', 'localhost:8002')
+    ? null
     : BASE_URL.includes('127.0.0.1:8002')
       ? BASE_URL.replace('127.0.0.1:8002', '127.0.0.1:8000')
       : BASE_URL.includes('localhost:8002')
@@ -38,13 +38,38 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   for (let i = 0; i < candidates.length; i += 1) {
     const base = candidates[i];
     try {
-      const timeoutMs = i === 0 ? 2000 : 4000;
+      const scanLikePath = path.includes('/agent/smart-evaluate') || path.includes('/auto-trade/activity');
+      const tradeExecutionPath = (
+        path.includes('/trade/execute-recommendation')
+        || path.includes('/trade/quick-buy')
+        || path.includes('/trade/execute')
+      );
+      const connectPath = (
+        path.includes('/connect')
+        || path.includes('/credentials/auto-connect')
+      );
+      const statusPath = path.includes('/status') || path.includes('/auto-trade/status');
+      const timeoutMs = scanLikePath
+        ? (i === 0 ? 30000 : 35000)
+        : tradeExecutionPath
+          ? (i === 0 ? 45000 : 55000)
+          : connectPath
+            ? (i === 0 ? 35000 : 50000)
+          : statusPath
+            ? (i === 0 ? 12000 : 18000)
+            : (i === 0 ? 15000 : 20000);
       const attempt = await fetchWithTimeout(`${base}${path}`, requestOptions, timeoutMs);
       preferredBaseUrl = base;
       res = attempt;
       break;
     } catch (err) {
-      lastError = err;
+      if (err instanceof Error && err.name === 'AbortError') {
+        lastError = new Error('Connection timed out. Please verify backend is running and IBKR TWS/Gateway API is reachable.');
+      } else if (err instanceof Error && err.message.toLowerCase().includes('signal is aborted')) {
+        lastError = new Error('Request was interrupted. Please retry connection and keep this page open until the response returns.');
+      } else {
+        lastError = err;
+      }
     }
   }
 
@@ -61,9 +86,21 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   // Connection
-  connect: (data: { account: number; password: string; server: string; terminal_path?: string; save_credentials?: boolean }) =>
+  connect: (data: {
+    platform?: 'mt5' | 'ibkr';
+    account?: number;
+    password?: string;
+    server?: string;
+    terminal_path?: string;
+    save_credentials?: boolean;
+    ibkr_host?: string;
+    ibkr_port?: number;
+    ibkr_client_id?: number;
+    ibkr_account_id?: string;
+  }) =>
     request<{
       connected: boolean;
+      platform?: 'mt5' | 'ibkr';
       account?: import('@/types').AccountInfo;
       is_demo?: boolean;
       credential_status?: { requested?: boolean; saved?: boolean; reason?: string };
@@ -280,6 +317,47 @@ export const api = {
 
   clearChatHistory: () =>
     request<{ cleared: boolean }>('/chat/history', { method: 'DELETE' }),
+
+  // External events (Finnhub)
+  getFinnhubHealth: () =>
+    request<{ provider: import('@/types').ProviderHealth; universe?: Record<string, unknown> }>('/events/finnhub/health'),
+
+  refreshEvents: (data?: {
+    from_date?: string;
+    to_date?: string;
+    news_category?: string;
+    classify_with_gemini?: boolean;
+  }) =>
+    request<{
+      provider: string;
+      success: boolean;
+      error?: string;
+      raw_item_count: number;
+      stored_event_count: number;
+      mapped_assets_count: number;
+      gemini_assessment_count: number;
+      degraded: boolean;
+      degraded_reasons?: string[];
+      from_date?: string;
+      to_date?: string;
+      finnhub?: import('@/types').ProviderHealth;
+    }>('/events/refresh', {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
+    }),
+
+  getLatestEvents: (limit: number = 25) =>
+    request<{ events: import('@/types').ExternalEventRecord[]; count: number }>(`/events/latest?limit=${limit}`),
+
+  getEventMappings: (limit: number = 100, eventId?: number) =>
+    request<{ mappings: import('@/types').EventAssetMappingRecord[]; count: number }>(
+      `/events/mappings?limit=${limit}${eventId ? `&event_id=${eventId}` : ''}`,
+    ),
+
+  getGeminiEventAssessments: (limit: number = 50, eventId?: number) =>
+    request<{ assessments: import('@/types').GeminiEventAssessmentRecord[]; count: number }>(
+      `/events/gemini-assessments?limit=${limit}${eventId ? `&event_id=${eventId}` : ''}`,
+    ),
 
   // Research cycle
   getResearchStatus: () =>
