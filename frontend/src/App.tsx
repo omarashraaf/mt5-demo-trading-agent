@@ -32,6 +32,8 @@ import EventsPage from './pages/Events';
 import AuthPage from './pages/Auth';
 import { useAuth } from './context/AuthContext';
 import AdminPortal from './pages/admin/AdminPortal';
+import PortalDashboard from './pages/PortalDashboard';
+import { runtimeConfig } from './config';
 
 const ADVANCED_NAV = [
   { path: '/chat', label: 'Gemini Chat', icon: MessageSquare },
@@ -115,6 +117,10 @@ export default function App() {
         </div>
       </div>
     );
+  }
+
+  if (runtimeConfig.appMode === 'portal') {
+    return <PortalDashboard isAdmin={role === 'admin'} />;
   }
 
   return (

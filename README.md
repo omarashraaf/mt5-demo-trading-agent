@@ -96,6 +96,11 @@ LinkTrade now supports a hybrid model:
 - Authentication and admin/user approval stay in Supabase cloud.
 - Core runtime logs can sync to Supabase cloud (best effort).
 
+Cloud portal behavior:
+- `/admin` is a dedicated admin app (separate login with username/password).
+- Main cloud app opens user login/register.
+- After approved user login, a portal dashboard appears with localhost runtime link.
+
 Backend env:
 - `CLOUD_SYNC_ENABLED=true`
 - `CLOUD_LOG_TABLE=runtime_logs`
@@ -111,6 +116,24 @@ create table if not exists public.runtime_logs (
   payload jsonb not null default '{}'::jsonb
 );
 ```
+
+Vercel setup (recommended two projects):
+- `frontend/` as LinkTrade Portal project.
+- `backend/` as LinkTrade Cloud Backend project (uses `backend/vercel.json`).
+
+Frontend env on Vercel:
+- `VITE_API_BASE_URL=https://<your-backend-vercel-domain>/api`
+- `VITE_SUPABASE_URL=...`
+- `VITE_SUPABASE_ANON_KEY=...`
+- `VITE_APP_MODE=portal`
+- `VITE_LOCAL_RUNTIME_URL=http://127.0.0.1:5173`
+
+Backend env on Vercel:
+- `SUPABASE_URL=...`
+- `SUPABASE_ANON_KEY=...`
+- `SUPABASE_SERVICE_ROLE_KEY=...`
+- `DB_PATH=/tmp/trading_agent.db`
+- `ENABLE_ADMIN_BOOTSTRAP=true` (set false after first setup)
 
 ## Demo Workflow
 

@@ -25,4 +25,6 @@ function buildApiBaseUrl(): string {
 
 export const runtimeConfig = {
   apiBaseUrl: buildApiBaseUrl(),
+  appMode: (env.VITE_APP_MODE?.trim().toLowerCase() || 'runtime') as 'runtime' | 'portal',
+  localRuntimeUrl: (env.VITE_LOCAL_RUNTIME_URL?.trim() || 'http://127.0.0.1:5173').replace(/\/+$/, ''),
 };

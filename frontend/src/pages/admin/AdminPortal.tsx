@@ -292,8 +292,8 @@ function AdminShell() {
   ], []);
 
   return (
-    <div style={{ minHeight: '100vh', padding: 24 }}>
-      <div className="card">
+    <div style={{ minHeight: '100vh', padding: 24, background: 'radial-gradient(circle at 10% 10%, rgba(59,130,246,0.2), transparent 45%), var(--bg-primary)' }}>
+      <div className="card" style={{ borderColor: 'rgba(59,130,246,0.35)', boxShadow: '0 0 0 1px rgba(59,130,246,0.18) inset' }}>
         <div className="card-header">
           <div>
             <h3>Admin</h3>
@@ -309,9 +309,14 @@ function AdminShell() {
             Logout
           </button>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
           {tabs.map((tab) => (
-            <NavLink key={tab.to} to={tab.to} className={({ isActive }) => `btn ${isActive ? 'btn-primary' : 'btn-secondary'}`}>
+            <NavLink
+              key={tab.to}
+              to={tab.to}
+              className={({ isActive }) => `btn ${isActive ? 'btn-primary' : 'btn-secondary'}`}
+              style={{ minWidth: 140, justifyContent: 'center' }}
+            >
               {tab.label}
             </NavLink>
           ))}
