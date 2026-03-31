@@ -44,6 +44,8 @@ copy .env.example .env
 ```bash
 cd frontend
 npm install
+copy .env.example .env
+# Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY for auth
 ```
 
 ### 3. Run

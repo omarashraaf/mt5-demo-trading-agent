@@ -29,6 +29,8 @@ import AIActivityPage from './pages/AIActivity';
 import ChatPage from './pages/Chat';
 import TradeHistoryPage from './pages/TradeHistory';
 import EventsPage from './pages/Events';
+import AuthPage from './pages/Auth';
+import { useAuth } from './context/AuthContext';
 
 const ADVANCED_NAV = [
   { path: '/chat', label: 'Gemini Chat', icon: MessageSquare },
@@ -43,6 +45,7 @@ const ADVANCED_NAV = [
 ];
 
 export default function App() {
+  const { loading: authLoading, user, signOut } = useAuth();
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(() => {
     return localStorage.getItem('advancedNav') === 'true';
@@ -72,6 +75,21 @@ export default function App() {
   };
 
   const connected = Boolean(status?.connected && status?.account);
+  const authed = Boolean(user);
+
+  if (authLoading) {
+    return (
+      <div className="app-layout" style={{ alignItems: 'center', justifyContent: 'center' }}>
+        <div className="card" style={{ marginBottom: 0 }}>
+          Checking session...
+        </div>
+      </div>
+    );
+  }
+
+  if (!authed) {
+    return <AuthPage />;
+  }
 
   return (
     <div className="app-layout">
@@ -86,6 +104,14 @@ export default function App() {
             ) : (
               'Demo Mode'
             )}
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => void signOut()}
+            >
+              Logout
+            </button>
           </div>
         </div>
         <nav className="sidebar-nav">
