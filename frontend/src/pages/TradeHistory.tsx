@@ -63,7 +63,12 @@ export default function TradeHistory({ connected }: { connected: boolean }) {
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 15000);
+    const tick = () => {
+      if (document.visibilityState === 'visible') {
+        void refresh();
+      }
+    };
+    const t = setInterval(tick, 45000);
     return () => clearInterval(t);
   }, [refresh]);
 

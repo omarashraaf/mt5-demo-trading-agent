@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Plug, PlugZap, Search, Trash2, AlertTriangle, HelpCircle, CheckCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { api } from '../utils/api';
 import type { StatusResponse, SavedCredentials } from '../types';
@@ -37,9 +37,10 @@ export default function Connection({ status, onRefresh }: Props) {
   const [error, setError] = useState('');
   const [verifyResult, setVerifyResult] = useState<any>(null);
   const [savedCreds, setSavedCreds] = useState<SavedCredentials[]>([]);
+  const [savedCredsError, setSavedCredsError] = useState('');
   const [savedIbkrAccounts, setSavedIbkrAccounts] = useState<SavedIbkrAccount[]>([]);
 
-  const connected = status?.connected ?? false;
+  const connected = Boolean(status?.connected && status?.account);
   const connectedPlatform = (status?.platform as 'mt5' | 'ibkr') || 'mt5';
 
   useEffect(() => {
@@ -50,11 +51,20 @@ export default function Connection({ status, onRefresh }: Props) {
 
   const ibkrPort = ibkrAccountType === 'live' ? '7496' : '7497';
 
-  useEffect(() => {
-    api.getCredentials().then((creds) => {
-      setSavedCreds(creds);
-    }).catch(() => {});
+  const refreshSavedCredentials = useCallback(async () => {
+    try {
+      const creds = await api.getCredentials();
+      setSavedCreds(creds || []);
+      setSavedCredsError('');
+    } catch (e: any) {
+      setSavedCreds([]);
+      setSavedCredsError(e?.message || 'Could not load saved MT5 accounts.');
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshSavedCredentials();
+  }, [refreshSavedCredentials]);
 
   useEffect(() => {
     try {
@@ -202,6 +212,8 @@ export default function Connection({ status, onRefresh }: Props) {
       const result = await api.autoConnect(acct);
       if (!result.connected) {
         setError(result.reason || 'Auto-connect failed');
+      } else if (!result.account) {
+        setError('Connection session is stale. Please click Auto Connect again or use Connect manually.');
       } else {
         onRefresh();
       }
@@ -522,13 +534,28 @@ export default function Connection({ status, onRefresh }: Props) {
         </div>
       )}
 
-      {(savedCreds.length > 0 || savedIbkrAccounts.length > 0) && !connected && (
+      {!connected && (
         <div className="card mt-4">
-          <h3 style={{ fontSize: 13, fontWeight: 600, marginBottom: 12 }}>Saved Accounts</h3>
+          <div className="flex justify-between items-center" style={{ marginBottom: 12 }}>
+            <h3 style={{ fontSize: 13, fontWeight: 600 }}>Saved Accounts</h3>
+            <button className="btn btn-secondary btn-sm" onClick={() => void refreshSavedCredentials()}>
+              Refresh
+            </button>
+          </div>
           <div className="warning-banner" style={{ fontSize: 11, padding: '8px 12px' }}>
             <CheckCircle size={12} />
             Passwords are stored outside SQLite and are never returned to the UI.
           </div>
+          {savedCredsError && (
+            <div className="error-banner" style={{ fontSize: 12, marginTop: 10 }}>
+              {savedCredsError}
+            </div>
+          )}
+          {savedCreds.length === 0 && savedIbkrAccounts.length === 0 && !savedCredsError && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10 }}>
+              No saved accounts found yet.
+            </div>
+          )}
 
           {savedCreds.map((c) => (
             <div key={`mt5-${c.account}`} className="flex justify-between items-center" style={{

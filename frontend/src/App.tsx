@@ -71,7 +71,7 @@ export default function App() {
     });
   };
 
-  const connected = status?.connected ?? false;
+  const connected = Boolean(status?.connected && status?.account);
 
   return (
     <div className="app-layout">

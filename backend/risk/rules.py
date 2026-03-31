@@ -120,7 +120,7 @@ class RiskSettings(BaseModel):
     # Auto-trading settings
     auto_trade_enabled: bool = False
     auto_trade_min_confidence: float = 0.65
-    auto_trade_scan_interval_seconds: int = 60
+    auto_trade_scan_interval_seconds: int = 10
 
 
 class RiskDecision(BaseModel):
@@ -134,7 +134,7 @@ class RiskEngine:
     def __init__(self):
         self.user_policy = build_policy_preset("balanced")
         self.auto_trade_enabled: bool = False
-        self.auto_trade_scan_interval_seconds: int = 60
+        self.auto_trade_scan_interval_seconds: int = 10
         self._daily_loss: float = 0.0
         self._daily_start_equity: float = 0.0
         self._panic_stop: bool = False

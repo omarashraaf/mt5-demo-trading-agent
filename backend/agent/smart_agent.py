@@ -89,6 +89,7 @@ class SmartAgent(TradingAgent):
         return "AI-powered mixed strategy: day trade forex, swing trade stocks & gold."
 
     def evaluate(self, input_data: AgentInput) -> TradeSignal:
+        policy_mode = str(getattr(input_data, "policy_mode", "balanced") or "balanced").lower()
         mtf = input_data.multi_tf_bars or {}
         h4_bars = mtf.get("H4", [])
         h1_bars = mtf.get("H1", [])
@@ -200,7 +201,7 @@ class SmartAgent(TradingAgent):
 
         # Get asset-specific parameters (forex=day trade, stocks/gold=swing trade)
         params = get_trade_params(asset_class)
-        min_entry_conf, min_non_entry_conf = self._confidence_thresholds(asset_class, has_entry)
+        min_entry_conf, min_non_entry_conf = self._confidence_thresholds(asset_class, has_entry, policy_mode)
         metadata = {
             "direction": trend if trend in {"bullish", "bearish"} else "flat",
             "asset_class": asset_class,
@@ -223,7 +224,7 @@ class SmartAgent(TradingAgent):
             "trend_conflict": trend_conflict,
         }
 
-        if trend_conflict:
+        if trend_conflict and policy_mode != "aggressive":
             return TradeSignal(
                 action="HOLD",
                 confidence=max(0.0, confidence - 0.08),
@@ -231,6 +232,10 @@ class SmartAgent(TradingAgent):
                 reason="No trade. H1 and H4 trend structure disagree, so the setup is too noisy.",
                 metadata=metadata,
             )
+        if trend_conflict and policy_mode == "aggressive":
+            # In aggressive mode we allow H1-led continuation attempts even with H4 disagreement.
+            confidence = round(max(0.0, min(0.95, confidence - 0.03)), 2)
+            metadata["aggressive_trend_override"] = True
 
         if trend == "bullish" and (
             (has_entry and confidence >= min_entry_conf) or confidence >= min_non_entry_conf
@@ -382,14 +387,30 @@ class SmartAgent(TradingAgent):
 
         return "none", 0.0
 
-    def _confidence_thresholds(self, asset_class: str, has_entry: bool) -> tuple[float, float]:
+    def _confidence_thresholds(self, asset_class: str, has_entry: bool, policy_mode: str = "balanced") -> tuple[float, float]:
         if asset_class == "stock":
-            return 0.56, 0.62
-        if asset_class == "index":
-            return 0.55, 0.60
-        if asset_class == "commodity":
-            return 0.56, 0.61
-        return 0.60, 0.67
+            entry, non_entry = 0.56, 0.62
+        elif asset_class == "index":
+            entry, non_entry = 0.55, 0.60
+        elif asset_class == "commodity":
+            entry, non_entry = 0.56, 0.61
+        else:
+            entry, non_entry = 0.60, 0.67
+
+        mode = (policy_mode or "balanced").lower()
+        if mode == "aggressive":
+            entry -= 0.12
+            non_entry -= 0.15
+        elif mode == "safe":
+            entry += 0.06
+            non_entry += 0.07
+        else:
+            entry += 0.00
+            non_entry += 0.00
+
+        entry = max(0.40, min(0.90, entry))
+        non_entry = max(entry, min(0.92, non_entry))
+        return round(entry, 2), round(non_entry, 2)
 
     def _check_sr_alignment(self, h1_bars: list[dict], current_price: float, trend: str) -> tuple[float, float]:
         """Check if price is near a support (for buys) or resistance (for sells)."""

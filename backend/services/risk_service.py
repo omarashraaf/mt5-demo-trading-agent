@@ -54,12 +54,19 @@ class RiskService:
     ) -> RiskApprovalDecision:
         live_entry_price = entry_price if entry_price is not None else self._entry_price(context, signal.action)
 
+        context_positions = list(context.all_open_positions or [])
+        live_positions = (
+            context_positions
+            if context_positions
+            else ([] if self.execution_engine is None else self.execution_engine.get_positions())
+        )
+
         risk_decision = self.risk_engine.evaluate(
             signal=signal.to_trade_signal(),
             symbol=context.symbol,
             spread=context.tick.get("spread", 999.0) if context.tick else 999.0,
             equity=context.account_equity,
-            open_positions=[] if self.execution_engine is None else self.execution_engine.get_positions(),
+            open_positions=live_positions,
             is_auto_trade=evaluation_mode == "auto",
             entry_price=live_entry_price,
         )

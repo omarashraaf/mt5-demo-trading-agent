@@ -1,6 +1,7 @@
 import MetaTrader5 as mt5
 import logging
 import pandas as pd
+import math
 from typing import Optional
 from pydantic import BaseModel
 
@@ -35,6 +36,70 @@ class BarData(BaseModel):
 
 
 class MarketDataService:
+    def _extract_commission_fields(self, symbol_info) -> dict:
+        """
+        Build a normalized commission snapshot for a symbol.
+        Values are best-effort because broker feeds vary by server.
+        """
+        payload = symbol_info._asdict() if hasattr(symbol_info, "_asdict") else {}
+
+        def _num(value) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                out = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(out):
+                return None
+            return out
+
+        def _pick(keys: list[str]) -> Optional[float]:
+            for key in keys:
+                raw = payload.get(key, getattr(symbol_info, key, None))
+                val = _num(raw)
+                if val is not None and abs(val) > 0:
+                    return abs(val)
+            return None
+
+        fixed_per_lot_side = _pick([
+            "trade_commission",
+            "trade_commission_per_lot",
+            "commission_per_lot",
+            "commission_lots",
+            "commission",
+        ])
+        percent_rate = _pick([
+            "trade_commission_percent",
+            "commission_percent",
+            "commission_rate",
+        ])
+
+        contract_size = _num(payload.get("trade_contract_size", getattr(symbol_info, "trade_contract_size", 0.0))) or 0.0
+        bid = _num(payload.get("bid", getattr(symbol_info, "bid", 0.0))) or 0.0
+        ask = _num(payload.get("ask", getattr(symbol_info, "ask", 0.0))) or 0.0
+        mid = ((bid + ask) / 2.0) if (bid > 0 and ask > 0) else (bid or ask or 0.0)
+        notional_one_lot = (contract_size * mid) if (contract_size > 0 and mid > 0) else None
+
+        if fixed_per_lot_side is not None:
+            per_lot_side = fixed_per_lot_side
+            model = "fixed_per_lot"
+        elif percent_rate is not None and notional_one_lot:
+            per_lot_side = (notional_one_lot * percent_rate) / 100.0
+            model = "percent_notional"
+        else:
+            per_lot_side = 0.0
+            model = "unknown_or_zero"
+
+        round_turn = per_lot_side * 2.0
+        return {
+            "commission_per_lot_side": round(float(per_lot_side), 6),
+            "commission_round_turn_per_lot": round(float(round_turn), 6),
+            "commission_model": model,
+            "commission_percent_rate": round(float(percent_rate), 6) if percent_rate is not None else None,
+            "commission_notional_1lot": round(float(notional_one_lot), 6) if notional_one_lot else None,
+        }
+
     def enable_symbol(self, symbol: str) -> bool:
         info = mt5.symbol_info(symbol)
         if info is None:
@@ -94,7 +159,7 @@ class MarketDataService:
         info = mt5.symbol_info(symbol)
         if info is None:
             return None
-        return {
+        base = {
             "name": info.name,
             "description": info.description,
             "path": info.path,
@@ -108,6 +173,8 @@ class MarketDataService:
             "visible": info.visible,
             "trade_stops_level": getattr(info, "trade_stops_level", 0),
         }
+        base.update(self._extract_commission_fields(info))
+        return base
 
     def get_all_symbols(self) -> list[dict]:
         """Get ALL symbols available on the broker's MT5 terminal."""
@@ -120,7 +187,7 @@ class MarketDataService:
         for s in symbols:
             # trade_mode: 0=disabled, 4=full access
             category = self._categorize_symbol(s)
-            result.append({
+            row = {
                 "name": s.name,
                 "description": s.description,
                 "path": s.path,
@@ -134,7 +201,9 @@ class MarketDataService:
                 "trade_enabled": s.trade_mode != 0,
                 "bid": s.bid,
                 "ask": s.ask,
-            })
+            }
+            row.update(self._extract_commission_fields(s))
+            result.append(row)
         return result
 
     def get_symbols_by_category(self, category: str) -> list[dict]:

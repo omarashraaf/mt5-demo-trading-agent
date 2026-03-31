@@ -37,40 +37,54 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   let lastError: unknown = null;
   for (let i = 0; i < candidates.length; i += 1) {
     const base = candidates[i];
-    try {
-      const scanLikePath = path.includes('/agent/smart-evaluate') || path.includes('/auto-trade/activity');
-      const tradeExecutionPath = (
-        path.includes('/trade/execute-recommendation')
-        || path.includes('/trade/quick-buy')
-        || path.includes('/trade/execute')
-      );
-      const connectPath = (
-        path.includes('/connect')
-        || path.includes('/credentials/auto-connect')
-      );
-      const statusPath = path.includes('/status') || path.includes('/auto-trade/status');
-      const timeoutMs = scanLikePath
-        ? (i === 0 ? 30000 : 35000)
-        : tradeExecutionPath
+    const tradeExecutionPath = (
+      path.includes('/trade/execute-recommendation')
+      || path.includes('/trade/quick-buy')
+      || path.includes('/trade/execute')
+    );
+    // Never retry trade execution requests on the client side.
+    // A second attempt can feel like lag and may risk duplicate intents.
+    const maxAttemptsForBase = tradeExecutionPath ? 1 : (i === 0 ? 2 : 1);
+    for (let attemptIdx = 0; attemptIdx < maxAttemptsForBase; attemptIdx += 1) {
+      try {
+        const scanLikePath = path.includes('/agent/smart-evaluate') || path.includes('/auto-trade/activity');
+        const availableSymbolsPath = path.includes('/market/available-symbols');
+        const connectPath = (
+          path.includes('/connect')
+          || path.includes('/credentials/auto-connect')
+        );
+        const statusPath = path.includes('/status') || path.includes('/auto-trade/status');
+        const timeoutMs = scanLikePath
           ? (i === 0 ? 45000 : 55000)
-          : connectPath
-            ? (i === 0 ? 35000 : 50000)
-          : statusPath
-            ? (i === 0 ? 12000 : 18000)
-            : (i === 0 ? 15000 : 20000);
-      const attempt = await fetchWithTimeout(`${base}${path}`, requestOptions, timeoutMs);
-      preferredBaseUrl = base;
-      res = attempt;
-      break;
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        lastError = new Error('Connection timed out. Please verify backend is running and IBKR TWS/Gateway API is reachable.');
-      } else if (err instanceof Error && err.message.toLowerCase().includes('signal is aborted')) {
-        lastError = new Error('Request was interrupted. Please retry connection and keep this page open until the response returns.');
-      } else {
-        lastError = err;
+          : availableSymbolsPath
+            ? (i === 0 ? 70000 : 80000)
+          : tradeExecutionPath
+            ? (i === 0 ? 120000 : 130000)
+            : connectPath
+              ? (i === 0 ? 15000 : 22000)
+            : statusPath
+              ? (i === 0 ? 15000 : 22000)
+              : (i === 0 ? 25000 : 32000);
+        const attempt = await fetchWithTimeout(`${base}${path}`, requestOptions, timeoutMs);
+        preferredBaseUrl = base;
+        res = attempt;
+        break;
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          lastError = new Error('Connection timed out. Please verify backend is running and IBKR TWS/Gateway API is reachable.');
+        } else if (err instanceof Error && err.message.toLowerCase().includes('signal is aborted')) {
+          lastError = new Error('Request was interrupted. Please retry connection and keep this page open until the response returns.');
+        } else if (err instanceof Error && err.message.toLowerCase().includes('failed to fetch')) {
+          lastError = new Error('Failed to fetch from backend. Retrying automatically...');
+        } else {
+          lastError = err;
+        }
+        if (attemptIdx < maxAttemptsForBase - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
       }
     }
+    if (res) break;
   }
 
   if (!res) {
@@ -124,6 +138,11 @@ export const api = {
 
   getTick: (symbol: string) =>
     request<import('@/types').TickData>(`/market/tick/${symbol}`),
+
+  getTicks: (symbols: string[]) =>
+    request<{ ticks: Record<string, import('@/types').TickData> }>(
+      `/market/ticks?symbols=${encodeURIComponent(symbols.join(','))}`
+    ),
 
   getBars: (symbol: string, timeframe: string, count: number = 100) =>
     request<import('@/types').BarData[]>(`/market/bars/${symbol}?timeframe=${timeframe}&count=${count}`),
@@ -267,6 +286,9 @@ export const api = {
         available: boolean;
         degraded: boolean;
         last_error?: string | null;
+        state?: 'available' | 'degraded' | 'cooldown' | 'unavailable' | string;
+        cooldown_seconds?: number;
+        credits_pct?: number;
       };
     }>('/auto-trade/status'),
 

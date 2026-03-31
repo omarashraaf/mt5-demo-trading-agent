@@ -151,6 +151,9 @@ export interface StatusResponse {
   gemini_available?: boolean;
   gemini_degraded?: boolean;
   gemini_last_error?: string | null;
+  gemini_state?: 'available' | 'degraded' | 'cooldown' | 'unavailable' | string;
+  gemini_cooldown_seconds?: number;
+  gemini_credits_pct?: number;
   user_policy?: UserPolicySettings;
   runtime_controls?: RuntimeControls;
   universe?: UniverseSettings;
@@ -350,6 +353,14 @@ export interface Recommendation {
   anti_churn?: AntiChurnAssessment;
   gemini_confirmation?: GeminiAssessment | null;
   execution_reason?: string;
+  recommended_amount_usd?: number;
+  recommended_amount_pct_free_margin?: number;
+  commission_per_lot_side?: number | null;
+  commission_round_turn_per_lot?: number | null;
+  commission_model?: string;
+  commission_percent_rate?: number | null;
+  commission_notional_1lot?: number | null;
+  commission_samples?: number | null;
 }
 
 export interface SmartEvaluateResponse {

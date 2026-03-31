@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -69,6 +71,8 @@ class GeminiStrategyAdvisorService:
         self._client = None
         self._unavailable_reason = ""
         self._last_error = ""
+        self._quota_cooldown_until = 0.0
+        self._quota_min_cooldown_seconds = 900.0
         self._init_client()
 
     @property
@@ -95,6 +99,13 @@ class GeminiStrategyAdvisorService:
             return self._fallback("No actionable direction to advise.", used=False)
         if not self.available:
             return self._fallback(self.unavailable_reason, used=False)
+        if time.time() < self._quota_cooldown_until:
+            return self._fallback(
+                "Gemini is paused due to quota cooldown; deterministic strategy is active.",
+                used=False,
+                degraded=False,
+                error="quota_cooldown",
+            )
 
         attempts = max(1, self.max_retries + 1)
         last_error: Exception | None = None
@@ -114,6 +125,20 @@ class GeminiStrategyAdvisorService:
                 return result
             except Exception as exc:  # pragma: no cover - defensive runtime guard
                 last_error = exc
+                text = str(exc)
+                if "429" in text or "RESOURCE_EXHAUSTED" in text:
+                    retry = self._quota_min_cooldown_seconds
+                    match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", text, flags=re.IGNORECASE)
+                    if match:
+                        retry = max(self._quota_min_cooldown_seconds, float(match.group(1)))
+                    self._quota_cooldown_until = time.time() + retry
+                    self._last_error = ""
+                    return self._fallback(
+                        "Gemini is paused due to quota cooldown; deterministic strategy is active.",
+                        used=False,
+                        degraded=False,
+                        error="quota_cooldown",
+                    )
                 logger.warning("Gemini strategy advisor failed for %s: %s", context.symbol, exc)
 
         self._last_error = str(last_error) if last_error else "Gemini strategy advisor failed."

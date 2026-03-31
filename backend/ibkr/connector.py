@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import socket
+import sys
 import time
 from datetime import datetime, timezone
 import re
@@ -14,6 +15,26 @@ from pydantic import BaseModel
 from mt5.connector import AccountInfo, TerminalInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _is_valid_resolved_contract(contract, *, expect_stock: bool = False) -> bool:
+    sec_type = str(getattr(contract, "secType", "") or "").upper()
+    con_id = int(getattr(contract, "conId", 0) or 0)
+    if con_id <= 0 or not sec_type:
+        return False
+    if expect_stock and sec_type != "STK":
+        return False
+    return True
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        num = float(value or 0.0)
+    except Exception:
+        return default
+    if not math.isfinite(num):
+        return default
+    return num
 
 
 class IBKRConnectionParams(BaseModel):
@@ -53,6 +74,11 @@ class IBKRConnector:
     def _ensure_ib(self):
         if self._ib is not None:
             return
+        if sys.platform.startswith("win"):
+            try:
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            except Exception:
+                pass
         try:
             asyncio.get_event_loop()
         except RuntimeError:
@@ -93,17 +119,22 @@ class IBKRConnector:
                 fallback_ports = [selected_port]
 
             candidate_client_ids = [int(params.client_id)]
-            # Reduce friction: auto-probe nearby client IDs when default is occupied.
-            for offset in (1, 2, 3, 4, 5):
+            # Keep connection snappy: try at most one nearby clientId.
+            for offset in (1,):
                 candidate_client_ids.append(int(params.client_id) + offset)
 
             last_connect_error: Exception | None = None
             connected = False
             selected_client_id = int(params.client_id)
+            connect_deadline = time.monotonic() + 12.0
             for candidate_port in fallback_ports:
+                if time.monotonic() >= connect_deadline:
+                    break
                 if not self._tcp_port_reachable(params.host, candidate_port, timeout_seconds=1.0):
                     continue
                 for candidate_client_id in candidate_client_ids:
+                    if time.monotonic() >= connect_deadline:
+                        break
                     try:
                         if self._ib is not None and self._ib.isConnected():
                             self._ib.disconnect()
@@ -114,7 +145,7 @@ class IBKRConnector:
                             port=candidate_port,
                             clientId=candidate_client_id,
                             readonly=bool(params.readonly),
-                            timeout=10,
+                            timeout=3,
                         )
                         if self._ib.isConnected():
                             selected_port = candidate_port
@@ -139,7 +170,7 @@ class IBKRConnector:
                         port=params.port,
                         clientId=params.client_id,
                         readonly=bool(params.readonly),
-                        timeout=10,
+                        timeout=3,
                     )
                     connected = bool(self._ib.isConnected())
                 except Exception as exc:
@@ -244,10 +275,6 @@ class IBKRConnector:
         if not self._connected or self._ib is None or not self._ib.isConnected():
             return None
         try:
-            try:
-                asyncio.get_event_loop()
-            except RuntimeError:
-                asyncio.set_event_loop(asyncio.new_event_loop())
             accounts = list(self._ib.managedAccounts() or [])
             account_id = self._active_account_id or (accounts[0] if accounts else "")
             if not account_id:
@@ -389,10 +416,39 @@ class IBKRConnector:
             return False
         return self._account_info.trade_mode == 0
 
+    def _normalize_symbol_for_ibkr(self, symbol: str) -> str:
+        raw = (symbol or "").upper().strip()
+        if not raw:
+            return ""
+        # Map CFD/index/commodity aliases to liquid IBKR-tradable proxies.
+        aliases = {
+            "US500": "SPY",
+            "SPX500": "SPY",
+            "US100": "QQQ",
+            "NAS100": "QQQ",
+            "US30": "DIA",
+            "DJ30": "DIA",
+            "GER40": "EWG",
+            "DAX40": "EWG",
+            "UK100": "EWU",
+            "FTSE100": "EWU",
+            "XAUUSD": "GLD",
+            "GOLD": "GLD",
+            "XAGUSD": "SLV",
+            "SILVER": "SLV",
+            "WTI": "USO",
+            "USOIL": "USO",
+            "XTIUSD": "USO",
+            "BRENT": "BNO",
+            "UKOIL": "BNO",
+            "XBRUSD": "BNO",
+        }
+        return aliases.get(raw, raw)
+
     def _resolve_contract(self, symbol: str):
         if not self._connected or self._ib is None or not self._ib.isConnected():
             return None
-        key = (symbol or "").upper().strip()
+        key = self._normalize_symbol_for_ibkr(symbol)
         if not key:
             return None
         cached = self._contract_cache.get(key)
@@ -405,21 +461,24 @@ class IBKRConnector:
             return None
 
         candidates = []
+        is_stock_like = bool(re.fullmatch(r"[A-Z]{1,6}", key))
         try:
             # Fast path for common US stocks/ETFs.
             candidates.append(Stock(key, "SMART", "USD"))
         except Exception:
             pass
 
-        # Try generic symbol matching for indices/commodities/custom feeds.
-        try:
-            matches = self._ib.reqMatchingSymbols(key) or []
-            for match in matches:
-                contract = getattr(match, "contract", None)
-                if contract is not None:
-                    candidates.append(contract)
-        except Exception:
-            matches = []
+        # Try generic symbol matching only for non stock-like symbols
+        # (for stock/ETF tickers this can add timeouts and invalid contracts).
+        if not is_stock_like:
+            try:
+                matches = self._ib.reqMatchingSymbols(key) or []
+                for match in matches:
+                    contract = getattr(match, "contract", None)
+                    if contract is not None:
+                        candidates.append(contract)
+            except Exception:
+                matches = []
 
         sec_type_priority = {
             "CFD": 0,
@@ -429,8 +488,6 @@ class IBKRConnector:
             "FUT": 4,
             "CMDTY": 5,
         }
-        is_stock_like = key.isalpha() and 1 <= len(key) <= 6
-
         def _score(contract):
             sec_type = str(getattr(contract, "secType", "")).upper()
             symbol = str(getattr(contract, "symbol", "")).upper()
@@ -466,21 +523,26 @@ class IBKRConnector:
                 qualified = self._ib.qualifyContracts(candidate)
                 if qualified:
                     resolved = qualified[0]
+                    if not _is_valid_resolved_contract(resolved, expect_stock=is_stock_like):
+                        continue
                     self._contract_cache[key] = resolved
                     return resolved
             except Exception:
                 continue
 
-        # Last fallback, generic contract object.
-        try:
-            generic = Contract(symbol=key)
-            qualified = self._ib.qualifyContracts(generic)
-            if qualified:
-                resolved = qualified[0]
-                self._contract_cache[key] = resolved
-                return resolved
-        except Exception:
-            pass
+        # Last fallback, generic contract object (only for non stock-like symbols).
+        if not is_stock_like:
+            try:
+                generic = Contract(symbol=key)
+                qualified = self._ib.qualifyContracts(generic)
+                if qualified:
+                    resolved = qualified[0]
+                    if not _is_valid_resolved_contract(resolved, expect_stock=is_stock_like):
+                        return None
+                    self._contract_cache[key] = resolved
+                    return resolved
+            except Exception:
+                pass
 
         return None
 
@@ -493,7 +555,8 @@ class IBKRConnector:
             return None
         try:
             ticker = self._ib.reqMktData(contract, "", True, False)
-            self._ib.sleep(0.8)
+            # Delayed streams can take a bit longer to populate.
+            self._ib.sleep(1.4)
             bid = float(getattr(ticker, "bid", 0.0) or 0.0)
             ask = float(getattr(ticker, "ask", 0.0) or 0.0)
             last = float(getattr(ticker, "last", 0.0) or 0.0)
@@ -558,7 +621,7 @@ class IBKRConnector:
                     useRTH=False,
                     formatDate=2,
                     keepUpToDate=False,
-                    timeout=3.0,
+                    timeout=10.0,
                 )
                 if bars:
                     break
@@ -708,19 +771,21 @@ class IBKRConnector:
             contract = getattr(row, "contract", None)
             if contract is None:
                 continue
-            pos_qty = float(getattr(row, "position", 0.0) or 0.0)
+            pos_qty = _safe_float(getattr(row, "position", 0.0), 0.0)
             if abs(pos_qty) < 1e-9:
                 continue
             sym = str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "") or "").upper()
             if symbol_filter and sym != symbol_filter:
                 continue
-            avg_cost = float(getattr(row, "avgCost", 0.0) or 0.0)
+            avg_cost = _safe_float(getattr(row, "avgCost", 0.0), 0.0)
             snap = self._snapshot_for_contract(contract)
-            current_price = float((snap or {}).get("last", 0.0) or 0.0)
+            current_price = _safe_float((snap or {}).get("last", 0.0), 0.0)
             multiplier_raw = getattr(contract, "multiplier", None)
             try:
                 multiplier = float(multiplier_raw) if multiplier_raw else 1.0
             except Exception:
+                multiplier = 1.0
+            if not math.isfinite(multiplier) or multiplier <= 0:
                 multiplier = 1.0
             profit = (current_price - avg_cost) * pos_qty * multiplier if current_price > 0 else 0.0
             ticket = int(getattr(contract, "conId", 0) or 0)
@@ -749,19 +814,21 @@ class IBKRConnector:
                 contract = getattr(row, "contract", None)
                 if contract is None:
                     continue
-                pos_qty = float(getattr(row, "position", 0.0) or 0.0)
+                pos_qty = _safe_float(getattr(row, "position", 0.0), 0.0)
                 if abs(pos_qty) < 1e-9:
                     continue
                 sym = str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "") or "").upper()
                 if symbol_filter and sym != symbol_filter:
                     continue
-                avg_cost = float(getattr(row, "avgCost", 0.0) or 0.0)
+                avg_cost = _safe_float(getattr(row, "avgCost", 0.0), 0.0)
                 snap = self._snapshot_for_contract(contract)
-                current_price = float((snap or {}).get("last", 0.0) or 0.0)
+                current_price = _safe_float((snap or {}).get("last", 0.0), 0.0)
                 multiplier_raw = getattr(contract, "multiplier", None)
                 try:
                     multiplier = float(multiplier_raw) if multiplier_raw else 1.0
                 except Exception:
+                    multiplier = 1.0
+                if not math.isfinite(multiplier) or multiplier <= 0:
                     multiplier = 1.0
                 account = str(getattr(row, "account", "") or "")
                 profit = (current_price - avg_cost) * pos_qty * multiplier if current_price > 0 else 0.0
@@ -788,60 +855,85 @@ class IBKRConnector:
                 self._active_account_id or "auto",
             )
 
-        # Include submitted/presubmitted orders so users can see active trades
-        # immediately even before fill.
-        try:
-            open_trades = list(self._ib.openTrades() or [])
-        except Exception:
-            open_trades = []
-        for trade in open_trades:
-            order = getattr(trade, "order", None)
-            contract = getattr(trade, "contract", None)
-            status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
-            if order is None or contract is None:
-                continue
-            if status not in {"Submitted", "PreSubmitted", "PendingSubmit"}:
-                continue
-            sym = str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "") or "").upper()
-            if symbol_filter and sym != symbol_filter:
-                continue
-            action = str(getattr(order, "action", "") or "").upper()
-            total_qty = float(getattr(order, "totalQuantity", 0.0) or 0.0)
-            limit_price = float(getattr(order, "lmtPrice", 0.0) or 0.0)
-            ticket = int(getattr(order, "permId", 0) or getattr(order, "orderId", 0) or 0)
-            normalized_ticket = ticket if ticket > 0 else abs(hash(f"{sym}:{status}:{total_qty}")) % 10_000_000
-            if int(normalized_ticket) in added_tickets:
-                continue
-            result.append(
-                {
-                    "ticket": normalized_ticket,
-                    "symbol": sym,
-                    "type": "BUY" if action == "BUY" else "SELL",
-                    "volume": abs(total_qty),
-                    "price_open": limit_price,
-                    "price_current": limit_price,
-                    "stop_loss": 0.0,
-                    "take_profit": 0.0,
-                    "profit": 0.0,
-                    "time": now_ts,
-                    "comment": f"IBKR pending ({status})",
-                }
-            )
-            added_tickets.add(int(normalized_ticket))
         return result
 
     def close_position(self, ticket: int) -> dict:
-        positions = self.get_positions()
-        pos = next((p for p in positions if int(p.get("ticket", 0)) == int(ticket)), None)
-        if pos is None:
-            return {"success": False, "retcode": -1, "retcode_desc": f"Position {ticket} not found"}
-        close_side = "SELL" if str(pos.get("type", "")).upper() == "BUY" else "BUY"
-        return self.place_order(
-            symbol=str(pos.get("symbol", "")),
-            action=close_side,
-            quantity=float(pos.get("volume", 0.0) or 0.0),
-            comment=f"Close {ticket}",
-        )
+        if not self._connected or self._ib is None or not self._ib.isConnected():
+            return {"success": False, "retcode": -1, "retcode_desc": "IBKR not connected"}
+        try:
+            rows = self._ib.positions() or []
+        except Exception as exc:
+            self._last_error = f"IBKR positions failed: {exc}"
+            return {"success": False, "retcode": -1, "retcode_desc": str(exc)}
+
+        matched_contract = None
+        matched_qty = 0.0
+        matched_symbol = ""
+        strict_filtering = bool(self._active_account_id)
+        for row in rows:
+            account = str(getattr(row, "account", "") or "")
+            if strict_filtering and account and account != self._active_account_id:
+                continue
+            contract = getattr(row, "contract", None)
+            if contract is None:
+                continue
+            con_id = int(getattr(contract, "conId", 0) or 0)
+            if con_id != int(ticket):
+                continue
+            qty = _safe_float(getattr(row, "position", 0.0), 0.0)
+            if abs(qty) < 1e-9:
+                continue
+            matched_contract = contract
+            matched_qty = qty
+            matched_symbol = str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "") or "").upper()
+            break
+
+        if matched_contract is None:
+            return {
+                "success": False,
+                "retcode": -1,
+                "retcode_desc": f"Live position {ticket} not found. Refusing to open opposite order.",
+            }
+
+        side = "SELL" if matched_qty > 0 else "BUY"
+        qty = abs(matched_qty)
+        try:
+            from ib_insync import MarketOrder  # type: ignore
+        except Exception:
+            return {"success": False, "retcode": -1, "retcode_desc": "ib_insync not available"}
+
+        try:
+            order = MarketOrder(side, qty)
+            if self._active_account_id:
+                order.account = self._active_account_id
+            order.orderRef = f"Close {ticket}"[:32]
+            trade = self._ib.placeOrder(matched_contract, order)
+            deadline = time.time() + 8.0
+            while not trade.isDone() and time.time() < deadline:
+                self._ib.sleep(0.2)
+            status = str(getattr(trade.orderStatus, "status", "") or "")
+            filled_qty = _safe_float(getattr(trade.orderStatus, "filled", 0.0), 0.0)
+            avg_fill = _safe_float(getattr(trade.orderStatus, "avgFillPrice", 0.0), 0.0)
+            if avg_fill <= 0 and trade.fills:
+                try:
+                    avg_fill = _safe_float(trade.fills[-1].execution.avgPrice, 0.0)
+                except Exception:
+                    avg_fill = 0.0
+            success = status in {"Filled", "Submitted", "PreSubmitted"} and (filled_qty > 0 or status != "Filled")
+            ticket_out = int(getattr(trade.order, "permId", 0) or getattr(trade.order, "orderId", 0) or 0)
+            return {
+                "success": success,
+                "retcode": 0 if success else -1,
+                "retcode_desc": status or "Close order rejected",
+                "ticket": ticket_out if ticket_out > 0 else None,
+                "volume": filled_qty if filled_qty > 0 else qty,
+                "price": avg_fill if avg_fill > 0 else None,
+                "comment": f"Close {matched_symbol}",
+            }
+        except Exception as exc:
+            self._last_error = f"IBKR close_position failed: {exc}"
+            logger.exception(self._last_error)
+            return {"success": False, "retcode": -1, "retcode_desc": str(exc)}
 
     def get_recent_executions(self, limit: int = 100) -> list[dict]:
         """Return recent executed fills from IBKR for the active account.

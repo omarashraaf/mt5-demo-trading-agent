@@ -12,6 +12,8 @@ The risk engine must approve every trade before execution.
 import asyncio
 import json
 import logging
+import math
+import re
 import time
 from typing import Optional
 
@@ -56,6 +58,7 @@ class AutoTrader:
         self._last_scan: float = 0
         self._trade_log: list[dict] = []  # Recent auto-trade log for UI
         self._state = BackgroundServiceState(name="auto_trader")
+        self._gemini_quota_cooldown_until = 0.0
 
         # Position Manager — autonomous management of open positions
         self.position_manager = PositionManager(
@@ -283,15 +286,21 @@ class AutoTrader:
                 entry_price = tick.ask if signal.action == "BUY" else tick.bid
                 symbol_info = context.symbol_info
                 contract_size = symbol_info.trade_contract_size if symbol_info else 100000
-                leverage = context.account_leverage or 100
-                investment = round(risk_evaluation.adjusted_volume * entry_price * contract_size / leverage, 0)
+                volume = float(risk_evaluation.adjusted_volume)
+                estimated_margin = self.execution.estimate_margin(
+                    symbol=sym,
+                    action=signal.action,
+                    volume=volume,
+                    price=entry_price,
+                )
+                investment = max(1.0, float(estimated_margin if estimated_margin is not None else 0.0))
                 normalized_sl, normalized_tp, sl_amount_usd, tp_amount_usd = await self._dynamic_amount_based_targets(
                     decision=decision,
                     action=signal.action,
                     entry_price=entry_price,
-                    volume=risk_evaluation.adjusted_volume,
+                    volume=volume,
                     contract_size=contract_size,
-                    amount_usd=max(float(investment), 1.0),
+                    amount_usd=investment,
                     digits=symbol_info.digits if symbol_info else 5,
                 )
                 normalized_sl, normalized_tp = self._normalize_live_stops(
@@ -309,13 +318,42 @@ class AutoTrader:
                         normalized_tp = round(entry_price + target_tp_distance, symbol_info.digits if symbol_info else 5)
                     else:
                         normalized_tp = round(entry_price - target_tp_distance, symbol_info.digits if symbol_info else 5)
-                # Keep broker comment ultra-safe.
-                comment = f"TA{int(max(float(investment), 1.0))}"
+                vol_min = float(symbol_info.volume_min if symbol_info and symbol_info.volume_min else 0.01)
+                vol_step = float(symbol_info.volume_step if symbol_info and symbol_info.volume_step else 0.01)
+                vol_max = float(symbol_info.volume_max if symbol_info and symbol_info.volume_max else 0.0)
+                rebalanced_volume, rebalance_error = self._rebalance_volume_for_started_amount_risk(
+                    entry_price=entry_price,
+                    stop_loss=normalized_sl,
+                    desired_sl_amount_usd=sl_amount_usd,
+                    volume=volume,
+                    contract_size=contract_size,
+                    vol_min=vol_min,
+                    vol_step=vol_step,
+                    vol_max=vol_max,
+                )
+                if rebalance_error:
+                    self._log_auto_trade(sym, signal, rebalance_error, False, quality.final_trade_quality_score)
+                    continue
+                if rebalanced_volume > 0 and rebalanced_volume < volume:
+                    volume = rebalanced_volume
+                    estimated_margin = self.execution.estimate_margin(
+                        symbol=sym,
+                        action=signal.action,
+                        volume=volume,
+                        price=entry_price,
+                    )
+                    investment = max(1.0, float(estimated_margin if estimated_margin is not None else investment))
+                # Keep broker comment compact and parseable.
+                comment = self._build_trade_comment(
+                    investment,
+                    sl_amount_usd=sl_amount_usd,
+                    tp_amount_usd=tp_amount_usd,
+                )
 
                 order_req = OrderRequest(
                     symbol=sym,
                     action=signal.action,
-                    volume=risk_evaluation.adjusted_volume,
+                    volume=volume,
                     stop_loss=normalized_sl,
                     take_profit=normalized_tp,
                     comment=comment,
@@ -323,7 +361,7 @@ class AutoTrader:
                 preflight = await self.execution_service.preflight(
                     symbol=sym,
                     action=signal.action,
-                    volume=risk_evaluation.adjusted_volume,
+                    volume=volume,
                     stop_loss=normalized_sl,
                     take_profit=normalized_tp,
                     reference_spread=decision.signal_decision.market_context.tick.get("spread", 0.0)
@@ -412,6 +450,77 @@ class AutoTrader:
 
     def _clamp(self, value: float, minimum: float, maximum: float) -> float:
         return max(minimum, min(maximum, value))
+
+    def _build_trade_comment(
+        self,
+        amount_usd: float,
+        *,
+        sl_amount_usd: float | None = None,
+        tp_amount_usd: float | None = None,
+    ) -> str:
+        parts = [f"TA{int(round(float(amount_usd)))}"]
+        if sl_amount_usd is not None and sl_amount_usd > 0:
+            parts.append(f"SLA{int(round(float(sl_amount_usd)))}")
+        if tp_amount_usd is not None and tp_amount_usd > 0:
+            parts.append(f"TPA{int(round(float(tp_amount_usd)))}")
+        comment = "|".join(parts)
+        if len(comment) <= 31:
+            return comment
+        compact = parts[0]
+        for token in parts[1:]:
+            trial = f"{compact}|{token}"
+            if len(trial) <= 31:
+                compact = trial
+            else:
+                break
+        return compact[:31]
+
+    def _round_volume_down(self, raw_volume: float, vol_min: float, vol_step: float, vol_max: float) -> float:
+        if raw_volume <= 0:
+            return 0.0
+        step = vol_step if vol_step and vol_step > 0 else max(vol_min, 0.01)
+        bounded = min(raw_volume, vol_max) if vol_max > 0 else raw_volume
+        units = math.floor((bounded + 1e-12) / step)
+        rounded = units * step
+        if rounded + 1e-12 < vol_min:
+            return 0.0
+        return round(rounded, 6)
+
+    def _rebalance_volume_for_started_amount_risk(
+        self,
+        *,
+        entry_price: float,
+        stop_loss: float,
+        desired_sl_amount_usd: float,
+        volume: float,
+        contract_size: float,
+        vol_min: float,
+        vol_step: float,
+        vol_max: float,
+    ) -> tuple[float, str | None]:
+        if (
+            desired_sl_amount_usd <= 0
+            or stop_loss <= 0
+            or entry_price <= 0
+            or volume <= 0
+            or contract_size <= 0
+        ):
+            return volume, None
+        sl_distance = abs(entry_price - stop_loss)
+        if sl_distance <= 0:
+            return volume, None
+        actual_sl_amount = sl_distance * volume * contract_size
+        if actual_sl_amount <= desired_sl_amount_usd * 1.02:
+            return volume, None
+        max_volume_for_risk = desired_sl_amount_usd / (sl_distance * contract_size)
+        adjusted = self._round_volume_down(max_volume_for_risk, vol_min, vol_step, vol_max)
+        if adjusted <= 0:
+            min_possible_risk = sl_distance * max(vol_min, 0.0) * contract_size
+            return 0.0, (
+                f"Skipped: broker minimum stop distance implies at least ${min_possible_risk:.2f} risk "
+                f"for {self.risk_engine.user_policy.mode} sizing."
+            )
+        return adjusted, None
 
     def _normalize_live_stops(
         self,
@@ -611,6 +720,8 @@ class AutoTrader:
         event_risk: str,
         contradiction_flag: bool,
     ) -> tuple[float, float]:
+        if time.time() < self._gemini_quota_cooldown_until:
+            return 0.0, 0.0
         gemini = self.agents.get("GeminiAgent")
         client = getattr(gemini, "_client", None)
         if not getattr(gemini, "available", False) or client is None:
@@ -665,7 +776,14 @@ class AutoTrader:
                 gemini.clear_runtime_error()
             return sl_delta, tp_delta
         except Exception as exc:
+            exc_text = str(exc)
+            if "429" in exc_text or "RESOURCE_EXHAUSTED" in exc_text:
+                retry = 60.0
+                match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", exc_text, flags=re.IGNORECASE)
+                if match:
+                    retry = max(15.0, float(match.group(1)))
+                self._gemini_quota_cooldown_until = time.time() + retry
             if hasattr(gemini, "mark_runtime_error"):
-                gemini.mark_runtime_error(str(exc))
+                gemini.mark_runtime_error(exc_text)
             logger.warning("Auto-trader Gemini SL/TP adjustment skipped: %s", exc)
             return 0.0, 0.0

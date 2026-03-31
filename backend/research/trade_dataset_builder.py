@@ -34,6 +34,12 @@ class TradeDatasetBuilder:
     def __init__(self, db):
         self.db = db
 
+    @staticmethod
+    def _chunked(values: list, size: int = 800) -> list[list]:
+        if not values:
+            return []
+        return [values[i:i + size] for i in range(0, len(values), size)]
+
     async def _fetch_candidates(self, limit: int) -> list[dict]:
         cursor = await self.db._db.execute(
             """SELECT *
@@ -49,45 +55,47 @@ class TradeDatasetBuilder:
     async def _fetch_feature_snapshots(self, candidate_ids: list[str]) -> dict[str, dict]:
         if not candidate_ids:
             return {}
-        placeholders = ",".join("?" for _ in candidate_ids)
-        cursor = await self.db._db.execute(
-            f"""SELECT candidate_id, schema_version, features_json
-                FROM feature_snapshots
-                WHERE candidate_id IN ({placeholders})
-                ORDER BY created_at DESC""",
-            tuple(candidate_ids),
-        )
-        rows = await cursor.fetchall()
         latest: dict[str, dict] = {}
-        for candidate_id, schema_version, features_json in rows:
-            if candidate_id in latest:
-                continue
-            latest[candidate_id] = {
-                "schema_version": schema_version or DEFAULT_FEATURE_SCHEMA_VERSION,
-                "features": _safe_json_load(features_json, {}),
-            }
+        for chunk in self._chunked(candidate_ids, size=800):
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = await self.db._db.execute(
+                f"""SELECT candidate_id, schema_version, features_json
+                    FROM feature_snapshots
+                    WHERE candidate_id IN ({placeholders})
+                    ORDER BY created_at DESC""",
+                tuple(chunk),
+            )
+            rows = await cursor.fetchall()
+            for candidate_id, schema_version, features_json in rows:
+                if candidate_id in latest:
+                    continue
+                latest[candidate_id] = {
+                    "schema_version": schema_version or DEFAULT_FEATURE_SCHEMA_VERSION,
+                    "features": _safe_json_load(features_json, {}),
+                }
         return latest
 
     async def _fetch_outcomes_by_signal(self, signal_ids: list[int]) -> dict[int, dict]:
         if not signal_ids:
             return {}
-        placeholders = ",".join("?" for _ in signal_ids)
-        cursor = await self.db._db.execute(
-            f"""SELECT *
-                FROM trade_outcomes
-                WHERE signal_id IN ({placeholders})
-                ORDER BY closed_at DESC""",
-            tuple(signal_ids),
-        )
-        rows = await cursor.fetchall()
-        cols = [d[0] for d in cursor.description]
         by_signal: dict[int, dict] = {}
-        for row in rows:
-            item = dict(zip(cols, row))
-            signal_id = item.get("signal_id")
-            if signal_id is None or signal_id in by_signal:
-                continue
-            by_signal[int(signal_id)] = item
+        for chunk in self._chunked(signal_ids, size=800):
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = await self.db._db.execute(
+                f"""SELECT *
+                    FROM trade_outcomes
+                    WHERE signal_id IN ({placeholders})
+                    ORDER BY closed_at DESC""",
+                tuple(chunk),
+            )
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            for row in rows:
+                item = dict(zip(cols, row))
+                signal_id = item.get("signal_id")
+                if signal_id is None or signal_id in by_signal:
+                    continue
+                by_signal[int(signal_id)] = item
         return by_signal
 
     async def build_dataset(

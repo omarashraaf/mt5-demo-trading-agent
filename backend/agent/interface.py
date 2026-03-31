@@ -11,6 +11,7 @@ class AgentInput(BaseModel):
     account_equity: float
     open_positions: list[dict]
     multi_tf_bars: Optional[dict[str, list[dict]]] = None  # {"M15": [...], "H1": [...], "H4": [...]}
+    policy_mode: str = "balanced"
 
 
 class TradeSignal(BaseModel):

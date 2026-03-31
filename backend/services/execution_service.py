@@ -142,7 +142,9 @@ class ExecutionService:
 
         recent_outcomes = []
         recent_evaluations = []
-        if self.db is not None:
+        # Keep manual/scan executions fast and non-blocking under heavy dashboard scans.
+        needs_history_lookups = evaluation_mode not in {"scan", "manual_fast", "auto_fast"}
+        if self.db is not None and needs_history_lookups:
             lookback_minutes = max(self.signal_pipeline.risk_engine.settings.cooldown_minutes_per_symbol, 1440)
             recent_outcomes = await self.db.get_recent_symbol_outcomes(
                 symbol,

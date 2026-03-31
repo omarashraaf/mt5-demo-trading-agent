@@ -159,7 +159,7 @@ class GeminiAgent(TradingAgent):
     def _is_quota_blocked(self) -> bool:
         return self._quota_block_until > time.time()
 
-    def _mark_quota_exhausted(self, cooldown_seconds: int = 300):
+    def _mark_quota_exhausted(self, cooldown_seconds: int = 1800):
         self._quota_block_until = max(self._quota_block_until, time.time() + cooldown_seconds)
 
     def evaluate(self, input_data: AgentInput) -> TradeSignal:
@@ -191,9 +191,9 @@ class GeminiAgent(TradingAgent):
         if self._is_quota_blocked():
             message = self._quota_block_message()
             return GeminiAssessment(
-                used=True,
+                used=False,
                 available=False,
-                degraded=True,
+                degraded=False,
                 summary_reason="Gemini quota exhausted; using technical logic only.",
                 reason="Gemini quota exhausted; using technical logic only.",
                 error=message,
@@ -229,6 +229,15 @@ class GeminiAgent(TradingAgent):
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 logger.warning("Gemini rate limited for %s", input_data.symbol)
                 self._mark_quota_exhausted()
+                self.clear_runtime_error()
+                return GeminiAssessment(
+                    used=False,
+                    available=False,
+                    degraded=False,
+                    summary_reason="Gemini quota exhausted; using technical logic only.",
+                    reason="Gemini quota exhausted; using technical logic only.",
+                    error=self._quota_block_message(),
+                )
             else:
                 logger.error("Gemini advisory failed for %s: %s", input_data.symbol, exc)
             self.mark_runtime_error(error_str)
@@ -263,9 +272,9 @@ class GeminiAgent(TradingAgent):
         if self._is_quota_blocked():
             message = self._quota_block_message()
             return GeminiAssessment(
-                used=True,
+                used=False,
                 available=False,
-                degraded=True,
+                degraded=False,
                 summary_reason="Gemini quota exhausted; using technical logic only.",
                 reason="Gemini quota exhausted; using technical logic only.",
                 error=message,
@@ -304,6 +313,16 @@ class GeminiAgent(TradingAgent):
             logger.error("Gemini normalized-news assessment failed for %s: %s", context.symbol, exc)
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 self._mark_quota_exhausted()
+                self.clear_runtime_error()
+                return GeminiAssessment(
+                    used=False,
+                    available=False,
+                    degraded=False,
+                    summary_reason="Gemini quota exhausted; using technical logic only.",
+                    reason="Gemini quota exhausted; using technical logic only.",
+                    error=self._quota_block_message(),
+                    affected_symbols=[context.symbol],
+                )
             self.mark_runtime_error(error_str)
             return GeminiAssessment(
                 used=True,

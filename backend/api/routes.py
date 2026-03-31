@@ -6,6 +6,8 @@ import time
 import asyncio
 import json
 import re
+import math
+from concurrent.futures import ThreadPoolExecutor
 
 from adapters.finnhub_adapter import FinnhubAdapter
 from mt5.connector import MT5Connector, ConnectionParams
@@ -40,6 +42,13 @@ from services.trade_decision_service import TradeDecisionService
 from domain.models import MarketContext, TechnicalSignal
 
 logger = logging.getLogger(__name__)
+_gemini_quota_cooldown_until = 0.0
+_last_scan_gemini_enrich_at = 0.0
+_ibkr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ibkr-worker")
+IBKR_SCAN_DEFAULT_SYMBOLS = [
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "AMD",
+    "SPY", "QQQ", "DIA", "IWM", "GLD", "SLV", "USO", "BNO",
+]
 
 router = APIRouter()
 
@@ -134,6 +143,99 @@ DEFAULT_MARGIN_SL_PCT = 0.08
 DEFAULT_MARGIN_TP_PCT = 0.12
 
 
+def _recommended_trade_amount_from_free_margin(
+    *,
+    free_margin: float,
+    policy_mode: str,
+    confidence: float,
+    quality_score: float | None,
+    ready_to_execute: bool,
+) -> tuple[float, float]:
+    if not ready_to_execute:
+        return 0.0, 0.0
+    if free_margin <= 0:
+        return 0.0, 0.0
+
+    mode = str(policy_mode or "balanced").lower()
+    base_pct_by_mode = {
+        "safe": 0.50,
+        "balanced": 1.00,
+        "aggressive": 1.50,
+    }
+    base_pct = base_pct_by_mode.get(mode, 1.00)
+    signal_strength = max(0.0, min(1.0, float(quality_score if quality_score is not None else confidence)))
+    strength_multiplier = 0.80 + (signal_strength * 0.40)  # 0.80x .. 1.20x
+    readiness_multiplier = 1.00 if ready_to_execute else 0.70
+
+    pct = base_pct * strength_multiplier * readiness_multiplier
+    pct = max(0.25, min(2.50, pct))
+
+    raw_amount = free_margin * (pct / 100.0)
+    min_amount = 25.0
+    max_amount = max(min_amount, free_margin * 0.10)  # keep within 10% of free margin
+    amount = max(min_amount, min(max_amount, raw_amount))
+    amount = round(amount, 2)
+    pct_effective = round((amount / free_margin) * 100.0, 2) if free_margin > 0 else 0.0
+    return amount, pct_effective
+
+
+def _commission_snapshot_from_symbol_info(symbol_info: Optional[dict]) -> dict:
+    info = dict(symbol_info or {})
+    per_side = info.get("commission_per_lot_side")
+    round_turn = info.get("commission_round_turn_per_lot")
+    model = str(info.get("commission_model") or "unknown_or_zero")
+    pct_rate = info.get("commission_percent_rate")
+    one_lot_notional = info.get("commission_notional_1lot")
+    try:
+        per_side_val = float(per_side) if per_side is not None else None
+    except (TypeError, ValueError):
+        per_side_val = None
+    try:
+        round_turn_val = float(round_turn) if round_turn is not None else None
+    except (TypeError, ValueError):
+        round_turn_val = None
+    try:
+        pct_rate_val = float(pct_rate) if pct_rate is not None else None
+    except (TypeError, ValueError):
+        pct_rate_val = None
+    try:
+        notional_val = float(one_lot_notional) if one_lot_notional is not None else None
+    except (TypeError, ValueError):
+        notional_val = None
+    return {
+        "commission_per_lot_side": per_side_val,
+        "commission_round_turn_per_lot": round_turn_val,
+        "commission_model": model,
+        "commission_percent_rate": pct_rate_val,
+        "commission_notional_1lot": notional_val,
+    }
+
+
+def _commission_is_missing_or_zero(snapshot: dict) -> bool:
+    per_side = snapshot.get("commission_per_lot_side")
+    try:
+        return per_side is None or float(per_side) <= 0.0
+    except (TypeError, ValueError):
+        return True
+
+
+def _merge_commission_snapshot(base: dict, fallback: Optional[dict]) -> dict:
+    if not fallback:
+        return base
+    if not _commission_is_missing_or_zero(base):
+        return base
+    merged = dict(base)
+    merged.update({
+        "commission_per_lot_side": fallback.get("commission_per_lot_side"),
+        "commission_round_turn_per_lot": fallback.get("commission_round_turn_per_lot"),
+        "commission_model": fallback.get("commission_model") or merged.get("commission_model"),
+        "commission_percent_rate": fallback.get("commission_percent_rate"),
+        "commission_notional_1lot": fallback.get("commission_notional_1lot"),
+        "commission_samples": fallback.get("commission_samples"),
+    })
+    return merged
+
+
 async def _on_position_manager_trade_closed(_payload: dict):
     _schedule_incremental_meta_training("position_manager_close")
 
@@ -212,8 +314,8 @@ async def restore_runtime_state():
         policy = UserPolicySettings(**(state.get("user_policy") or {}))
         risk_engine.update_user_policy(policy)
         risk_engine.auto_trade_enabled = bool(state.get("auto_trade_enabled", False))
-        interval = int(state.get("auto_trade_scan_interval_seconds", 60))
-        risk_engine.auto_trade_scan_interval_seconds = max(30, interval)
+        interval = int(state.get("auto_trade_scan_interval_seconds", 15))
+        risk_engine.auto_trade_scan_interval_seconds = max(5, min(interval, 15))
         logger.info("Restored runtime state: mode=%s, auto_trade_enabled=%s, scan_interval=%ss",
                     risk_engine.user_policy.mode,
                     risk_engine.auto_trade_enabled,
@@ -312,7 +414,7 @@ async def _pre_execution_checks(
         reference_spread=reference_spread,
         requested_agent_name=requested_agent_name,
         requested_timeframe="H1",
-        evaluation_mode="manual",
+        evaluation_mode="scan",
     )
     if not preflight.approved:
         raise HTTPException(status_code=409, detail=preflight.reason)
@@ -521,9 +623,69 @@ def _require_active_platform_connection():
         raise HTTPException(status_code=400, detail="Not connected")
 
 
+def _build_fast_execution_context(
+    *,
+    symbol: str,
+    tick,
+    symbol_info: Optional[dict],
+    evaluation_mode: str = "manual_fast",
+) -> Optional[MarketContext]:
+    if tick is None:
+        return None
+    account = connector.refresh_account() if connector.connected else None
+    tick_payload = {
+        "bid": float(getattr(tick, "bid", 0.0) or 0.0),
+        "ask": float(getattr(tick, "ask", 0.0) or 0.0),
+        "spread": float(getattr(tick, "spread", 0.0) or 0.0),
+        "time": float(getattr(tick, "time", 0.0) or 0.0),
+    }
+
+
+async def _run_ibkr(callable_obj, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _ibkr_executor,
+        lambda: callable_obj(*args, **kwargs),
+    )
+    normalized_symbol_info = signal_pipeline._normalize_symbol_info(symbol, tick_payload) if symbol_info else None
+    profile = (
+        signal_pipeline.profile_service.resolve_profile(symbol, normalized_symbol_info)
+        if normalized_symbol_info is not None
+        else None
+    )
+    open_positions = (
+        [p.model_dump() for p in execution.get_positions()]
+        if connector.connected
+        else []
+    )
+    symbol_positions = [
+        p for p in open_positions
+        if str(p.get("symbol", "")).upper() == str(symbol).upper()
+    ]
+    return MarketContext(
+        symbol=symbol,
+        requested_timeframe="H1",
+        evaluation_mode=evaluation_mode,
+        user_policy=risk_engine.user_policy.model_dump(),
+        symbol_info=normalized_symbol_info,
+        profile=profile,
+        tick=tick_payload,
+        account_balance=float(account.balance) if account else 0.0,
+        account_equity=float(account.equity) if account else 0.0,
+        account_margin=float(account.margin) if account else 0.0,
+        account_free_margin=float(account.free_margin) if account else 0.0,
+        account_currency=str(account.currency) if account else "",
+        account_leverage=int(account.leverage) if account else 0,
+        bars_by_timeframe={},
+        symbol_open_positions=symbol_positions,
+        all_open_positions=open_positions,
+    )
+
+
 def _ibkr_market_symbols(include_inactive: bool = False) -> list[dict]:
     summary = universe_service.summary_dict()
-    candidates = summary.get("enabled_symbols") or summary.get("auto_trade_fallback_symbols") or []
+    configured = summary.get("enabled_symbols") or []
+    candidates = configured if configured else list(IBKR_SCAN_DEFAULT_SYMBOLS)
     symbols: list[dict] = []
     for raw in candidates:
         canonical = universe_service.canonical_symbol(raw)
@@ -550,15 +712,15 @@ def _ibkr_market_symbols(include_inactive: bool = False) -> list[dict]:
 
 async def _evaluate_ibkr_symbol_recommendation(sym: str) -> dict:
     category = universe_service.expected_category_for_symbol(sym) or "Stocks"
-    snapshot = ibkr_connector.get_snapshot(sym)
+    snapshot = await _run_ibkr(ibkr_connector.get_snapshot, sym)
     bid = float((snapshot or {}).get("bid", 0.0) or 0.0)
     ask = float((snapshot or {}).get("ask", 0.0) or 0.0)
     mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else (bid or ask or 0.0)
     spread = max(0.0, ask - bid) if ask > 0 and bid > 0 else 0.0
 
-    bars_m15 = ibkr_connector.get_bars(sym, "M15", 96)
-    bars_h1 = ibkr_connector.get_bars(sym, "H1", 96)
-    bars_h4 = ibkr_connector.get_bars(sym, "H4", 72)
+    bars_m15 = await _run_ibkr(ibkr_connector.get_bars, sym, "M15", 96)
+    bars_h1 = await _run_ibkr(ibkr_connector.get_bars, sym, "H1", 96)
+    bars_h4 = await _run_ibkr(ibkr_connector.get_bars, sym, "H4", 72)
     if len(bars_h4) < 52:
         bars_h4 = bars_h1
     if mid <= 0 and bars_m15:
@@ -583,7 +745,7 @@ async def _evaluate_ibkr_symbol_recommendation(sym: str) -> dict:
         "stop_loss": None,
         "take_profit": None,
         "max_holding_minutes": None,
-        "reason": "Waiting for enough IBKR market data.",
+        "reason": f"Waiting for enough IBKR market data (M15={len(bars_m15)}, H1={len(bars_h1)}).",
         "strategy": "ibkr_wait_data",
         "metadata": {},
     }
@@ -598,6 +760,7 @@ async def _evaluate_ibkr_symbol_recommendation(sym: str) -> dict:
             account_equity=float(account.equity) if account else 0.0,
             open_positions=[],
             multi_tf_bars={"M15": bars_m15, "H1": bars_h1, "H4": bars_h4},
+            policy_mode=risk_engine.user_policy.mode,
         )
         smart_agent = agents.get("SmartAgent")
         model_signal = smart_agent.evaluate(agent_input) if smart_agent else None
@@ -722,6 +885,17 @@ async def _evaluate_ibkr_symbol_recommendation(sym: str) -> dict:
         reason = ", ".join(blockers) if blockers else "Blocked by IBKR pre-checks."
         status = "block"
 
+    ibkr_account = ibkr_connector.account_info
+    ibkr_free_margin = float(getattr(ibkr_account, "free_margin", 0.0) or 0.0)
+    recommended_amount_usd, recommended_amount_pct = _recommended_trade_amount_from_free_margin(
+        free_margin=ibkr_free_margin,
+        policy_mode=risk_engine.user_policy.mode,
+        confidence=confidence,
+        quality_score=confidence,
+        ready_to_execute=ready_to_execute,
+    )
+    commission_snapshot = _commission_snapshot_from_symbol_info(None)
+
     signal_id = None
     if db is not None:
         signal_id = await db.log_signal(
@@ -807,15 +981,18 @@ async def _evaluate_ibkr_symbol_recommendation(sym: str) -> dict:
         },
         "gemini_confirmation": None,
         "execution_reason": reason,
+        "recommended_amount_usd": recommended_amount_usd,
+        "recommended_amount_pct_free_margin": recommended_amount_pct,
+        **commission_snapshot,
     }
 
 
 async def _ibkr_reference_price(symbol: str) -> float:
-    snap = ibkr_connector.get_snapshot(symbol)
+    snap = await _run_ibkr(ibkr_connector.get_snapshot, symbol)
     price = float((snap or {}).get("last") or (snap or {}).get("ask") or (snap or {}).get("bid") or 0.0)
     if price > 0:
         return price
-    bars = ibkr_connector.get_bars(symbol, "H1", 5)
+    bars = await _run_ibkr(ibkr_connector.get_bars, symbol, "H1", 5)
     if bars:
         price = float(bars[-1].get("close", 0.0) or 0.0)
     return price if price > 0 else 0.0
@@ -906,19 +1083,47 @@ def _current_gemini_status() -> dict:
         return text
 
     available = bool(gemini_agent.available)
-    degraded = bool(
-        gemini_adapter.degraded
-        or getattr(gemini_agent, "degraded", False)
-        or (getattr(gemini_agent, "unavailable_reason", "") and not available)
+    now = time.time()
+    agent_quota_until = float(getattr(gemini_agent, "_quota_block_until", 0.0) or 0.0)
+    route_quota_until = float(_gemini_quota_cooldown_until or 0.0)
+    cooldown_seconds = int(max(0.0, max(agent_quota_until - now, route_quota_until - now)))
+    # Treat adapter failures as degraded only while recent, to avoid stale red state.
+    RECENT_FAILURE_WINDOW_SECONDS = 900.0
+    adapter_last_failure_at = float(getattr(gemini_adapter, "last_failure_at", 0.0) or 0.0)
+    adapter_failure_recent = bool(
+        getattr(gemini_adapter, "last_error", None)
+        and adapter_last_failure_at > 0
+        and (now - adapter_last_failure_at) <= RECENT_FAILURE_WINDOW_SECONDS
     )
-    last_error = _normalize_error(
-        gemini_adapter.last_error
-        or getattr(gemini_agent, "runtime_last_error", "")
-        or (getattr(gemini_agent, "unavailable_reason", "") if not available else "")
-        or None
+    degraded = bool(
+        (not available)
+        or cooldown_seconds > 0
+        or adapter_failure_recent
     )
 
-    if available and not degraded:
+    active_error = None
+    if not available:
+        active_error = getattr(gemini_agent, "unavailable_reason", "") or None
+    elif cooldown_seconds > 0:
+        active_error = "Quota exhausted / rate limited. Using technical logic only until quota resets."
+    elif adapter_failure_recent:
+        active_error = getattr(gemini_adapter, "last_error", None)
+    last_error = _normalize_error(active_error)
+
+    if not available:
+        credits_pct = 0
+    elif cooldown_seconds > 0:
+        # During cooldown, model should be considered near-exhausted.
+        credits_pct = 5
+    elif degraded:
+        credits_pct = 40
+    else:
+        credits_pct = 100
+
+    if available and cooldown_seconds > 0:
+        reply = f"Gemini is in quota cooldown (~{cooldown_seconds}s remaining). Technical logic is used until cooldown ends."
+        state = "cooldown"
+    elif available and not degraded:
         reply = "Yes. Gemini is available and healthy right now."
         state = "available"
     elif available and degraded:
@@ -933,6 +1138,8 @@ def _current_gemini_status() -> dict:
         "available": available,
         "degraded": degraded,
         "last_error": last_error,
+        "cooldown_seconds": cooldown_seconds,
+        "credits_pct": credits_pct,
         "reply": reply,
     }
 
@@ -964,13 +1171,13 @@ async def connect(req: ConnectRequest):
                 client_id=int(req.ibkr_client_id or 1),
                 account_id=(req.ibkr_account_id or "").strip() or None,
             )
-            success = ibkr_connector.connect(ibkr_params)
+            success = await _run_ibkr(ibkr_connector.connect, ibkr_params)
             if not success:
                 if db:
                     await db.log_error("connection", ibkr_connector.last_error or "IBKR connection failed")
                 raise HTTPException(status_code=400, detail=ibkr_connector.last_error or "IBKR connection failed")
             if success and not ibkr_connector.is_demo() and (risk_engine.user_policy.demo_only_default or not config.LIVE_TRADING_ENABLED):
-                ibkr_connector.disconnect()
+                await _run_ibkr(ibkr_connector.disconnect)
                 raise HTTPException(
                     status_code=403,
                     detail="IBKR live account rejected by policy. Use paper account or enable live trading.",
@@ -978,7 +1185,7 @@ async def connect(req: ConnectRequest):
             if connector.connected:
                 connector.disconnect()
             active_platform = "ibkr"
-            live_account = ibkr_connector.refresh_account()
+            live_account = await _run_ibkr(ibkr_connector.refresh_account)
             if db:
                 await db.log_connection_event(
                     "connected",
@@ -1064,7 +1271,7 @@ async def connect(req: ConnectRequest):
 async def disconnect():
     global active_platform
     mt5_success = connector.disconnect() if connector.connected else True
-    ibkr_success = ibkr_connector.disconnect() if ibkr_connector.connected else True
+    ibkr_success = await _run_ibkr(ibkr_connector.disconnect) if ibkr_connector.connected else True
     success = bool(mt5_success and ibkr_success)
     active_platform = "mt5"
     if db:
@@ -1074,24 +1281,14 @@ async def disconnect():
 
 @router.get("/status")
 async def status():
-    def _normalize_error(msg: str | None) -> str | None:
-        text = (msg or "").strip()
-        if not text:
-            return None
-        upper = text.upper()
-        if "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper or "429" in upper:
-            return "Quota exhausted / rate limited. Using technical logic only until quota resets."
-        if len(text) > 240:
-            return text[:240].rstrip() + "..."
-        return text
-
+    gemini_status = _current_gemini_status()
     if active_platform == "ibkr" and ibkr_connector.connected:
-        account = ibkr_connector.refresh_account()
+        account = await _run_ibkr(ibkr_connector.refresh_account)
         terminal = ibkr_connector.get_terminal_info()
         connected_flag = bool(ibkr_connector.connected)
         last_error = ibkr_connector.last_error
         is_demo = ibkr_connector.is_demo()
-        positions_snapshot = ibkr_connector.get_positions()
+        positions_snapshot = await _run_ibkr(ibkr_connector.get_positions)
     else:
         account = connector.refresh_account()
         terminal = connector.get_terminal_info()
@@ -1099,6 +1296,11 @@ async def status():
         last_error = connector.last_error
         is_demo = connector.is_demo()
         positions_snapshot = execution.get_positions()
+
+    # Normalize stale MT5 IPC state: if connector says connected but account refresh failed,
+    # report disconnected so UI shows reconnection flow instead of a blank "connected" shell.
+    if active_platform == "mt5" and connected_flag and account is None:
+        connected_flag = False
     portfolio_snapshot = signal_pipeline.portfolio_risk_service.snapshot(
         account,
         positions_snapshot,
@@ -1124,18 +1326,12 @@ async def status():
         "panic_stop": risk_engine.panic_stopped,
         "active_agent": active_agent_name,
         "credential_storage_available": credential_vault.available,
-        "gemini_available": gemini_agent.available,
-        "gemini_degraded": bool(
-            gemini_adapter.degraded
-            or getattr(gemini_agent, "degraded", False)
-            or (getattr(gemini_agent, "unavailable_reason", "") and not gemini_agent.available)
-        ),
-        "gemini_last_error": _normalize_error(
-            gemini_adapter.last_error
-            or getattr(gemini_agent, "runtime_last_error", "")
-            or (getattr(gemini_agent, "unavailable_reason", "") if not gemini_agent.available else "")
-            or None
-        ),
+        "gemini_available": gemini_status.get("available", False),
+        "gemini_degraded": gemini_status.get("degraded", False),
+        "gemini_last_error": gemini_status.get("last_error"),
+        "gemini_state": gemini_status.get("state", "unavailable"),
+        "gemini_cooldown_seconds": int(gemini_status.get("cooldown_seconds", 0) or 0),
+        "gemini_credits_pct": int(gemini_status.get("credits_pct", 0) or 0),
         "user_policy": risk_engine.user_policy.model_dump(),
         "runtime_controls": risk_engine.runtime_controls(),
         "universe": universe_service.summary_dict(),
@@ -1148,7 +1344,7 @@ async def status():
 @router.get("/account")
 async def account():
     if active_platform == "ibkr" and ibkr_connector.connected:
-        info = ibkr_connector.refresh_account()
+        info = await _run_ibkr(ibkr_connector.refresh_account)
         if info is None:
             raise HTTPException(status_code=500, detail="Failed to get IBKR account info")
         return info.model_dump()
@@ -1195,7 +1391,7 @@ async def select_symbols(req: SymbolSelectRequest):
 async def get_tick(symbol: str):
     _require_active_platform_connection()
     if active_platform == "ibkr":
-        snap = ibkr_connector.get_stock_snapshot(symbol)
+        snap = await _run_ibkr(ibkr_connector.get_stock_snapshot, symbol)
         if not snap:
             raise HTTPException(status_code=404, detail=f"No IBKR tick data for {symbol}")
         spread = max(0.0, float(snap["ask"]) - float(snap["bid"]))
@@ -1210,6 +1406,41 @@ async def get_tick(symbol: str):
     if tick is None:
         raise HTTPException(status_code=404, detail=f"No tick data for {symbol}")
     return tick.model_dump()
+
+
+@router.get("/market/ticks")
+async def get_ticks(symbols: str):
+    """Bulk tick endpoint to keep prices live with one request."""
+    _require_active_platform_connection()
+    raw_symbols = [s.strip() for s in (symbols or "").split(",") if s.strip()]
+    # Defensive cap to avoid oversized requests from UI.
+    requested = raw_symbols[:120]
+    if not requested:
+        return {"ticks": {}}
+
+    ticks: dict[str, dict] = {}
+    if active_platform == "ibkr":
+        for sym in requested:
+            snap = await _run_ibkr(ibkr_connector.get_stock_snapshot, sym)
+            if not snap:
+                continue
+            spread = max(0.0, float(snap["ask"]) - float(snap["bid"]))
+            ticks[sym] = {
+                "symbol": str(snap["symbol"]),
+                "bid": float(snap["bid"]),
+                "ask": float(snap["ask"]),
+                "spread": spread,
+                "time": int(time.time()),
+            }
+    else:
+        for sym in requested:
+            resolved = _resolve_market_symbol(sym)
+            tick = market_data.get_tick(resolved)
+            if tick is None:
+                continue
+            ticks[sym] = tick.model_dump()
+
+    return {"ticks": ticks}
 
 
 @router.get("/market/bars/{symbol}")
@@ -1244,10 +1475,18 @@ async def get_symbol_info(symbol: str):
             "visible": True,
             "trade_stops_level": 0,
             "category": category,
+            "commission_per_lot_side": 0.0,
+            "commission_round_turn_per_lot": 0.0,
+            "commission_model": "ibkr_not_implemented",
+            "commission_percent_rate": None,
+            "commission_notional_1lot": None,
         }
     info = market_data.get_symbol_info(_resolve_market_symbol(symbol))
     if info is None:
         raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
+    base_commission = _commission_snapshot_from_symbol_info(info)
+    history_commission = execution.get_recent_commission_by_symbol().get(info.get("name", ""))
+    info.update(_merge_commission_snapshot(base_commission, history_commission))
     return info
 
 
@@ -1265,6 +1504,20 @@ async def get_available_symbols(
         symbols = market_data.get_tradeable_symbols()
     else:
         symbols = market_data.get_all_symbols()
+
+    history_commission_map = execution.get_recent_commission_by_symbol() if active_platform != "ibkr" else {}
+    if history_commission_map:
+        enriched_symbols = []
+        for item in symbols:
+            row = dict(item)
+            name = str(row.get("name", "") or "")
+            merged = _merge_commission_snapshot(
+                _commission_snapshot_from_symbol_info(row),
+                history_commission_map.get(name),
+            )
+            row.update(merged)
+            enriched_symbols.append(row)
+        symbols = enriched_symbols
 
     symbols = universe_service.filter_market_symbols(symbols, include_inactive=include_inactive)
 
@@ -1489,8 +1742,8 @@ async def set_agent(req: SetAgentRequest):
 async def calculate_volume(symbol: str, amount_usd: float):
     """Convert a dollar amount (margin) to trading volume (lots) for a given symbol.
 
-    The amount_usd is treated as margin: with leverage, it controls a larger position.
-    volume = amount_usd * leverage / (price * contract_size)
+    The amount_usd is treated as margin budget and solved using MT5 margin estimation.
+    This avoids incorrect sizing on symbols whose effective margin differs from account leverage.
     """
     _require_active_platform_connection()
     if active_platform == "ibkr":
@@ -1518,28 +1771,32 @@ async def calculate_volume(symbol: str, amount_usd: float):
     if not tick or not sym_info:
         raise HTTPException(status_code=404, detail=f"Cannot get info for {symbol}")
 
-    # Get account leverage
-    account = connector.refresh_account()
-    leverage = account.leverage if account else 1
-
     price = tick.ask
     contract_size = sym_info.get("trade_contract_size", 100000)
-    vol_min = sym_info.get("volume_min", 0.01)
-    vol_max = sym_info.get("volume_max", 100)
-    vol_step = sym_info.get("volume_step", 0.01)
+    vol_min = float(sym_info.get("volume_min", 0.01) or 0.01)
+    vol_max = float(sym_info.get("volume_max", 100) or 100)
+    vol_step = float(sym_info.get("volume_step", 0.01) or 0.01)
 
     if price <= 0 or contract_size <= 0:
         raise HTTPException(status_code=400, detail="Invalid price or contract size")
 
     # amount_usd is margin → multiply by leverage to get notional, then divide by lot value
-    raw_volume = (amount_usd * leverage) / (price * contract_size)
-    if vol_step > 0:
-        raw_volume = round(raw_volume / vol_step) * vol_step
-    volume = max(raw_volume, vol_min)
-    volume = min(volume, vol_max)
-
-    # Actual margin required for this volume
-    margin_required = round((volume * price * contract_size) / leverage, 2)
+    volume, estimated_margin = _solve_volume_by_margin_target(
+        symbol=resolved_symbol,
+        action="BUY",
+        target_margin_usd=amount_usd,
+        price=price,
+        vol_min=vol_min,
+        vol_max=vol_max,
+        vol_step=vol_step,
+    )
+    if volume <= 0:
+        min_required = estimated_margin if estimated_margin is not None else 0.0
+        raise HTTPException(
+            status_code=400,
+            detail=f"Amount too small for this symbol. Minimum required margin is about ${min_required:.2f}.",
+        )
+    margin_required = round(float(estimated_margin if estimated_margin is not None else amount_usd), 2)
 
     # Calculate minimum SL/TP dollar amounts based on MT5 STOPLEVEL and spread
     point = sym_info.get("point", 0.00001)
@@ -1564,7 +1821,7 @@ async def calculate_volume(symbol: str, amount_usd: float):
         "contract_size": contract_size,
         "volume_min": vol_min,
         "volume_max": vol_max,
-        "leverage": leverage,
+        "leverage": (connector.refresh_account().leverage if connector.refresh_account() else 1),
         "min_sl_tp_dollars": min_sl_tp_dollars,
         "stops_level": effective_stops,
     }
@@ -1609,9 +1866,9 @@ def _build_trade_comment(
     # long/special-char payloads. Keep compact ASCII-only <= 31 chars.
     parts = [f"TA{int(round(float(amount_usd)))}"]
     if sl_amount_usd is not None and sl_amount_usd > 0:
-        parts.append(f"SL{int(round(float(sl_amount_usd)))}")
+        parts.append(f"SLA{int(round(float(sl_amount_usd)))}")
     if tp_amount_usd is not None and tp_amount_usd > 0:
-        parts.append(f"TP{int(round(float(tp_amount_usd)))}")
+        parts.append(f"TPA{int(round(float(tp_amount_usd)))}")
     comment = "|".join(parts)
     # Hard cap for broad MT5 compatibility.
     if len(comment) > 31:
@@ -1625,6 +1882,232 @@ def _build_trade_comment(
                 break
         comment = compact[:31]
     return comment
+
+
+def _round_volume_down(
+    *,
+    raw_volume: float,
+    vol_min: float,
+    vol_step: float,
+    vol_max: float,
+) -> float:
+    if raw_volume <= 0:
+        return 0.0
+    step = vol_step if vol_step and vol_step > 0 else max(vol_min, 0.01)
+    bounded = min(raw_volume, vol_max) if vol_max > 0 else raw_volume
+    units = math.floor((bounded + 1e-12) / step)
+    rounded = units * step
+    if rounded + 1e-12 < vol_min:
+        return 0.0
+    return round(rounded, 6)
+
+
+def _solve_volume_by_margin_target(
+    *,
+    symbol: str,
+    action: str,
+    target_margin_usd: float,
+    price: float,
+    vol_min: float,
+    vol_max: float,
+    vol_step: float,
+) -> tuple[float, float | None]:
+    """Find the highest volume whose MT5 estimated margin is <= target margin.
+
+    Returns (volume, estimated_margin). If MT5 margin estimation is unavailable,
+    returns (0.0, None) so callers can choose a fallback.
+    """
+    if target_margin_usd <= 0:
+        return 0.0, 0.0
+
+    step = vol_step if vol_step and vol_step > 0 else max(vol_min, 0.01)
+    min_units = max(1, math.ceil(vol_min / step))
+    max_units = max(min_units, math.floor(vol_max / step)) if vol_max > 0 else max(min_units, 1_000_000)
+
+    def _margin_for_units(units: int) -> float | None:
+        volume = round(units * step, 6)
+        margin = execution.estimate_margin(symbol=symbol, action=action, volume=volume, price=price)
+        if margin is None:
+            return None
+        return float(margin)
+
+    min_margin = _margin_for_units(min_units)
+    if min_margin is None:
+        return 0.0, None
+    if min_margin > target_margin_usd:
+        return 0.0, min_margin
+
+    low = min_units
+    high = max_units
+    best_units = min_units
+    best_margin = min_margin
+
+    while low <= high:
+        mid = (low + high) // 2
+        margin = _margin_for_units(mid)
+        if margin is None:
+            return 0.0, None
+        if margin <= target_margin_usd:
+            best_units = mid
+            best_margin = margin
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    return round(best_units * step, 6), float(best_margin)
+
+
+def _solve_volume_by_margin_target_fast(
+    *,
+    symbol: str,
+    action: str,
+    target_margin_usd: float,
+    price: float,
+    contract_size: float,
+    vol_min: float,
+    vol_max: float,
+    vol_step: float,
+) -> tuple[float, float | None]:
+    """Fast margin->volume approximation for click-to-trade latency.
+
+    Uses at most a few margin checks (instead of full binary search).
+    Falls back to precise solver only when margin estimation is unavailable.
+    """
+    if target_margin_usd <= 0:
+        return 0.0, 0.0
+
+    step = vol_step if vol_step and vol_step > 0 else max(vol_min, 0.01)
+    max_volume = vol_max if vol_max and vol_max > 0 else 1_000_000.0
+
+    # Initial rough estimate from leverage formula (fast first guess).
+    leverage = 1.0
+    try:
+        acct = connector.refresh_account()
+        leverage = float(acct.leverage) if acct and acct.leverage else 1.0
+    except Exception:
+        leverage = 1.0
+    rough = (
+        (target_margin_usd * max(leverage, 1.0)) / (price * max(contract_size, 1e-9))
+        if price > 0 and contract_size > 0
+        else vol_min
+    )
+    volume = _round_volume_down(
+        raw_volume=max(rough, vol_min),
+        vol_min=vol_min,
+        vol_step=step,
+        vol_max=max_volume,
+    )
+    if volume <= 0:
+        volume = _round_volume_down(raw_volume=vol_min, vol_min=vol_min, vol_step=step, vol_max=max_volume)
+    if volume <= 0:
+        return 0.0, None
+
+    def _margin(v: float) -> float | None:
+        m = execution.estimate_margin(symbol=symbol, action=action, volume=round(v, 6), price=price)
+        return float(m) if m is not None else None
+
+    margin = _margin(volume)
+    if margin is None:
+        return _solve_volume_by_margin_target(
+            symbol=symbol,
+            action=action,
+            target_margin_usd=target_margin_usd,
+            price=price,
+            vol_min=vol_min,
+            vol_max=max_volume,
+            vol_step=step,
+        )
+
+    # Scale towards target with a couple of bounded iterations.
+    for _ in range(3):
+        if margin <= 0:
+            break
+        scale = target_margin_usd / margin
+        # If already close enough, stop.
+        if 0.96 <= scale <= 1.04:
+            break
+        candidate = _round_volume_down(
+            raw_volume=max(vol_min, volume * max(0.2, min(scale, 5.0))),
+            vol_min=vol_min,
+            vol_step=step,
+            vol_max=max_volume,
+        )
+        if candidate <= 0 or abs(candidate - volume) < 1e-9:
+            break
+        cand_margin = _margin(candidate)
+        if cand_margin is None:
+            break
+        volume, margin = candidate, cand_margin
+
+    # Ensure we never exceed target; step down quickly if needed.
+    guard = 0
+    while margin is not None and margin > target_margin_usd and volume > vol_min + 1e-9 and guard < 5:
+        volume = _round_volume_down(
+            raw_volume=max(vol_min, volume - step),
+            vol_min=vol_min,
+            vol_step=step,
+            vol_max=max_volume,
+        )
+        margin = _margin(volume)
+        guard += 1
+
+    if margin is None:
+        return 0.0, None
+    if margin > target_margin_usd:
+        min_margin = _margin(vol_min)
+        return 0.0, float(min_margin) if min_margin is not None else float(margin)
+    return round(volume, 6), float(margin)
+
+
+def _rebalance_volume_for_started_amount_risk(
+    *,
+    entry_price: float,
+    stop_loss: float | None,
+    desired_sl_amount_usd: float | None,
+    volume: float,
+    contract_size: float,
+    vol_min: float,
+    vol_step: float,
+    vol_max: float,
+) -> tuple[float, str | None]:
+    """Ensure actual SL-dollar risk stays aligned with the started amount target.
+
+    If broker min distance widens SL, we reduce volume to preserve risk budget.
+    """
+    if (
+        desired_sl_amount_usd is None
+        or desired_sl_amount_usd <= 0
+        or stop_loss is None
+        or stop_loss <= 0
+        or entry_price <= 0
+        or contract_size <= 0
+        or volume <= 0
+    ):
+        return volume, None
+
+    sl_distance = abs(entry_price - stop_loss)
+    if sl_distance <= 0:
+        return volume, None
+
+    actual_sl_amount = sl_distance * volume * contract_size
+    # Allow tiny tolerance to avoid jitter from rounding.
+    if actual_sl_amount <= desired_sl_amount_usd * 1.02:
+        return volume, None
+
+    max_volume_for_risk = desired_sl_amount_usd / (sl_distance * contract_size)
+    adjusted_volume = _round_volume_down(
+        raw_volume=max_volume_for_risk,
+        vol_min=vol_min,
+        vol_step=vol_step,
+        vol_max=vol_max,
+    )
+    if adjusted_volume <= 0:
+        min_possible_risk = sl_distance * max(vol_min, 0.0) * contract_size
+        return 0.0, (
+            f"Broker minimum stop distance implies at least ${min_possible_risk:.2f} risk "
+            f"for this symbol at minimum volume, which exceeds your selected risk budget."
+        )
+    return adjusted_volume, None
 
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -1645,6 +2128,9 @@ async def _gemini_target_pct_adjustment(
     event_risk: str,
     contradiction_flag: bool,
 ) -> tuple[float, float]:
+    global _gemini_quota_cooldown_until
+    if time.time() < _gemini_quota_cooldown_until:
+        return 0.0, 0.0
     if not gemini_agent.available or getattr(gemini_agent, "_client", None) is None:
         return 0.0, 0.0
     try:
@@ -1700,6 +2186,13 @@ async def _gemini_target_pct_adjustment(
         tp_delta = _clamp(float(parsed.get("tp_delta_pct", 0.0)), -0.03, 0.06)
         return sl_delta, tp_delta
     except Exception as exc:
+        text = str(exc)
+        if "429" in text or "RESOURCE_EXHAUSTED" in text:
+            retry = 60.0
+            match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", text, flags=re.IGNORECASE)
+            if match:
+                retry = max(15.0, float(match.group(1)))
+            _gemini_quota_cooldown_until = time.time() + retry
         logger.warning("Gemini SL/TP adjustment unavailable: %s", exc)
         return 0.0, 0.0
 
@@ -1870,7 +2363,8 @@ async def quick_buy(req: QuickBuyRequest):
         if price <= 0:
             raise HTTPException(status_code=400, detail=f"Invalid IBKR quote for {req.symbol}")
         quantity = max(1.0, round(req.amount_usd / price, 4))
-        result = ibkr_connector.place_order(
+        result = await _run_ibkr(
+            ibkr_connector.place_order,
             req.symbol,
             req.action.upper(),
             quantity,
@@ -1911,36 +2405,36 @@ async def quick_buy(req: QuickBuyRequest):
     if action not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="Action must be BUY or SELL")
 
+    # Keep quick/manual execution fast: avoid a second full evaluation round-trip here.
     decision_for_targets = None
-    try:
-        decision_for_targets = await signal_pipeline.evaluate(
-            symbol=symbol,
-            requested_agent_name=active_agent_name,
-            requested_timeframe="H1",
-            evaluation_mode="manual",
-            bar_count=100,
-        )
-    except Exception as exc:
-        logger.warning("Could not build dynamic SL/TP context for quick trade %s: %s", symbol, exc)
 
     is_buy = action == "BUY"
     price = tick.ask if is_buy else tick.bid
     contract_size = sym_info.get("trade_contract_size", 100000)
-    vol_min = sym_info.get("volume_min", 0.01)
-    vol_step = sym_info.get("volume_step", 0.01)
-
-    # Get account leverage
-    account = connector.refresh_account()
-    leverage = account.leverage if account else 1
+    vol_min = float(sym_info.get("volume_min", 0.01) or 0.01)
+    vol_step = float(sym_info.get("volume_step", 0.01) or 0.01)
+    vol_max = float(sym_info.get("volume_max", 0.0) or 0.0)
 
     # Calculate volume from dollar amount (margin-based with leverage)
     if price <= 0 or contract_size <= 0:
         raise HTTPException(status_code=400, detail="Invalid price data")
 
-    raw_volume = (req.amount_usd * leverage) / (price * contract_size)
-    if vol_step > 0:
-        raw_volume = round(raw_volume / vol_step) * vol_step
-    volume = max(raw_volume, vol_min)
+    volume, estimated_margin = _solve_volume_by_margin_target_fast(
+        symbol=symbol,
+        action=action,
+        target_margin_usd=req.amount_usd,
+        price=price,
+        contract_size=contract_size,
+        vol_min=vol_min,
+        vol_step=vol_step,
+        vol_max=vol_max,
+    )
+    if volume <= 0:
+        min_required = estimated_margin if estimated_margin is not None else 0.0
+        raise HTTPException(
+            status_code=400,
+            detail=f"Amount too small for this symbol. Minimum required margin is about ${min_required:.2f}.",
+        )
 
     digits = sym_info.get("digits", 5)
     sl = req.custom_stop_loss if req.custom_stop_loss and req.custom_stop_loss > 0 else None
@@ -2013,69 +2507,121 @@ async def quick_buy(req: QuickBuyRequest):
             digits=digits,
         )
 
-    # Log signal
-    signal_id = None
-    if db:
-        signal_id = await db.log_signal(
-            agent_name="QuickTrade", symbol=symbol, timeframe="manual",
-            action=action, confidence=0.5, stop_loss=sl, take_profit=tp,
-            max_holding_minutes=None, reason=f"Manual {action.lower()} ${req.amount_usd}",
+    if req.amount_usd and req.amount_usd > 0:
+        desired_sl_amount = sl_amount_for_comment if sl_amount_for_comment and sl_amount_for_comment > 0 else None
+        adjusted_volume, rebalance_error = _rebalance_volume_for_started_amount_risk(
+            entry_price=price,
+            stop_loss=sl,
+            desired_sl_amount_usd=desired_sl_amount,
+            volume=volume,
+            contract_size=contract_size,
+            vol_min=vol_min,
+            vol_step=vol_step,
+            vol_max=vol_max,
         )
+        if rebalance_error:
+            raise HTTPException(status_code=409, detail=rebalance_error)
+        if adjusted_volume > 0 and adjusted_volume < volume:
+            volume = adjusted_volume
+
+    # Keep click-to-order path fast: persist logs asynchronously after send.
+    signal_id = None
 
     order_req = OrderRequest(
         symbol=symbol, action=action,
         volume=volume, stop_loss=sl, take_profit=tp,
         comment=_build_trade_comment(req.amount_usd, sl_amount_for_comment, tp_amount_for_comment),
     )
-    quick_preflight = await execution_service.preflight(
+    quick_context = _build_fast_execution_context(
         symbol=symbol,
+        tick=tick,
+        symbol_info=sym_info,
+        evaluation_mode="manual_fast",
+    )
+    if quick_context is None:
+        raise HTTPException(status_code=404, detail=f"No live context available for {symbol}")
+    quick_candidate_signal = TechnicalSignal(
+        agent_name="QuickTrade",
         action=action,
-        volume=volume,
+        confidence=0.55,
         stop_loss=sl,
         take_profit=tp,
+        max_holding_minutes=None,
+        reason=f"Manual {action.lower()} request",
+        strategy="manual_execution",
+        metadata={},
+    )
+    quick_preflight = await execution_service.preflight_for_context_signal(
+        context=quick_context,
+        candidate_signal=quick_candidate_signal,
+        volume=volume,
         reference_spread=tick.spread if tick else 0.0,
-        requested_agent_name=active_agent_name,
-        requested_timeframe="H1",
-        evaluation_mode="manual",
+        evaluation_mode="scan",
     )
     if not quick_preflight.approved:
         raise HTTPException(status_code=409, detail=quick_preflight.reason)
     result = execution_service.place_order_if_approved(order_req, quick_preflight)
 
     if db:
-        await db.log_order(
-            signal_id=signal_id, symbol=symbol, action=action,
-            volume=volume, price=result.price,
-            stop_loss=sl, take_profit=tp, ticket=result.ticket,
-            retcode=result.retcode, retcode_desc=result.retcode_desc,
-            success=result.success,
-            comment=order_req.comment,
-        )
-        if result.success and result.ticket:
-            decision = await signal_pipeline.evaluate(
-                symbol=symbol,
-                requested_agent_name=active_agent_name,
-                requested_timeframe="H1",
-                evaluation_mode="manual",
-                bar_count=100,
-            )
-            await _store_management_plan(result.ticket, signal_id, symbol, action, decision)
-            if signal_id:
-                await db.mark_evaluation_outcome(signal_id, "opened")
-                account = connector.refresh_account() if connector.connected else None
-                await db.mark_trade_candidate_execution(
-                    signal_id=signal_id,
-                    executed=True,
-                    ticket=result.ticket,
-                    fill_price=result.price,
-                    slippage_estimate=0.0,
-                    margin_snapshot={
-                        "balance": float(account.balance) if account else 0.0,
-                        "equity": float(account.equity) if account else 0.0,
-                        "margin": float(account.margin) if account else 0.0,
-                        "free_margin": float(account.free_margin) if account else 0.0,
-                    },
+        async def _persist_quick_buy_async():
+            sid = None
+            try:
+                sid = await db.log_signal(
+                    agent_name="QuickTrade", symbol=symbol, timeframe="manual",
+                    action=action, confidence=0.5, stop_loss=sl, take_profit=tp,
+                    max_holding_minutes=None, reason=f"Manual {action.lower()} ${req.amount_usd}",
                 )
+            except Exception as exc:
+                logger.warning("Quick-buy signal persistence failed for %s: %s", symbol, exc)
+
+            try:
+                await db.log_order(
+                    signal_id=sid, symbol=symbol, action=action,
+                    volume=volume, price=result.price,
+                    stop_loss=sl, take_profit=tp, ticket=result.ticket,
+                    retcode=result.retcode, retcode_desc=result.retcode_desc,
+                    success=result.success,
+                    comment=order_req.comment,
+                )
+            except Exception as exc:
+                logger.warning("Quick-buy order persistence failed for %s: %s", symbol, exc)
+
+            if result.success and result.ticket:
+                async def _store_plan_async(ticket: int, linked_sid: int | None, sym: str, side: str):
+                    try:
+                        decision = await signal_pipeline.evaluate(
+                            symbol=sym,
+                            requested_agent_name=active_agent_name,
+                            requested_timeframe="H1",
+                            evaluation_mode="manual",
+                            bar_count=100,
+                        )
+                        await _store_management_plan(ticket, linked_sid, sym, side, decision)
+                    except Exception as exc:
+                        logger.warning("Background plan generation failed for %s #%s: %s", sym, ticket, exc)
+
+                asyncio.create_task(_store_plan_async(result.ticket, sid, symbol, action))
+                if sid:
+                    try:
+                        await db.mark_evaluation_outcome(sid, "opened")
+                        account = connector.refresh_account() if connector.connected else None
+                        await db.mark_trade_candidate_execution(
+                            signal_id=sid,
+                            executed=True,
+                            ticket=result.ticket,
+                            fill_price=result.price,
+                            slippage_estimate=0.0,
+                            margin_snapshot={
+                                "balance": float(account.balance) if account else 0.0,
+                                "equity": float(account.equity) if account else 0.0,
+                                "margin": float(account.margin) if account else 0.0,
+                                "free_margin": float(account.free_margin) if account else 0.0,
+                            },
+                        )
+                    except Exception as exc:
+                        logger.warning("Quick-buy post-open persistence failed for %s #%s: %s", symbol, result.ticket, exc)
+
+        asyncio.create_task(_persist_quick_buy_async())
 
     return result.model_dump()
 
@@ -2217,20 +2763,34 @@ Never promise guaranteed profits.
             sym_info = market_data.get_symbol_info(symbol)
             if tick and sym_info:
                 side_price = tick.ask if trade_req.action == "BUY" else tick.bid
-                account_info = connector.refresh_account()
-                leverage = account_info.leverage if account_info else 1
                 contract_size = sym_info.get("trade_contract_size", 100000)
-                vol_step = sym_info.get("volume_step", 0.01)
-                vol_min = sym_info.get("volume_min", 0.01)
-
-                raw_volume = (
-                    (trade_req.amount_usd * leverage) / (side_price * contract_size)
-                    if side_price > 0 and contract_size > 0
-                    else vol_min
+                vol_step = float(sym_info.get("volume_step", 0.01) or 0.01)
+                vol_min = float(sym_info.get("volume_min", 0.01) or 0.01)
+                vol_max = float(sym_info.get("volume_max", 0.0) or 0.0)
+                volume, estimated_margin = _solve_volume_by_margin_target(
+                    symbol=symbol,
+                    action=trade_req.action,
+                    target_margin_usd=trade_req.amount_usd,
+                    price=side_price,
+                    vol_min=vol_min,
+                    vol_step=vol_step,
+                    vol_max=vol_max,
                 )
-                if vol_step > 0:
-                    raw_volume = round(raw_volume / vol_step) * vol_step
-                volume = max(raw_volume, vol_min)
+                if volume <= 0:
+                    min_required = estimated_margin if estimated_margin is not None else 0.0
+                    reply = (
+                        f"I detected a trade request, but ${trade_req.amount_usd:.2f} is too small for {symbol}. "
+                        f"Minimum required margin is about ${min_required:.2f}."
+                    )
+                    trade_preview = {
+                        "symbol": symbol,
+                        "action": trade_req.action,
+                        "amount_usd": trade_req.amount_usd,
+                        "estimated_entry": side_price,
+                        "estimated_volume": 0.0,
+                        "reason": "amount_too_small",
+                    }
+                    volume = 0.0
 
                 decision_for_targets = None
                 try:
@@ -2267,12 +2827,13 @@ Never promise guaranteed profits.
                     "amount_usd": trade_req.amount_usd,
                     "estimated_entry": side_price,
                     "estimated_volume": round(volume, 4),
+                    "estimated_margin": round(float(estimated_margin), 2) if estimated_margin is not None else None,
                     "stop_loss": sl,
                     "take_profit": tp,
                     "reason": trade_req.reason,
                 }
 
-                if req.execute_trade:
+                if req.execute_trade and volume > 0:
                     order_result = await quick_buy(
                         QuickBuyRequest(
                             symbol=symbol,
@@ -2322,7 +2883,8 @@ async def execute_trade(req: ExecuteTradeRequest):
         if account and account.trade_mode != 0 and not config.LIVE_TRADING_ENABLED:
             raise HTTPException(status_code=403, detail="Live trading is disabled")
 
-        result = ibkr_connector.place_order(
+        result = await _run_ibkr(
+            ibkr_connector.place_order,
             req.symbol,
             req.action.upper(),
             req.volume,
@@ -2436,7 +2998,7 @@ async def execute_trade(req: ExecuteTradeRequest):
 async def get_positions(symbol: Optional[str] = None):
     _require_active_platform_connection()
     if active_platform == "ibkr":
-        return ibkr_connector.get_positions(symbol)
+        return await _run_ibkr(ibkr_connector.get_positions, symbol)
     positions = execution.get_positions(symbol)
     return [p.model_dump() for p in positions]
 
@@ -2449,7 +3011,7 @@ class ClosePositionRequest(BaseModel):
 async def close_position(req: ClosePositionRequest):
     _require_active_platform_connection()
     if active_platform == "ibkr":
-        result = ibkr_connector.close_position(req.ticket)
+        result = await _run_ibkr(ibkr_connector.close_position, req.ticket)
         if db:
             await db.log_order(
                 signal_id=None,
@@ -2492,13 +3054,16 @@ async def close_position(req: ClosePositionRequest):
             signal_id = plan.get("signal_id") if plan else None
             signal = await db.get_signal_by_id(signal_id) if signal_id else None
             outcome_context = _trade_outcome_context(plan, existing_position)
+            realized_profit = execution.get_position_realized_profit(req.ticket)
+            if realized_profit is None:
+                realized_profit = existing_position.profit if existing_position else 0.0
             await db.log_trade_outcome(
                 ticket=req.ticket,
                 signal_id=signal_id,
                 symbol=outcome_context["symbol"],
                 action=outcome_context["action"],
                 confidence=float(signal.get("confidence", 0.0)) if signal else 0.0,
-                profit=existing_position.profit if existing_position else 0.0,
+                profit=float(realized_profit),
                 exit_reason="manual_close",
                 holding_minutes=outcome_context["holding_minutes"],
                 symbol_category=outcome_context["symbol_category"],
@@ -2556,7 +3121,7 @@ async def get_logs(limit: int = 100, log_type: str = "all"):
 @router.get("/trade-history")
 async def get_trade_history(limit: int = 50):
     if active_platform == "ibkr" and ibkr_connector.connected:
-        broker_trades = ibkr_connector.get_recent_executions(limit=max(limit, 50))
+        broker_trades = await _run_ibkr(ibkr_connector.get_recent_executions, limit=max(limit, 50))
         closed = [t for t in broker_trades if t.get("status") == "closed"]
         summary = {
             "total_trades": len(broker_trades),
@@ -2599,7 +3164,7 @@ async def get_trade_history(limit: int = 50):
             "trades": [],
         }
 
-    raw_orders = await db.get_trade_history(max(limit * 4, 100))
+    raw_orders = await db.get_trade_history(max(limit * 3, 90))
     outcomes = await db.get_trade_outcomes(max(limit * 4, 100))
 
     account = connector.refresh_account() if connector.connected else None
@@ -2650,6 +3215,18 @@ async def get_trade_history(limit: int = 50):
         if isinstance(signal_id, int) and signal_id not in outcome_by_signal:
             outcome_by_signal[signal_id] = outcome
 
+    # Cache MT5 symbol-info calls by symbol to avoid repeated terminal round-trips.
+    symbol_contract_size_cache: dict[str, Optional[float]] = {}
+
+    def _contract_size_for_symbol(symbol_name: str) -> Optional[float]:
+        if symbol_name in symbol_contract_size_cache:
+            return symbol_contract_size_cache[symbol_name]
+        info = market_data.get_symbol_info(symbol_name) or {}
+        contract_size_value = _to_float(info.get("trade_contract_size"), 0.0)
+        contract_size = contract_size_value if contract_size_value > 0 else None
+        symbol_contract_size_cache[symbol_name] = contract_size
+        return contract_size
+
     trades: list[dict] = []
     for row in raw_orders:
         action = str(row.get("action", "")).upper()
@@ -2681,10 +3258,7 @@ async def get_trade_history(limit: int = 50):
         status = "closed" if outcome else "open"
         exit_reason = str(outcome.get("exit_reason", "")) if outcome else ""
 
-        info = market_data.get_symbol_info(symbol) or {}
-        contract_size = _to_float(info.get("trade_contract_size"), 0.0)
-        if contract_size <= 0:
-            contract_size = None
+        contract_size = _contract_size_for_symbol(symbol)
 
         started_with, started_source = _extract_started_amount(row.get("comment"), row.get("signal_reason"))
         if (
@@ -2751,6 +3325,23 @@ async def get_trade_history(limit: int = 50):
         )
         if len(trades) >= limit:
             break
+
+    if connector.connected:
+        mt5_tickets = [
+            int(t["ticket"])
+            for t in trades
+            if t.get("status") == "closed" and isinstance(t.get("ticket"), int)
+        ]
+        if mt5_tickets:
+            pnl_map = execution.get_realized_profit_map(mt5_tickets, lookback_days=60)
+            for t in trades:
+                tk = t.get("ticket")
+                if t.get("status") == "closed" and isinstance(tk, int) and tk in pnl_map:
+                    mt5_profit = float(pnl_map[tk])
+                    t["profit_usd"] = mt5_profit
+                    started_with = t.get("started_with_usd")
+                    t["ended_with_usd"] = (started_with + mt5_profit) if started_with is not None else None
+                    t["profit_pct"] = ((mt5_profit / started_with) * 100.0) if started_with else None
 
     closed = [t for t in trades if t.get("status") == "closed" and t.get("profit_usd") is not None]
     wins = [t for t in closed if _to_float(t.get("profit_usd")) > 0]
@@ -2834,7 +3425,16 @@ async def auto_connect(account_id: Optional[int] = None):
     if db is None:
         return {"connected": False, "reason": "No database"}
     if connector.connected:
-        return {"connected": True, "reason": "Already connected"}
+        # Handle stale MT5 IPC sessions where connector flag is true but account refresh fails.
+        refreshed = connector.refresh_account()
+        if refreshed is not None:
+            return {
+                "connected": True,
+                "reason": "Already connected",
+                "platform": active_platform,
+                "account": refreshed.model_dump(),
+            }
+        connector.disconnect()
 
     if account_id is not None:
         selected = await db.get_saved_credential(account_id)
@@ -2928,6 +3528,7 @@ async def smart_evaluate(req: SmartEvaluateRequest):
         for item in market_universe
         if item.get("name")
     }
+    history_commission_map = execution.get_recent_commission_by_symbol()
 
     if not symbols:
         # Use canonical universe selection to reduce alias duplicates and include the full active set.
@@ -2951,7 +3552,7 @@ async def smart_evaluate(req: SmartEvaluateRequest):
                         requested_agent_name="SmartAgent",
                         requested_timeframe="H1",
                         # Keep bulk dashboard scan deterministic and fast (no Gemini/news round-trip).
-                        evaluation_mode="manual",
+                        evaluation_mode="scan",
                         bar_count=100,
                     ),
                     timeout=PER_SYMBOL_TIMEOUT_SECONDS,
@@ -2977,7 +3578,7 @@ async def smart_evaluate(req: SmartEvaluateRequest):
                     candidate_signal=signal,
                     volume=max(risk_decision.adjusted_volume, risk_engine.settings.fixed_lot_size),
                     reference_spread=context.tick.get("spread", 0.0) if context.tick else 0.0,
-                    evaluation_mode="manual",
+                    evaluation_mode="scan",
                 )
                 if not preflight.approved:
                     ready_to_execute = False
@@ -2997,6 +3598,24 @@ async def smart_evaluate(req: SmartEvaluateRequest):
                         ready_to_execute = False
                         execution_reason = dist_error
 
+            quality_score = float(
+                execution_decision.trade_quality_assessment.final_trade_quality_score
+                if execution_decision.trade_quality_assessment
+                else signal.confidence
+            )
+            recommended_amount_usd, recommended_amount_pct = _recommended_trade_amount_from_free_margin(
+                free_margin=float(context.account_free_margin or 0.0),
+                policy_mode=str((context.user_policy or {}).get("mode", risk_engine.user_policy.mode)),
+                confidence=float(signal.confidence or 0.0),
+                quality_score=quality_score,
+                ready_to_execute=ready_to_execute,
+            )
+            commission_snapshot = _commission_snapshot_from_symbol_info(symbol_lookup.get(sym))
+            commission_snapshot = _merge_commission_snapshot(
+                commission_snapshot,
+                history_commission_map.get(sym),
+            )
+
             return {
                 "symbol": sym,
                 "signal": signal.to_trade_signal().model_dump(),
@@ -3015,6 +3634,9 @@ async def smart_evaluate(req: SmartEvaluateRequest):
                 if execution_decision.signal_decision.gemini_confirmation
                 else None,
                 "execution_reason": execution_reason,
+                "recommended_amount_usd": recommended_amount_usd,
+                "recommended_amount_pct_free_margin": recommended_amount_pct,
+                **commission_snapshot,
             }
         except Exception as exc:
             logger.error("Smart evaluate error for %s: %r", sym, exc, exc_info=True)
@@ -3040,6 +3662,101 @@ async def smart_evaluate(req: SmartEvaluateRequest):
             logger.error("Smart evaluate task failed: %r", exc, exc_info=True)
             evaluations.append(None)
     recommendations = [item for item in evaluations if item is not None]
+
+    # Second-pass Gemini enrichment for actionable rows only.
+    # Keep this bounded so dashboard scan remains responsive and quota-safe.
+    global _last_scan_gemini_enrich_at
+    role = str(risk_engine.user_policy.gemini_role or "advisory").lower()
+    gemini_status = _current_gemini_status()
+    now_ts = time.time()
+    GEMINI_SCAN_ENRICH_MIN_INTERVAL_SECONDS = 60.0
+    can_enrich_scan_now = (
+        role != "off"
+        and str(gemini_status.get("state", "")).lower() == "available"
+        and (now_ts - float(_last_scan_gemini_enrich_at or 0.0)) >= GEMINI_SCAN_ENRICH_MIN_INTERVAL_SECONDS
+    )
+    if can_enrich_scan_now:
+        actionable_indexes = [
+            idx for idx, rec in enumerate(recommendations)
+            if str((rec.get("signal") or {}).get("action", "")).upper() in {"BUY", "SELL"}
+        ]
+        MAX_GEMINI_CONFIRMATIONS = 2
+        GEMINI_CONFIRM_TIMEOUT_SECONDS = 3.0
+        GEMINI_CONFIRM_CONCURRENCY = 1
+        actionable_indexes = actionable_indexes[:MAX_GEMINI_CONFIRMATIONS]
+        if actionable_indexes:
+            _last_scan_gemini_enrich_at = now_ts
+            confirm_sem = asyncio.Semaphore(GEMINI_CONFIRM_CONCURRENCY)
+
+            async def enrich_with_gemini(rec_index: int) -> tuple[int, dict | None]:
+                rec = recommendations[rec_index]
+                sym = str(rec.get("symbol") or "")
+                if not sym:
+                    return rec_index, None
+                try:
+                    async with confirm_sem:
+                        decision = await asyncio.wait_for(
+                            signal_pipeline.evaluate(
+                                symbol=sym,
+                                requested_agent_name="SmartAgent",
+                                requested_timeframe="H1",
+                                evaluation_mode="manual",
+                                bar_count=100,
+                            ),
+                            timeout=GEMINI_CONFIRM_TIMEOUT_SECONDS,
+                        )
+                except Exception as exc:
+                    logger.info("Gemini confirm pass skipped for %s: %s", sym, exc)
+                    return rec_index, None
+
+                signal = decision.signal_decision.final_signal
+                risk_decision = decision.risk_evaluation
+                context = decision.signal_decision.market_context
+                quality_score = float(
+                    decision.trade_quality_assessment.final_trade_quality_score
+                    if decision.trade_quality_assessment
+                    else signal.confidence
+                )
+                recommended_amount_usd, recommended_amount_pct = _recommended_trade_amount_from_free_margin(
+                    free_margin=float(context.account_free_margin or 0.0),
+                    policy_mode=str((context.user_policy or {}).get("mode", risk_engine.user_policy.mode)),
+                    confidence=float(signal.confidence or 0.0),
+                    quality_score=quality_score,
+                    ready_to_execute=bool(decision.allow_execute),
+                )
+                patched = {
+                    "signal": signal.to_trade_signal().model_dump(),
+                    "risk_decision": risk_decision.model_dump(),
+                    "entry_price_estimate": decision.entry_price,
+                    "explanation": signal.reason,
+                    "ready_to_execute": bool(decision.allow_execute),
+                    "degraded_reasons": decision.signal_decision.degraded_reasons,
+                    "trade_quality": decision.trade_quality_assessment.model_dump(),
+                    "portfolio_risk": decision.portfolio_risk_assessment.model_dump(),
+                    "anti_churn": decision.anti_churn_assessment.model_dump(),
+                    "gemini_confirmation": decision.signal_decision.gemini_confirmation.model_dump()
+                    if decision.signal_decision.gemini_confirmation
+                    else None,
+                    "execution_reason": decision.reason,
+                    "recommended_amount_usd": recommended_amount_usd,
+                    "recommended_amount_pct_free_margin": recommended_amount_pct,
+                }
+                return rec_index, patched
+
+            enrichment_tasks = [asyncio.create_task(enrich_with_gemini(i)) for i in actionable_indexes]
+            done_enrich, pending_enrich = await asyncio.wait(
+                enrichment_tasks,
+                timeout=(GEMINI_CONFIRM_TIMEOUT_SECONDS * max(1, len(actionable_indexes))),
+            )
+            for task in pending_enrich:
+                task.cancel()
+            for task in done_enrich:
+                try:
+                    rec_index, patched = task.result()
+                    if patched is not None:
+                        recommendations[rec_index].update(patched)
+                except Exception as exc:
+                    logger.info("Gemini confirm merge failed: %s", exc)
 
     recommendations.sort(
         key=lambda r: (
@@ -3096,7 +3813,8 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
                 quantity = max(1.0, round(req.amount_usd / px, 4))
         sl = req.custom_stop_loss if req.custom_stop_loss and req.custom_stop_loss > 0 else signal_data.get("stop_loss")
         tp = req.custom_take_profit if req.custom_take_profit and req.custom_take_profit > 0 else signal_data.get("take_profit")
-        result = ibkr_connector.place_order(
+        result = await _run_ibkr(
+            ibkr_connector.place_order,
             symbol,
             action,
             quantity,
@@ -3104,22 +3822,31 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
             tp,
             _build_trade_comment(req.amount_usd, None, None),
         )
-        await db.log_order(
-            signal_id=req.signal_id,
-            symbol=symbol,
-            action=action,
-            volume=quantity,
-            price=result.get("price"),
-            stop_loss=sl,
-            take_profit=tp,
-            ticket=result.get("ticket"),
-            retcode=result.get("retcode", -1),
-            retcode_desc=result.get("retcode_desc", ""),
-            success=bool(result.get("success")),
-            comment=result.get("comment", ""),
-        )
-        if result.get("success"):
-            await db.mark_evaluation_outcome(req.signal_id, "opened")
+        async def _persist_ibkr_execute_reco_async():
+            try:
+                await db.log_order(
+                    signal_id=req.signal_id,
+                    symbol=symbol,
+                    action=action,
+                    volume=quantity,
+                    price=result.get("price"),
+                    stop_loss=sl,
+                    take_profit=tp,
+                    ticket=result.get("ticket"),
+                    retcode=result.get("retcode", -1),
+                    retcode_desc=result.get("retcode_desc", ""),
+                    success=bool(result.get("success")),
+                    comment=result.get("comment", ""),
+                )
+            except Exception as exc:
+                logger.warning("IBKR execute-recommendation order persistence failed for %s: %s", symbol, exc)
+            if result.get("success"):
+                try:
+                    await db.mark_evaluation_outcome(req.signal_id, "opened")
+                except Exception as exc:
+                    logger.warning("IBKR execute-recommendation outcome persistence failed for %s: %s", symbol, exc)
+
+        asyncio.create_task(_persist_ibkr_execute_reco_async())
         return result
     if risk_engine.panic_stopped:
         raise HTTPException(status_code=403, detail="Panic stop is active")
@@ -3150,12 +3877,6 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
             "comment": "",
         }
 
-    context = signal_pipeline.build_market_context(
-        symbol=symbol,
-        requested_timeframe=signal_data.get("timeframe", "H1"),
-        evaluation_mode="manual",
-        bar_count=100,
-    )
     current_signal = TechnicalSignal(
         agent_name=signal_data.get("agent_name", "SmartAgent"),
         action=action,
@@ -3177,36 +3898,48 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
     # Convert dollar amount to volume if provided
     tick = market_data.get_tick(symbol)
     sym_info = market_data.get_symbol_info(symbol)
+    if not tick or not sym_info:
+        raise HTTPException(status_code=404, detail=f"Cannot get live symbol context for {symbol}")
+    context = _build_fast_execution_context(
+        symbol=symbol,
+        tick=tick,
+        symbol_info=sym_info,
+        evaluation_mode="manual_fast",
+    )
+    if context is None:
+        raise HTTPException(status_code=404, detail=f"No live context available for {symbol}")
     if req.amount_usd and req.amount_usd > 0 and sym_info and tick:
+        # Keep recommendation execution responsive: do not run a full evaluate cycle here.
         decision_for_targets = None
-        try:
-            decision_for_targets = await signal_pipeline.evaluate(
-                symbol=symbol,
-                requested_agent_name=requested_agent_name,
-                requested_timeframe=signal_data.get("timeframe", "H1"),
-                evaluation_mode="manual",
-                bar_count=100,
-            )
-        except Exception as exc:
-            logger.warning("Could not refresh dynamic target context for recommendation %s: %s", symbol, exc)
 
         price = tick.ask if action == "BUY" else tick.bid
         contract_size = sym_info.get("trade_contract_size", 100000)
-        vol_min = sym_info.get("volume_min", 0.01)
-        vol_step = sym_info.get("volume_step", 0.01)
+        vol_min = float(sym_info.get("volume_min", 0.01) or 0.01)
+        vol_step = float(sym_info.get("volume_step", 0.01) or 0.01)
+        vol_max = float(sym_info.get("volume_max", 0.0) or 0.0)
         if price > 0 and contract_size > 0:
-            acct = connector.refresh_account()
-            lev = acct.leverage if acct else 1
-            raw_volume = (req.amount_usd * lev) / (price * contract_size)
-            if vol_step > 0:
-                raw_volume = round(raw_volume / vol_step) * vol_step
-            volume = max(raw_volume, vol_min)
+            volume, estimated_margin = _solve_volume_by_margin_target_fast(
+                symbol=symbol,
+                action=action,
+                target_margin_usd=req.amount_usd,
+                price=price,
+                contract_size=contract_size,
+                vol_min=vol_min,
+                vol_step=vol_step,
+                vol_max=vol_max,
+            )
+            if volume <= 0:
+                min_required = estimated_margin if estimated_margin is not None else 0.0
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Amount too small for this symbol. Minimum required margin is about ${min_required:.2f}.",
+                )
             logger.info(
-                "Converted $%s margin (leverage %sx) to %s lots for %s",
+                "Converted $%s target margin to %s lots for %s (estimated margin=%s)",
                 req.amount_usd,
-                lev,
                 volume,
                 symbol,
+                round(float(estimated_margin), 2) if estimated_margin is not None else None,
             )
             if req.custom_stop_loss is None or req.custom_take_profit is None:
                 sl_amount, tp_amount = await _derive_dynamic_amount_targets(
@@ -3274,6 +4007,23 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
             required_rr=required_rr,
             digits=int(sym_info.get("digits", 5) if sym_info else 5),
         )
+
+    if req.amount_usd and req.amount_usd > 0 and sym_info:
+        desired_sl_amount = sl_amount_for_comment if sl_amount_for_comment and sl_amount_for_comment > 0 else None
+        adjusted_volume, rebalance_error = _rebalance_volume_for_started_amount_risk(
+            entry_price=entry_ref_price,
+            stop_loss=sl,
+            desired_sl_amount_usd=desired_sl_amount,
+            volume=volume,
+            contract_size=float(sym_info.get("trade_contract_size", 100000) or 100000),
+            vol_min=float(sym_info.get("volume_min", 0.01) or 0.01),
+            vol_step=float(sym_info.get("volume_step", 0.01) or 0.01),
+            vol_max=float(sym_info.get("volume_max", 0.0) or 0.0),
+        )
+        if rebalance_error:
+            raise HTTPException(status_code=409, detail=rebalance_error)
+        if adjusted_volume > 0 and adjusted_volume < volume:
+            volume = adjusted_volume
     candidate_signal = current_signal.model_copy(
         update={
             "stop_loss": sl,
@@ -3286,13 +4036,18 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
         candidate_signal=candidate_signal,
         volume=volume,
         reference_spread=context.tick.get("spread", 0.0) if context.tick else 0.0,
-        evaluation_mode="manual",
+        evaluation_mode="scan",
     )
     if not preflight.approved:
         raise HTTPException(status_code=409, detail=preflight.reason)
 
     if preflight.risk_approval and preflight.risk_approval.risk_evaluation.adjusted_volume > 0:
-        volume = preflight.risk_approval.risk_evaluation.adjusted_volume
+        approved_volume = preflight.risk_approval.risk_evaluation.adjusted_volume
+        if req.amount_usd and req.amount_usd > 0:
+            # Preserve started-amount SL/TP semantics; never scale above user-sized volume.
+            volume = min(volume, approved_volume)
+        else:
+            volume = approved_volume
 
     amt_label = _build_trade_comment(req.amount_usd, sl_amount_for_comment, tp_amount_for_comment)
     order_req = OrderRequest(
@@ -3306,42 +4061,73 @@ async def execute_recommendation(req: ExecuteRecommendationRequest):
     result = execution_service.place_order_if_approved(order_req, preflight)
 
     if db:
-        await db.log_order(
-            signal_id=req.signal_id, symbol=symbol, action=action,
-            volume=order_req.volume, price=result.price,
-            stop_loss=sl, take_profit=tp, ticket=result.ticket,
-            retcode=result.retcode, retcode_desc=result.retcode_desc,
-            success=result.success,
-            comment=order_req.comment,
-        )
-        if result.success and result.ticket:
-            await db.log_position_change(
-                result.ticket, "opened", symbol,
-                f"{action} {order_req.volume} lots at {result.price}"
-            )
-            decision = await signal_pipeline.evaluate(
-                symbol=symbol,
-                requested_agent_name=requested_agent_name,
-                requested_timeframe=signal_data.get("timeframe", "H1"),
-                evaluation_mode="manual",
-                bar_count=100,
-            )
-            await _store_management_plan(result.ticket, req.signal_id, symbol, action, decision)
-            await db.mark_evaluation_outcome(req.signal_id, "opened")
-            account = connector.refresh_account() if connector.connected else None
-            await db.mark_trade_candidate_execution(
-                signal_id=req.signal_id,
-                executed=True,
-                ticket=result.ticket,
-                fill_price=result.price,
-                slippage_estimate=0.0,
-                margin_snapshot={
-                    "balance": float(account.balance) if account else 0.0,
-                    "equity": float(account.equity) if account else 0.0,
-                    "margin": float(account.margin) if account else 0.0,
-                    "free_margin": float(account.free_margin) if account else 0.0,
-                },
-            )
+        async def _persist_execute_reco_async():
+            try:
+                await db.log_order(
+                    signal_id=req.signal_id, symbol=symbol, action=action,
+                    volume=order_req.volume, price=result.price,
+                    stop_loss=sl, take_profit=tp, ticket=result.ticket,
+                    retcode=result.retcode, retcode_desc=result.retcode_desc,
+                    success=result.success,
+                    comment=order_req.comment,
+                )
+            except Exception as exc:
+                logger.warning("Execute-recommendation order persistence failed for %s: %s", symbol, exc)
+
+            if result.success and result.ticket:
+                try:
+                    await db.log_position_change(
+                        result.ticket, "opened", symbol,
+                        f"{action} {order_req.volume} lots at {result.price}"
+                    )
+                except Exception as exc:
+                    logger.warning("Execute-recommendation position-change persistence failed for %s #%s: %s", symbol, result.ticket, exc)
+
+                async def _store_plan_async(ticket: int, sid: int, sym: str, side: str, timeframe: str):
+                    try:
+                        decision = await signal_pipeline.evaluate(
+                            symbol=sym,
+                            requested_agent_name=requested_agent_name,
+                            requested_timeframe=timeframe,
+                            evaluation_mode="manual",
+                            bar_count=100,
+                        )
+                        await _store_management_plan(ticket, sid, sym, side, decision)
+                    except Exception as exc:
+                        logger.warning("Background plan generation failed for %s #%s: %s", sym, ticket, exc)
+
+                asyncio.create_task(
+                    _store_plan_async(
+                        result.ticket,
+                        req.signal_id,
+                        symbol,
+                        action,
+                        signal_data.get("timeframe", "H1"),
+                    )
+                )
+                try:
+                    await db.mark_evaluation_outcome(req.signal_id, "opened")
+                except Exception as exc:
+                    logger.warning("Execute-recommendation outcome persistence failed for %s #%s: %s", symbol, result.ticket, exc)
+                try:
+                    account = connector.refresh_account() if connector.connected else None
+                    await db.mark_trade_candidate_execution(
+                        signal_id=req.signal_id,
+                        executed=True,
+                        ticket=result.ticket,
+                        fill_price=result.price,
+                        slippage_estimate=0.0,
+                        margin_snapshot={
+                            "balance": float(account.balance) if account else 0.0,
+                            "equity": float(account.equity) if account else 0.0,
+                            "margin": float(account.margin) if account else 0.0,
+                            "free_margin": float(account.free_margin) if account else 0.0,
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning("Execute-recommendation post-open persistence failed for %s #%s: %s", symbol, result.ticket, exc)
+
+        asyncio.create_task(_persist_execute_reco_async())
 
     return result.model_dump()
 
@@ -3616,8 +4402,8 @@ async def auto_trade_status():
     settings = risk_engine.settings
     service_status = task_orchestrator.status_snapshot()
     if active_platform == "ibkr" and ibkr_connector.connected:
-        account_snapshot = ibkr_connector.refresh_account()
-        positions_snapshot = ibkr_connector.get_positions()
+        account_snapshot = await _run_ibkr(ibkr_connector.refresh_account)
+        positions_snapshot = await _run_ibkr(ibkr_connector.get_positions)
         portfolio_snapshot = signal_pipeline.portfolio_risk_service.snapshot(
             account_snapshot,
             positions_snapshot,
@@ -3638,6 +4424,7 @@ async def auto_trade_status():
             "usd_beta_exposure_pct": 0.0,
             "stocks_equity_exposure_pct": 0.0,
         }
+    gemini_status = _current_gemini_status()
     return {
         "running": auto_trader.is_running,
         "enabled": risk_engine.auto_trade_enabled,
@@ -3652,18 +4439,12 @@ async def auto_trade_status():
         "managed_tickets": list(auto_trader.position_manager.managed_tickets),
         "portfolio": portfolio_snapshot,
         "gemini": {
-            "available": gemini_agent.available,
-            "degraded": bool(
-                gemini_adapter.degraded
-                or getattr(gemini_agent, "degraded", False)
-                or (getattr(gemini_agent, "unavailable_reason", "") and not gemini_agent.available)
-            ),
-            "last_error": (
-                gemini_adapter.last_error
-                or getattr(gemini_agent, "runtime_last_error", "")
-                or (getattr(gemini_agent, "unavailable_reason", "") if not gemini_agent.available else "")
-                or None
-            ),
+            "available": gemini_status.get("available", False),
+            "degraded": gemini_status.get("degraded", False),
+            "last_error": gemini_status.get("last_error"),
+            "state": gemini_status.get("state", "unavailable"),
+            "cooldown_seconds": int(gemini_status.get("cooldown_seconds", 0) or 0),
+            "credits_pct": int(gemini_status.get("credits_pct", 0) or 0),
         },
         "event_providers": {
             "finnhub": finnhub_adapter.healthcheck(),

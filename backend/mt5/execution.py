@@ -2,6 +2,7 @@ import MetaTrader5 as mt5
 import logging
 from typing import Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,52 @@ RETCODE_DESCRIPTIONS = {
 
 
 class ExecutionEngine:
+    def get_recent_commission_by_symbol(
+        self,
+        lookback_days: int = 45,
+    ) -> dict[str, dict]:
+        """
+        Derive effective commission from realized MT5 deals.
+        Returns per-symbol weighted average commission per lot per side.
+        """
+        date_to = datetime.now()
+        date_from = date_to - timedelta(days=max(1, int(lookback_days)))
+        deals = mt5.history_deals_get(date_from, date_to)
+        if deals is None:
+            return {}
+
+        agg: dict[str, dict[str, float]] = {}
+        for deal in deals:
+            symbol = str(getattr(deal, "symbol", "") or "").strip()
+            if not symbol:
+                continue
+            volume = float(getattr(deal, "volume", 0.0) or 0.0)
+            commission = float(getattr(deal, "commission", 0.0) or 0.0)
+            if volume <= 0:
+                continue
+            if abs(commission) <= 0:
+                continue
+            item = agg.setdefault(symbol, {"sum_abs_commission": 0.0, "sum_volume": 0.0, "deals": 0.0})
+            item["sum_abs_commission"] += abs(commission)
+            item["sum_volume"] += volume
+            item["deals"] += 1.0
+
+        out: dict[str, dict] = {}
+        for symbol, item in agg.items():
+            sum_volume = float(item.get("sum_volume", 0.0) or 0.0)
+            if sum_volume <= 0:
+                continue
+            per_lot_side = float(item["sum_abs_commission"]) / sum_volume
+            out[symbol] = {
+                "commission_per_lot_side": round(per_lot_side, 6),
+                "commission_round_turn_per_lot": round(per_lot_side * 2.0, 6),
+                "commission_model": "realized_history",
+                "commission_percent_rate": None,
+                "commission_notional_1lot": None,
+                "commission_samples": int(item.get("deals", 0.0) or 0.0),
+            }
+        return out
+
     def estimate_margin(self, symbol: str, action: str, volume: float, price: Optional[float] = None) -> Optional[float]:
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
@@ -122,6 +169,39 @@ class ExecutionEngine:
             "trade_enabled": getattr(info, "trade_mode", 0) != 0 if info is not None else False,
             "has_tick": tick is not None,
         }
+
+    def get_realized_profit_map(
+        self,
+        position_tickets: list[int],
+        lookback_days: int = 30,
+    ) -> dict[int, float]:
+        tickets = {int(t) for t in position_tickets if t is not None}
+        if not tickets:
+            return {}
+        date_to = datetime.now()
+        date_from = date_to - timedelta(days=max(1, int(lookback_days)))
+        deals = mt5.history_deals_get(date_from, date_to)
+        if deals is None:
+            return {}
+        pnl_by_position: dict[int, float] = {}
+        for deal in deals:
+            pos_id = int(getattr(deal, "position_id", 0) or 0)
+            if pos_id not in tickets:
+                continue
+            profit = float(getattr(deal, "profit", 0.0) or 0.0)
+            commission = float(getattr(deal, "commission", 0.0) or 0.0)
+            swap = float(getattr(deal, "swap", 0.0) or 0.0)
+            fee = float(getattr(deal, "fee", 0.0) or 0.0)
+            pnl_by_position[pos_id] = pnl_by_position.get(pos_id, 0.0) + profit + commission + swap + fee
+        return pnl_by_position
+
+    def get_position_realized_profit(
+        self,
+        position_ticket: int,
+        lookback_days: int = 30,
+    ) -> Optional[float]:
+        pnl_map = self.get_realized_profit_map([position_ticket], lookback_days=lookback_days)
+        return pnl_map.get(int(position_ticket))
 
     def place_order(self, req: OrderRequest) -> OrderResult:
         tick = mt5.symbol_info_tick(req.symbol)

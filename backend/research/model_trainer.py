@@ -26,6 +26,7 @@ class ModelTrainer:
             from sklearn.linear_model import LogisticRegression
             from sklearn.pipeline import Pipeline
             from sklearn.preprocessing import OneHotEncoder
+            from sklearn.model_selection import train_test_split
             import pandas as pd
         except Exception as exc:
             raise RuntimeError(
@@ -37,6 +38,7 @@ class ModelTrainer:
             "Pipeline": Pipeline,
             "ColumnTransformer": ColumnTransformer,
             "OneHotEncoder": OneHotEncoder,
+            "train_test_split": train_test_split,
             "LogisticRegression": LogisticRegression,
             "GradientBoostingClassifier": GradientBoostingClassifier,
         }
@@ -132,6 +134,7 @@ class ModelTrainer:
             Pipeline = libs["Pipeline"]
             ColumnTransformer = libs["ColumnTransformer"]
             OneHotEncoder = libs["OneHotEncoder"]
+            train_test_split = libs["train_test_split"]
             LogisticRegression = libs["LogisticRegression"]
             GradientBoostingClassifier = libs["GradientBoostingClassifier"]
 
@@ -152,6 +155,22 @@ class ModelTrainer:
             train_y = [int(float(r.get(target_column, 0) or 0) >= 0.5) for r in train_rows]
             test_y = [int(float(r.get(target_column, 0) or 0) >= 0.5) for r in test_rows]
             active_target_column = target_column
+            # Time split can produce one-class train sets when positives are sparse/recent.
+            # Fallback to stratified split before downgrading to no_trade_label.
+            if len(set(train_y)) < 2:
+                all_y = [int(float(r.get(target_column, 0) or 0) >= 0.5) for r in rows]
+                if len(set(all_y)) >= 2:
+                    train_rows, test_rows = train_test_split(
+                        rows,
+                        test_size=0.2,
+                        random_state=42,
+                        shuffle=True,
+                        stratify=all_y,
+                    )
+                    train_x = self._build_feature_frame(pd, train_rows, feature_columns)
+                    test_x = self._build_feature_frame(pd, test_rows, feature_columns)
+                    train_y = [int(float(r.get(target_column, 0) or 0) >= 0.5) for r in train_rows]
+                    test_y = [int(float(r.get(target_column, 0) or 0) >= 0.5) for r in test_rows]
             if len(set(train_y)) < 2 and target_column != "no_trade_label":
                 fallback_train_y = [int(float(r.get("no_trade_label", 0) or 0) >= 0.5) for r in train_rows]
                 fallback_test_y = [int(float(r.get("no_trade_label", 0) or 0) >= 0.5) for r in test_rows]

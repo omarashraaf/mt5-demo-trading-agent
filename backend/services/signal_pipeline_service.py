@@ -718,6 +718,7 @@ class SignalPipelineService:
             account_equity=context.account_equity,
             open_positions=context.symbol_open_positions,
             multi_tf_bars=context.bars_by_timeframe,
+            policy_mode=str((context.user_policy or {}).get("mode", "balanced") or "balanced"),
         )
 
     def _apply_gemini_assessment(

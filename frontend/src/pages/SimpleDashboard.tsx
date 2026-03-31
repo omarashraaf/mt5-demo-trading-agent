@@ -1,13 +1,121 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { RefreshCw, AlertOctagon, X, TrendingUp, TrendingDown, Minus, Play, HelpCircle, DollarSign, ShieldCheck, Clock, Zap, Power, CheckCircle, XCircle } from 'lucide-react';
 import { api } from '../utils/api';
-import type { StatusResponse, PositionInfo, Recommendation, OrderResult } from '../types';
+import type { StatusResponse, PositionInfo, Recommendation, OrderResult, TickData } from '../types';
 import ConnectionBar from '../components/ConnectionBar';
 import { getSymbolName, getSymbolEmoji, getSignalStrength, getActionDescription, explainProfitLoss } from '../utils/symbolNames';
 
 interface Props {
   status: StatusResponse | null;
   onRefresh: () => void;
+}
+
+type AvailableSymbolRow = {
+  name: string;
+  description?: string;
+  category?: string;
+  bid?: number;
+  ask?: number;
+  spread?: number;
+};
+
+const MARKET_SELECTION_STORAGE_KEY = 'trading_selected_markets_v2';
+const EGYPT_POPULAR_MARKET_HINTS = [
+  'XAUUSD', 'GOLD',
+  'XAGUSD', 'SILVER',
+  'US30', 'DJ30',
+  'US100', 'NAS100',
+  'US500', 'SP500',
+  'GER40', 'DAX',
+  'UK100', 'FTSE',
+  'WTI', 'BRENT',
+  'AAPL', 'MSFT', 'NVDA', 'TSLA',
+];
+
+const IBKR_EXTRA_MARKET_CATALOG: AvailableSymbolRow[] = [
+  // Indices
+  { name: 'US30', category: 'Indices' },
+  { name: 'US100', category: 'Indices' },
+  { name: 'US500', category: 'Indices' },
+  { name: 'GER40', category: 'Indices' },
+  { name: 'UK100', category: 'Indices' },
+  { name: 'JPN225', category: 'Indices' },
+  { name: 'HK50', category: 'Indices' },
+  { name: 'AUS200', category: 'Indices' },
+  // Commodities
+  { name: 'GOLD', category: 'Commodities' },
+  { name: 'XAUUSD', category: 'Commodities' },
+  { name: 'SILVER', category: 'Commodities' },
+  { name: 'XAGUSD', category: 'Commodities' },
+  { name: 'WTI', category: 'Commodities' },
+  { name: 'BRENT', category: 'Commodities' },
+  { name: 'NATGAS', category: 'Commodities' },
+  { name: 'XPDUSD', category: 'Commodities' },
+  { name: 'XPTUSD', category: 'Commodities' },
+  // US mega-cap & liquid stocks
+  { name: 'AAPL', category: 'Stocks' },
+  { name: 'MSFT', category: 'Stocks' },
+  { name: 'NVDA', category: 'Stocks' },
+  { name: 'TSLA', category: 'Stocks' },
+  { name: 'AMZN', category: 'Stocks' },
+  { name: 'GOOGL', category: 'Stocks' },
+  { name: 'META', category: 'Stocks' },
+  { name: 'AMD', category: 'Stocks' },
+  { name: 'INTC', category: 'Stocks' },
+  { name: 'NFLX', category: 'Stocks' },
+  { name: 'AVGO', category: 'Stocks' },
+  { name: 'ADBE', category: 'Stocks' },
+  { name: 'CRM', category: 'Stocks' },
+  { name: 'ORCL', category: 'Stocks' },
+  { name: 'JPM', category: 'Stocks' },
+  { name: 'BAC', category: 'Stocks' },
+  { name: 'WMT', category: 'Stocks' },
+  { name: 'KO', category: 'Stocks' },
+  { name: 'NKE', category: 'Stocks' },
+  { name: 'PFE', category: 'Stocks' },
+  { name: 'XOM', category: 'Stocks' },
+  { name: 'CVX', category: 'Stocks' },
+  { name: 'DIS', category: 'Stocks' },
+  { name: 'BA', category: 'Stocks' },
+  { name: 'V', category: 'Stocks' },
+  { name: 'MA', category: 'Stocks' },
+  // ETFs (very common)
+  { name: 'SPY', category: 'Stocks' },
+  { name: 'QQQ', category: 'Stocks' },
+  { name: 'DIA', category: 'Stocks' },
+  { name: 'IWM', category: 'Stocks' },
+  { name: 'GLD', category: 'Stocks' },
+  { name: 'SLV', category: 'Stocks' },
+  { name: 'USO', category: 'Stocks' },
+  { name: 'TLT', category: 'Stocks' },
+  { name: 'EEM', category: 'Stocks' },
+  { name: 'XLE', category: 'Stocks' },
+  { name: 'XLF', category: 'Stocks' },
+  { name: 'XLK', category: 'Stocks' },
+];
+
+function mergeUniverseRows(baseRows: AvailableSymbolRow[], extraRows: AvailableSymbolRow[]): AvailableSymbolRow[] {
+  const byName = new Map<string, AvailableSymbolRow>();
+  for (const row of baseRows) {
+    const name = String(row.name || '').trim();
+    if (!name) continue;
+    byName.set(name, row);
+  }
+  for (const row of extraRows) {
+    const name = String(row.name || '').trim();
+    if (!name) continue;
+    if (!byName.has(name)) {
+      byName.set(name, {
+        name,
+        category: row.category || 'Other',
+        description: row.description || `${name} (IBKR catalog)`,
+        bid: row.bid ?? 0,
+        ask: row.ask ?? 0,
+        spread: row.spread ?? 0,
+      });
+    }
+  }
+  return Array.from(byName.values());
 }
 
 function formatPct(value?: number | null) {
@@ -39,8 +147,202 @@ function summarizeGeminiError(error?: string | null) {
   return raw.length > 140 ? `${raw.slice(0, 140)}...` : raw;
 }
 
+function formatUiError(error: unknown) {
+  const raw = String((error as any)?.message || error || '').trim();
+  const lower = raw.toLowerCase();
+  if (!raw) return 'Request failed. Please try again.';
+  if (lower.includes('failed to fetch') || lower.includes('network request failed')) {
+    return 'Backend connection issue. Please wait a few seconds and try again.';
+  }
+  if (lower.includes('timed out') || lower.includes('timeout')) {
+    return 'Request timed out. Please try again.';
+  }
+  if (lower.includes('retrying automatically')) {
+    return 'Backend is reconnecting. Please retry now.';
+  }
+  return raw;
+}
+
+function formatCommissionLabel(rec: Recommendation, currency: string) {
+  const side = rec.commission_per_lot_side;
+  const roundTurn = rec.commission_round_turn_per_lot;
+  const pct = rec.commission_percent_rate;
+  const notional = rec.commission_notional_1lot;
+  const model = String(rec.commission_model || '').toLowerCase();
+  const samples = typeof rec.commission_samples === 'number' ? rec.commission_samples : null;
+
+  if (typeof side === 'number' && side > 0) {
+    const rtText = typeof roundTurn === 'number' ? ` • ${currency} ${roundTurn.toFixed(2)} round-turn` : '';
+    const src = model === 'realized_history' && samples && samples > 0
+      ? ` • from ${samples} closed deal(s)`
+      : '';
+    return `Commission: ${currency} ${side.toFixed(2)} / lot / side${rtText}${src}`;
+  }
+  if (model === 'percent_notional' && typeof pct === 'number' && pct > 0) {
+    const sideEstimate = typeof notional === 'number' && notional > 0 ? (notional * pct) / 100 : null;
+    const estText = typeof sideEstimate === 'number' ? ` (~${currency} ${sideEstimate.toFixed(2)} / side)` : '';
+    return `Commission: ${pct.toFixed(4)}% of notional${estText}`;
+  }
+  if (model === 'ibkr_not_implemented') {
+    return 'Commission: broker-side model (not available in current feed)';
+  }
+  return 'Commission: unknown from broker feed (will auto-learn after first closed trade)';
+}
+
+function formatCooldown(seconds?: number | null) {
+  const s = Math.max(0, Math.floor(Number(seconds || 0)));
+  if (s <= 0) return '0s';
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m <= 0) return `${s}s`;
+  if (m < 60) return `${m}m ${rem}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return `${h}h ${rm}m`;
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pickEgyptPopularSymbols(allSymbols: AvailableSymbolRow[]): string[] {
+  const uniqueByName = new Map<string, AvailableSymbolRow>();
+  for (const row of allSymbols) {
+    const name = String(row.name || '').trim();
+    if (!name) continue;
+    if (!uniqueByName.has(name)) uniqueByName.set(name, row);
+  }
+  const names = Array.from(uniqueByName.keys());
+  const upperNames = names.map((n) => n.toUpperCase());
+
+  const picked: string[] = [];
+  for (const hint of EGYPT_POPULAR_MARKET_HINTS) {
+    const idx = upperNames.findIndex((n) => n === hint || n.includes(hint));
+    if (idx >= 0) {
+      const sym = names[idx];
+      if (!picked.includes(sym)) picked.push(sym);
+    }
+  }
+
+  // Keep a minimum default set so first-time users never see an almost-empty list.
+  if (picked.length < 12) {
+    const fallback = allSymbols
+      .filter((s) => ['Commodities', 'Indices', 'Stocks'].includes(String(s.category || 'Other')))
+      .slice(0, 24)
+      .map((s) => String(s.name || '').trim())
+      .filter(Boolean);
+    for (const sym of fallback) {
+      if (!picked.includes(sym)) picked.push(sym);
+      if (picked.length >= 18) break;
+    }
+  }
+
+  return picked;
+}
+
+function pickIbkrPopularSymbols(allSymbols: AvailableSymbolRow[]): string[] {
+  // Prefer liquid US symbols/ETFs that reliably resolve on IBKR accounts.
+  const ibkrHints = [
+    'AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'GOOGL', 'META', 'AMD',
+    'SPY', 'QQQ', 'DIA', 'IWM', 'GLD', 'SLV', 'XOM', 'CVX', 'JPM', 'BAC',
+  ];
+  const uniqueByName = new Map<string, AvailableSymbolRow>();
+  for (const row of allSymbols) {
+    const name = String(row.name || '').trim();
+    if (!name) continue;
+    if (!uniqueByName.has(name)) uniqueByName.set(name, row);
+  }
+  const names = Array.from(uniqueByName.keys());
+  const upperNames = names.map((n) => n.toUpperCase());
+  const picked: string[] = [];
+  for (const hint of ibkrHints) {
+    const idx = upperNames.findIndex((n) => n === hint || n.includes(hint));
+    if (idx >= 0) {
+      const sym = names[idx];
+      if (!picked.includes(sym)) picked.push(sym);
+    }
+  }
+  if (picked.length < 10) {
+    const fallback = allSymbols
+      .filter((s) => ['Stocks', 'Indices'].includes(String(s.category || 'Other')))
+      .slice(0, 24)
+      .map((s) => String(s.name || '').trim())
+      .filter(Boolean);
+    for (const sym of fallback) {
+      if (!picked.includes(sym)) picked.push(sym);
+      if (picked.length >= 16) break;
+    }
+  }
+  return picked;
+}
+
+const MAX_UI_SYMBOL_ROWS = 400;
+const MAX_MT5_SCAN_SYMBOLS = 30;
+const MAX_IBKR_SCAN_SYMBOLS = 8;
+
+function normalizeIbkrSymbolAlias(symbol: string): string {
+  const raw = String(symbol || '').trim().toUpperCase();
+  const aliases: Record<string, string> = {
+    US500: 'SPY',
+    SPX500: 'SPY',
+    US100: 'QQQ',
+    NAS100: 'QQQ',
+    US30: 'DIA',
+    DJ30: 'DIA',
+    GER40: 'EWG',
+    DAX40: 'EWG',
+    UK100: 'EWU',
+    FTSE100: 'EWU',
+    GOLD: 'GLD',
+    XAUUSD: 'GLD',
+    SILVER: 'SLV',
+    XAGUSD: 'SLV',
+    WTI: 'USO',
+    USOIL: 'USO',
+    XTIUSD: 'USO',
+    BRENT: 'BNO',
+    UKOIL: 'BNO',
+    XBRUSD: 'BNO',
+  };
+  return aliases[raw] || raw;
+}
+
+function createPendingRecommendation(symbol: AvailableSymbolRow): Recommendation {
+  const bid = Number(symbol.bid || 0);
+  const ask = Number(symbol.ask || 0);
+  const entry = bid > 0 && ask > 0 ? (bid + ask) / 2 : Math.max(bid, ask, 0);
+  return {
+    symbol: String(symbol.name || ''),
+    category: String(symbol.category || 'Other'),
+    signal: {
+      action: 'HOLD',
+      confidence: 0,
+      stop_loss: null,
+      take_profit: null,
+      max_holding_minutes: null,
+      reason: 'Waiting for scan.',
+    },
+    signal_id: null,
+    risk_decision: {
+      approved: false,
+      reason: 'Pending analysis.',
+      adjusted_volume: 0,
+      warnings: [],
+      status: 'warn',
+      machine_reasons: [],
+      metrics_snapshot: {},
+    },
+    entry_price_estimate: entry,
+    explanation: 'Pending scan for this market. Click "Scan All" to evaluate it.',
+    ready_to_execute: false,
+    degraded_reasons: [],
+    execution_reason: 'Pending analysis.',
+  };
+}
+
 // Beginner-friendly recommendation card
-function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecuted: () => void; currency: string }) {
+function TradeCard({ rec, onExecuted, currency, liveTick }: { rec: Recommendation; onExecuted: () => Promise<void> | void; currency: string; liveTick?: TickData }) {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<OrderResult | null>(null);
   const [dismissed, setDismissed] = useState(false);
@@ -102,10 +404,10 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
       const res = await api.executeRecommendation(rec.signal_id, amountNum, slPrice, tpPrice);
       setResult(res);
       setShowAmountInput(false);
-      onExecuted();
+      void onExecuted();
     } catch (e: any) {
       setResult({
-        success: false, retcode: -1, retcode_desc: e.message,
+        success: false, retcode: -1, retcode_desc: formatUiError(e),
         ticket: null, volume: null, price: null,
         stop_loss: null, take_profit: null, comment: '',
       });
@@ -114,22 +416,8 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
     }
   };
 
-  // Live tick data
-  const [bid, setBid] = useState<number | null>(null);
-  const [ask, setAsk] = useState<number | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const fetchTick = async () => {
-      try {
-        const tick = await api.getTick(rec.symbol);
-        if (!cancelled) { setBid(tick.bid); setAsk(tick.ask); }
-      } catch {}
-    };
-    fetchTick();
-    const t = setInterval(fetchTick, 15000);
-    return () => { cancelled = true; clearInterval(t); };
-  }, [rec.symbol]);
+  const bid = liveTick?.bid ?? null;
+  const ask = liveTick?.ask ?? null;
 
   const isBuy = rec.signal.action === 'BUY';
   const isSell = rec.signal.action === 'SELL';
@@ -141,6 +429,12 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
     ? rec.trade_quality.final_trade_quality_score
     : (rec.signal.confidence || 0);
   const qualityThreshold = rec.trade_quality?.threshold ?? 0;
+  const suggestedAmount = rec.ready_to_execute && rec.recommended_amount_usd && rec.recommended_amount_usd > 0
+    ? Math.round(rec.recommended_amount_usd)
+    : null;
+  const suggestedPct = rec.ready_to_execute && rec.recommended_amount_pct_free_margin && rec.recommended_amount_pct_free_margin > 0
+    ? rec.recommended_amount_pct_free_margin
+    : null;
   const blockReasons = compactReasons(
     [
       ...(rec.trade_quality?.no_trade_reasons || []),
@@ -256,6 +550,9 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
           </div>
         )}
       </div>
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+        {formatCommissionLabel(rec, currency)}
+      </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 12 }}>
         <div style={{ background: 'var(--bg-primary)', borderRadius: 8, padding: '10px 12px' }}>
@@ -362,11 +659,14 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
           }
         </div>
       ) : !showAmountInput ? (
-        <div className="flex gap-3">
-          <button
-            className="btn btn-success"
-            onClick={() => {
+      <div className="flex gap-3">
+        <button
+          className="btn btn-success"
+          onClick={() => {
               setShowAmountInput(true);
+              if (suggestedAmount && !amount) {
+                void handleAmountChange(String(suggestedAmount));
+              }
             }}
             style={{ fontSize: 15, padding: '12px 28px', fontWeight: 600 }}
           >
@@ -391,6 +691,12 @@ function TradeCard({ rec, onExecuted, currency }: { rec: Recommendation; onExecu
           <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>
             How much do you want to invest? ({currency})
           </div>
+          {suggestedAmount && (
+            <div style={{ fontSize: 12, color: 'var(--accent-blue)', marginBottom: 10 }}>
+              AI suggested amount: <span style={{ fontWeight: 700 }}>${suggestedAmount}</span>
+              {suggestedPct ? ` (${suggestedPct.toFixed(2)}% of free margin)` : ''}
+            </div>
+          )}
 
           {/* Preset amounts */}
           <div className="flex gap-2" style={{ marginBottom: 12, flexWrap: 'wrap' }}>
@@ -554,9 +860,12 @@ function PositionCard({ position, currency, onClose, leverage = 100 }: { positio
     const distance = Math.abs(position.price_open - priceLevel);
     return distance * position.volume * contractSize;
   };
-  const commentAmount = position.comment?.match(/TA:\$(\d+(?:\.\d+)?)/)?.[1];
-  const commentSlAmount = position.comment?.match(/SLA:\$(\d+(?:\.\d+)?)/)?.[1];
-  const commentTpAmount = position.comment?.match(/TPA:\$(\d+(?:\.\d+)?)/)?.[1];
+  const amountMatch = position.comment?.match(/TA:\$(\d+(?:\.\d+)?)|TA(\d+(?:\.\d+)?)/i);
+  const slMatch = position.comment?.match(/SLA:\$(\d+(?:\.\d+)?)|SLA(\d+(?:\.\d+)?)/i);
+  const tpMatch = position.comment?.match(/TPA:\$(\d+(?:\.\d+)?)|TPA(\d+(?:\.\d+)?)/i);
+  const commentAmount = amountMatch ? (amountMatch[1] || amountMatch[2]) : undefined;
+  const commentSlAmount = slMatch ? (slMatch[1] || slMatch[2]) : undefined;
+  const commentTpAmount = tpMatch ? (tpMatch[1] || tpMatch[2]) : undefined;
   const slDollars = commentSlAmount ? parseFloat(commentSlAmount) : (position.stop_loss > 0 ? calcDollarDistance(position.stop_loss) : null);
   const tpDollars = commentTpAmount ? parseFloat(commentTpAmount) : (position.take_profit > 0 ? calcDollarDistance(position.take_profit) : null);
 
@@ -708,7 +1017,7 @@ function PositionCard({ position, currency, onClose, leverage = 100 }: { positio
 }
 
 // Compact market row with Buy button for any symbol
-function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation; currency: string; onExecuted: () => void; isLast: boolean }) {
+function MarketRow({ rec, currency, onExecuted, isLast, liveTick }: { rec: Recommendation; currency: string; onExecuted: () => Promise<void> | void; isLast: boolean; liveTick?: TickData }) {
   const [expanded, setExpanded] = useState(false);
   const [amount, setAmount] = useState('');
   const [loading, setLoading] = useState(false);
@@ -725,9 +1034,8 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
   const digits = price < 50 ? 5 : 2;
   const minSlTp = volumeInfo?.min_sl_tp_dollars || 0;
 
-  // Fetch live tick data on demand.
-  const [bid, setBid] = useState<number | null>(null);
-  const [ask, setAsk] = useState<number | null>(null);
+  const bid = liveTick?.bid ?? null;
+  const ask = liveTick?.ask ?? null;
 
   // Reset state when symbol changes (React may reuse component for different rec)
   const prevSymbol = useRef(rec.symbol);
@@ -740,23 +1048,7 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
       setAmount('');
       setResult(null);
       setVolumeInfo(null);
-      setBid(null);
-      setAsk(null);
     }
-  }, [rec.symbol]);
-
-  // Refresh tick in the row so collapsed lists don't look permanently "Loading...".
-  useEffect(() => {
-    let cancelled = false;
-    const fetchTick = async () => {
-      try {
-        const tick = await api.getTick(rec.symbol);
-        if (!cancelled) { setBid(tick.bid); setAsk(tick.ask); }
-      } catch {}
-    };
-    fetchTick();
-    const t = setInterval(fetchTick, 15000);
-    return () => { cancelled = true; clearInterval(t); };
   }, [rec.symbol]);
 
   const name = getSymbolName(rec.symbol);
@@ -770,6 +1062,12 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
       : (rec.signal.confidence || 0)
   ) * 100);
   const qualityThreshold = Math.round((rec.trade_quality?.threshold || 0) * 100);
+  const suggestedAmount = rec.ready_to_execute && rec.recommended_amount_usd && rec.recommended_amount_usd > 0
+    ? Math.round(rec.recommended_amount_usd)
+    : null;
+  const suggestedPct = rec.ready_to_execute && rec.recommended_amount_pct_free_margin && rec.recommended_amount_pct_free_margin > 0
+    ? rec.recommended_amount_pct_free_margin
+    : null;
   const holdReasons = compactReasons(
     [
       ...(rec.trade_quality?.no_trade_reasons || []),
@@ -827,9 +1125,9 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
     try {
       const res = await api.quickBuy(rec.symbol, num, slNum, tpNum, manualAction);
       setResult(res);
-      if (res.success) onExecuted();
+      if (res.success) void onExecuted();
     } catch (e: any) {
-      setResult({ success: false, retcode: -1, retcode_desc: e.message, ticket: null, volume: null, price: null, stop_loss: null, take_profit: null, comment: '' });
+      setResult({ success: false, retcode: -1, retcode_desc: formatUiError(e), ticket: null, volume: null, price: null, stop_loss: null, take_profit: null, comment: '' });
     } finally {
       setLoading(false);
     }
@@ -837,7 +1135,11 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
 
   const handleExpand = () => {
     if (!result) {
-      setExpanded(!expanded);
+      const next = !expanded;
+      setExpanded(next);
+      if (next && suggestedAmount && !amount) {
+        void handleAmountChange(String(suggestedAmount));
+      }
     }
   };
 
@@ -882,8 +1184,8 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
           </span>
         </div>
 
-        <div style={{ width: 72, textAlign: 'right', fontSize: 10, fontWeight: 700, color: qualityScore >= qualityThreshold ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-          Q {qualityScore}%
+        <div style={{ width: 72, textAlign: 'right', fontSize: 10, fontWeight: 700, color: pendingEvaluation ? 'var(--text-muted)' : (qualityScore >= qualityThreshold ? 'var(--accent-green)' : 'var(--accent-red)') }}>
+          {pendingEvaluation ? 'Q --' : `Q ${qualityScore}%`}
         </div>
 
         {result ? (
@@ -941,6 +1243,9 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{rec.gemini_confirmation?.news_bias || 'technical only'}</div>
             </div>
           </div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+            {formatCommissionLabel(rec, currency)}
+          </div>
 
           {/* Buy/Sell Toggle */}
           <div className="flex items-center gap-1 mb-2">
@@ -963,6 +1268,12 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
             )}
           </div>
           {/* Amount row */}
+          {suggestedAmount && (
+            <div style={{ fontSize: 10, color: 'var(--accent-blue)', marginBottom: 6 }}>
+              AI suggested amount: <span style={{ fontWeight: 700 }}>${suggestedAmount}</span>
+              {suggestedPct ? ` (${suggestedPct.toFixed(2)}% free margin)` : ''}
+            </div>
+          )}
           <div className="flex items-center gap-2" style={{ flexWrap: 'wrap' }}>
             {[10, 25, 50, 100].map((preset) => (
               <button
@@ -1048,6 +1359,13 @@ function MarketRow({ rec, currency, onExecuted, isLast }: { rec: Recommendation;
 
 export default function SimpleDashboard({ status, onRefresh }: Props) {
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
+  const [allSymbols, setAllSymbols] = useState<AvailableSymbolRow[]>([]);
+  const [selectedMarketSymbols, setSelectedMarketSymbols] = useState<string[]>([]);
+  const [marketDraftSymbols, setMarketDraftSymbols] = useState<string[]>([]);
+  const [showMarketSelector, setShowMarketSelector] = useState(false);
+  const [marketSearch, setMarketSearch] = useState('');
+  const [availableMarketCount, setAvailableMarketCount] = useState(0);
+  const [liveTicks, setLiveTicks] = useState<Record<string, TickData>>({});
   const [analyzedCount, setAnalyzedCount] = useState(0);
   const [positions, setPositions] = useState<PositionInfo[]>([]);
   const [scanning, setScanning] = useState(false);
@@ -1074,7 +1392,11 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
     available: status?.gemini_available ?? false,
     degraded: status?.gemini_degraded ?? false,
     last_error: status?.gemini_last_error ?? null,
+    state: status?.gemini_state ?? ((status?.gemini_degraded ?? false) ? 'degraded' : (status?.gemini_available ? 'available' : 'unavailable')),
+    cooldown_seconds: status?.gemini_cooldown_seconds ?? 0,
+    credits_pct: status?.gemini_credits_pct ?? ((status?.gemini_available ?? false) ? 100 : 0),
   });
+  const geminiLiveRef = useRef(false);
 
   const connected = status?.connected ?? false;
   const account = status?.account;
@@ -1082,11 +1404,48 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   const geminiErrorSummary = summarizeGeminiError(geminiState.last_error);
 
   useEffect(() => {
+    try {
+      const raw = localStorage.getItem(MARKET_SELECTION_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const cleaned = parsed.map((x) => String(x || '').trim()).filter(Boolean);
+        if (cleaned.length > 0) setSelectedMarketSymbols(cleaned);
+      }
+    } catch {
+      // ignore malformed local cache
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!showMarketSelector) return;
+    const popular = status?.platform === 'ibkr'
+      ? pickIbkrPopularSymbols(allSymbols)
+      : pickEgyptPopularSymbols(allSymbols);
+    const base = selectedMarketSymbols.length > 0 ? selectedMarketSymbols : popular;
+    setMarketDraftSymbols(base);
+  }, [showMarketSelector, selectedMarketSymbols, allSymbols, status?.platform]);
+
+  useEffect(() => {
     if (status?.portfolio) setPortfolioSnapshot(status.portfolio);
-    setGeminiState({
-      available: status?.gemini_available ?? false,
-      degraded: status?.gemini_degraded ?? false,
-      last_error: status?.gemini_last_error ?? null,
+    // Avoid oscillation between /status (app-level poll) and /auto-trade/status (dashboard poll).
+    // Once we have live dashboard Gemini telemetry, keep it as the source of truth.
+    if (geminiLiveRef.current) return;
+    setGeminiState((prev) => {
+      const available = status?.gemini_available ?? prev.available;
+      const degraded = status?.gemini_degraded ?? prev.degraded;
+      const state = status?.gemini_state
+        ?? (degraded ? 'degraded' : (available ? 'available' : 'unavailable'));
+      const cooldown = toFiniteNumber(status?.gemini_cooldown_seconds);
+      const credits = toFiniteNumber(status?.gemini_credits_pct);
+      return {
+        available,
+        degraded,
+        last_error: status?.gemini_last_error ?? prev.last_error ?? null,
+        state,
+        cooldown_seconds: cooldown ?? prev.cooldown_seconds ?? 0,
+        credits_pct: credits ?? prev.credits_pct ?? (available ? 100 : 0),
+      };
     });
   }, [status]);
 
@@ -1098,69 +1457,127 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
     } catch {}
   }, [connected]);
 
+  const refreshPositionsBurst = useCallback(async () => {
+    // Make manual trade feedback feel immediate: refresh rapidly for a short window.
+    await refreshPositions();
+    for (let i = 0; i < 6; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await refreshPositions();
+    }
+  }, [refreshPositions]);
 
-  const scanMarkets = useCallback(async () => {
+  const saveSelectedMarkets = useCallback((symbols: string[]) => {
+    const unique = Array.from(new Set(symbols.map((s) => String(s || '').trim()).filter(Boolean)));
+    setSelectedMarketSymbols(unique);
+    localStorage.setItem(MARKET_SELECTION_STORAGE_KEY, JSON.stringify(unique));
+  }, []);
+
+
+  const scanMarkets = useCallback(async (symbolsOverride?: string[]) => {
     if (!connected || scanningRef.current) return;
     scanningRef.current = true;
     setScanning(true);
     setError('');
     try {
-      const available = await api.getAvailableSymbols(undefined, true);
-      const allMt5Symbols = Object.values(available.categories || {}).flat();
-      const baseList: Recommendation[] = [];
-      const seen = new Set<string>();
-
-      for (const sym of allMt5Symbols) {
-        baseList.push({
-          symbol: sym.name,
-          signal: {
-            action: 'HOLD',
-            confidence: 0,
-            stop_loss: null,
-            take_profit: null,
-            max_holding_minutes: null,
-            reason: 'Waiting for full analysis in the next scan cycle.',
-          },
-          signal_id: null,
-          risk_decision: {
-            approved: false,
-            reason: 'Not evaluated in this scan cycle yet.',
-            adjusted_volume: 0,
-            warnings: [],
-            status: 'warn',
-            machine_reasons: [],
-            metrics_snapshot: {},
-          },
-          entry_price_estimate: sym.ask || sym.bid || 0,
-          explanation: sym.description || `${sym.name} available on MT5`,
-          ready_to_execute: false,
-          category: sym.category,
-          description: sym.description,
-          execution_reason: 'Not evaluated in this scan window yet.',
-        });
-        seen.add(sym.name);
+      let availableTotal = 0;
+      let fullUniverse = allSymbols;
+      if (!fullUniverse || fullUniverse.length === 0 || !!symbolsOverride) {
+        const available = await api.getAvailableSymbols(undefined, false);
+        availableTotal = Number(available.total || 0);
+        const brokerSymbols = Object.values(available.categories || {}).flat() as AvailableSymbolRow[];
+        fullUniverse = (status?.platform === 'ibkr')
+          ? mergeUniverseRows(brokerSymbols, IBKR_EXTRA_MARKET_CATALOG)
+          : brokerSymbols;
       }
-      setRecommendations(baseList);
+      setAvailableMarketCount(fullUniverse.length || availableTotal || 0);
+      setAllSymbols(fullUniverse);
+      setRecommendations([]);
       setAnalyzedCount(0);
       setLastScan(Date.now() / 1000);
 
       // Fast opportunity scan: score a focused subset first to avoid very long cycles.
-      const categoryPriority: Record<string, number> = {
-        Commodities: 0,
-        Indices: 1,
-        Stocks: 2,
-      };
-      const symbolsForAi = allMt5Symbols
-        .filter((s) => Number(s.bid || 0) > 0 && Number(s.ask || 0) > 0)
-        .sort((a, b) => {
-          const catA = categoryPriority[a.category || 'Stocks'] ?? 3;
-          const catB = categoryPriority[b.category || 'Stocks'] ?? 3;
-          if (catA !== catB) return catA - catB;
-          return Number(a.spread || 0) - Number(b.spread || 0);
-        })
-        .slice(0, 24)
+      const mode = String(status?.user_policy?.mode || 'balanced').toLowerCase();
+      const categoryPriority: Record<string, number> = mode === 'aggressive'
+        ? { Indices: 0, Commodities: 1, Stocks: 2, Forex: 3, Other: 4 }
+        : mode === 'safe'
+          ? { Stocks: 0, Indices: 1, Commodities: 2, Forex: 3, Other: 4 }
+          : { Commodities: 0, Indices: 1, Stocks: 2, Forex: 3, Other: 4 };
+
+      const symbolByName = new Map<string, AvailableSymbolRow>();
+      for (const row of fullUniverse) {
+        const name = String(row.name || '').trim();
+        if (!name) continue;
+        symbolByName.set(name, row);
+      }
+
+      const defaultPopular = status?.platform === 'ibkr'
+        ? pickIbkrPopularSymbols(fullUniverse)
+        : pickEgyptPopularSymbols(fullUniverse);
+      const selectedInputRaw = (symbolsOverride && symbolsOverride.length > 0)
+        ? symbolsOverride
+        : (selectedMarketSymbols.length > 0 ? selectedMarketSymbols : defaultPopular);
+      const selectedInput = status?.platform === 'ibkr'
+        ? selectedInputRaw.map((sym) => normalizeIbkrSymbolAlias(sym))
+        : selectedInputRaw;
+      const selectedNow = selectedInput
+        .filter((sym) => symbolByName.has(sym));
+      if (status?.platform === 'ibkr' && selectedNow.length > 0) {
+        const savedRaw = selectedMarketSymbols.map((sym) => String(sym || '').trim().toUpperCase());
+        const savedNormalized = selectedNow.map((sym) => String(sym || '').trim().toUpperCase());
+        if (savedRaw.join(',') !== savedNormalized.join(',')) {
+          saveSelectedMarkets(selectedNow);
+        }
+      } else if (selectedMarketSymbols.length === 0 && defaultPopular.length > 0) {
+        saveSelectedMarkets(defaultPopular);
+      }
+
+      const selectedRowsAll = selectedNow
+        .map((sym) => symbolByName.get(sym))
+        .filter(Boolean) as AvailableSymbolRow[];
+      const selectedRows = selectedRowsAll.slice(0, MAX_UI_SYMBOL_ROWS);
+      const liveSymbols = selectedRows.filter((s) => Number(s.bid || 0) > 0 && Number(s.ask || 0) > 0);
+
+      const byCategory = new Map<string, Array<any>>();
+      for (const item of liveSymbols) {
+        const cat = String(item.category || 'Other');
+        const bucket = byCategory.get(cat) || [];
+        bucket.push(item);
+        byCategory.set(cat, bucket);
+      }
+      for (const bucket of byCategory.values()) {
+        bucket.sort((a, b) => Number(a.spread || 0) - Number(b.spread || 0));
+      }
+
+      // Keep broad market representation; avoid one-category dominance.
+      const targetCount = Math.max(20, Math.min(120, selectedRows.length || 60));
+      const categoryOrder = Array.from(byCategory.keys()).sort(
+        (a, b) => (categoryPriority[a] ?? 99) - (categoryPriority[b] ?? 99),
+      );
+      const perCategoryCap = mode === 'aggressive' ? 20 : 16;
+      const selected: Array<any> = [];
+      const used = new Set<string>();
+
+      let added = true;
+      while (selected.length < targetCount && added) {
+        added = false;
+        for (const cat of categoryOrder) {
+          const bucket = byCategory.get(cat) || [];
+          const takenInCat = selected.filter((x) => String(x.category || 'Other') === cat).length;
+          if (takenInCat >= perCategoryCap) continue;
+          const next = bucket.find((x) => !used.has(String(x.name || '')));
+          if (!next) continue;
+          selected.push(next);
+          used.add(String(next.name || ''));
+          added = true;
+          if (selected.length >= targetCount) break;
+        }
+      }
+
+      const scanLimit = status?.platform === 'ibkr' ? MAX_IBKR_SCAN_SYMBOLS : MAX_MT5_SCAN_SYMBOLS;
+      const symbolsForAi = (selected.length > 0 ? selected : selectedRows)
         .map((s) => s.name)
-        .filter(Boolean);
+        .filter(Boolean)
+        .slice(0, scanLimit);
 
       const result = await Promise.race([
         api.smartEvaluate(symbolsForAi),
@@ -1168,35 +1585,40 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
           setTimeout(() => reject(new Error('AI scan timeout')), 25000),
         ),
       ]);
-      const scanned = result.recommendations || [];
+      const scanned = (result.recommendations || []).map((r) => ({
+        ...r,
+        category: r.category || symbolByName.get(r.symbol)?.category || 'Other',
+      }));
       setAnalyzedCount(scanned.length);
       if (result.scanned_at) setLastScan(result.scanned_at);
+      const scannedBySymbol = new Map<string, Recommendation>();
+      scanned.forEach((rec) => scannedBySymbol.set(String(rec.symbol || '').toUpperCase(), rec));
 
-      const mergedMap = new Map(baseList.map((rec) => [rec.symbol, rec]));
-      for (const rec of scanned) {
-        const previous = mergedMap.get(rec.symbol);
-        mergedMap.set(rec.symbol, {
-          ...(previous || rec),
-          ...rec,
-          category: rec.category || previous?.category,
-          description: rec.description || previous?.description,
-        });
-      }
-      setRecommendations(Array.from(mergedMap.values()));
+      const mergedRecommendations = selectedRows.map((row) => {
+        const key = String(row.name || '').toUpperCase();
+        return scannedBySymbol.get(key) || createPendingRecommendation(row);
+      });
+      setRecommendations(mergedRecommendations);
     } catch (e: any) {
-      // Keep full MT5 list visible even when AI scoring times out.
-      if (!String(e?.message || '').toLowerCase().includes('timeout')) {
-        setError(e.message);
+      // Keep full MT5 list visible even when AI scoring degrades.
+      const msg = String(e?.message || '');
+      const lower = msg.toLowerCase();
+      if (
+        !lower.includes('timeout')
+        && !lower.includes('failed to fetch')
+        && !lower.includes('retrying automatically')
+      ) {
+        setError(msg);
       }
     } finally {
       scanningRef.current = false;
       setScanning(false);
     }
-  }, [connected]);
+  }, [connected, status?.platform, status?.user_policy?.mode, selectedMarketSymbols, saveSelectedMarkets, allSymbols]);
 
   useEffect(() => {
     refreshPositions();
-    const t = setInterval(refreshPositions, 10000);
+    const t = setInterval(refreshPositions, 5000);
     return () => clearInterval(t);
   }, [refreshPositions]);
 
@@ -1204,7 +1626,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   useEffect(() => {
     if (connected) {
       scanMarkets();
-      const t = setInterval(scanMarkets, 120000);
+      const t = setInterval(scanMarkets, 300000);
       return () => clearInterval(t);
     }
   }, [connected, scanMarkets]);
@@ -1218,7 +1640,26 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       setAutoTradeLogs(st.recent_trades);
       setPosManagerRunning(st.position_manager_running ?? false);
       setPortfolioSnapshot(st.portfolio || null);
-      setGeminiState(st.gemini || { available: false, degraded: false, last_error: null });
+      if (st.gemini) {
+        geminiLiveRef.current = true;
+      }
+      setGeminiState((prev) => {
+        const g = st.gemini || {};
+        const available = (g as any).available ?? prev.available;
+        const degraded = (g as any).degraded ?? prev.degraded;
+        const state = (g as any).state
+          ?? (degraded ? 'degraded' : (available ? 'available' : prev.state || 'unavailable'));
+        const cooldown = toFiniteNumber((g as any).cooldown_seconds);
+        const credits = toFiniteNumber((g as any).credits_pct);
+        return {
+          available,
+          degraded,
+          last_error: (g as any).last_error ?? prev.last_error ?? null,
+          state,
+          cooldown_seconds: cooldown ?? prev.cooldown_seconds ?? 0,
+          credits_pct: credits ?? prev.credits_pct ?? (available ? 100 : 0),
+        };
+      });
     } catch {}
   }, [connected]);
 
@@ -1259,7 +1700,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
         setAutoTradeRunning(true);
       }
     } catch (e: any) {
-      setError(e.message);
+      setError(formatUiError(e));
     } finally {
       setAutoTradeLoading(false);
     }
@@ -1270,7 +1711,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       await api.closePosition(ticket);
       refreshPositions();
     } catch (e: any) {
-      setError(e.message);
+      setError(formatUiError(e));
     }
   };
 
@@ -1334,7 +1775,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       refreshPositions();
       onRefresh();
     } catch (e: any) {
-      setError(e.message);
+      setError(formatUiError(e));
     } finally {
       setClosingAll(false);
     }
@@ -1342,13 +1783,60 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
 
   const totalProfit = positions.reduce((s, p) => s + p.profit, 0);
 
+  const draftMarketSet = useMemo(() => new Set(marketDraftSymbols), [marketDraftSymbols]);
+  const defaultPopularSymbols = useMemo(() => pickEgyptPopularSymbols(allSymbols), [allSymbols]);
+  const marketSelectorRows = useMemo(() => {
+    const term = marketSearch.trim().toLowerCase();
+    const rows = [...allSymbols];
+    rows.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    if (!term) return rows;
+    return rows.filter((row) => {
+      const n = String(row.name || '').toLowerCase();
+      const d = String(row.description || '').toLowerCase();
+      const c = String(row.category || '').toLowerCase();
+      return n.includes(term) || d.includes(term) || c.includes(term);
+    });
+  }, [allSymbols, marketSearch]);
+
+  const setMarketSymbolChecked = (symbol: string, checked: boolean) => {
+    if (!symbol) return;
+    const base = marketDraftSymbols.length > 0
+      ? [...marketDraftSymbols]
+      : [...defaultPopularSymbols];
+    const has = base.includes(symbol);
+    if (checked && !has) {
+      setMarketDraftSymbols([...base, symbol]);
+      return;
+    }
+    if (!checked && has) {
+      setMarketDraftSymbols(base.filter((s) => s !== symbol));
+    }
+  };
+
+  const resetToEgyptPopular = () => {
+    const popular = pickEgyptPopularSymbols(allSymbols);
+    setMarketDraftSymbols(popular);
+  };
+
   // Category filter
-  const filteredRecs = selectedCategory === 'All'
-    ? recommendations
-    : recommendations.filter((r) => (r.category || 'Other') === selectedCategory);
-  const actionableRecs = filteredRecs.filter((r) => r.signal.action === 'BUY' || r.signal.action === 'SELL');
-  const holdRecs = filteredRecs.filter((r) => r.signal.action === 'HOLD');
-  const visibleHoldRecs = holdRecs.slice(0, visibleMarketRows);
+  const filteredRecs = useMemo(
+    () => (selectedCategory === 'All'
+      ? recommendations
+      : recommendations.filter((r) => (r.category || 'Other') === selectedCategory)),
+    [selectedCategory, recommendations],
+  );
+  const actionableRecs = useMemo(
+    () => filteredRecs.filter((r) => r.signal.action === 'BUY' || r.signal.action === 'SELL'),
+    [filteredRecs],
+  );
+  const holdRecs = useMemo(
+    () => filteredRecs.filter((r) => r.signal.action === 'HOLD'),
+    [filteredRecs],
+  );
+  const visibleHoldRecs = useMemo(
+    () => holdRecs.slice(0, visibleMarketRows),
+    [holdRecs, visibleMarketRows],
+  );
 
   useEffect(() => {
     setVisibleMarketRows(60);
@@ -1362,6 +1850,41 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   });
   const categoryOrder = ['All', 'Stocks', 'Crypto', 'Indices', 'Commodities', 'Forex', 'Other'];
   const availableCategories = categoryOrder.filter((c) => (categoryCounts[c] || 0) > 0);
+
+  const liveTickSymbols = useMemo(() => {
+    const hot = actionableRecs.slice(0, 25).map((r) => r.symbol);
+    const warm = visibleHoldRecs.slice(0, 80).map((r) => r.symbol);
+    return Array.from(new Set([...hot, ...warm].filter(Boolean)));
+  }, [actionableRecs, visibleHoldRecs]);
+
+  // Live prices in one bulk request so bid/ask updates feel instant without request storms.
+  useEffect(() => {
+    if (!connected || recommendations.length === 0 || scanning) {
+      setLiveTicks({});
+      return;
+    }
+    if (liveTickSymbols.length === 0) {
+      setLiveTicks({});
+      return;
+    }
+    let cancelled = false;
+    const refreshTicks = async () => {
+      try {
+        const resp = await api.getTicks(liveTickSymbols);
+        if (!cancelled) {
+          setLiveTicks(resp.ticks || {});
+        }
+      } catch {
+        // keep previous ticks on transient errors
+      }
+    };
+    refreshTicks();
+    const t = setInterval(refreshTicks, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [connected, recommendations.length, scanning, liveTickSymbols]);
 
   // Not connected state
   if (!connected) {
@@ -1497,7 +2020,38 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
             <div style={{ textAlign: 'right' }}>
               <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Gemini</div>
               <div style={{ fontWeight: 700, color: geminiState.degraded ? 'var(--accent-yellow)' : geminiState.available ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-                {geminiState.degraded ? 'Degraded' : geminiState.available ? 'Online' : 'Offline'}
+                {geminiState.state === 'cooldown'
+                  ? 'Cooldown'
+                  : geminiState.degraded
+                    ? 'Degraded'
+                    : geminiState.available
+                      ? 'Online'
+                      : 'Offline'}
+              </div>
+              <div style={{ marginTop: 6, width: 220, marginLeft: 'auto' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)' }}>
+                  <span>Gemini credits</span>
+                  <span>{Math.max(0, Math.min(100, Number(geminiState.credits_pct || 0))).toFixed(0)}%</span>
+                </div>
+                <div style={{ marginTop: 4, height: 8, borderRadius: 999, background: 'var(--bg-primary)', overflow: 'hidden' }}>
+                  <div
+                    style={{
+                      width: `${Math.max(0, Math.min(100, Number(geminiState.credits_pct || 0))).toFixed(0)}%`,
+                      height: '100%',
+                      background: (geminiState.credits_pct || 0) >= 60
+                        ? 'var(--accent-green)'
+                        : (geminiState.credits_pct || 0) >= 25
+                          ? 'var(--accent-yellow)'
+                          : 'var(--accent-red)',
+                      transition: 'width 220ms ease',
+                    }}
+                  />
+                </div>
+                {Number(geminiState.cooldown_seconds || 0) > 0 && (
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+                    Cooldown remaining: {formatCooldown(geminiState.cooldown_seconds)}
+                  </div>
+                )}
               </div>
               {geminiErrorSummary && (
                 <div style={{ fontSize: 10, color: 'var(--text-muted)', maxWidth: 260, whiteSpace: 'normal' }}>
@@ -1939,12 +2493,19 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
             <h3 style={{ fontSize: 16, fontWeight: 600 }}>Available Markets</h3>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
               {lastScan
-                ? `MT5 available ${recommendations.length} symbols \u2022 AI analyzed ${analyzedCount} \u2022 Last checked: ${new Date(lastScan * 1000).toLocaleTimeString()}`
+                ? `${status?.platform === 'ibkr' ? 'IBKR' : 'MT5'} available ${availableMarketCount} symbols \u2022 AI analyzed ${analyzedCount} \u2022 Last checked: ${new Date(lastScan * 1000).toLocaleTimeString()}`
                 : 'Click "Scan All" to analyze every available market'
               }
             </p>
           </div>
           <div className="flex gap-2">
+            <button
+              className="btn btn-secondary"
+              onClick={() => setShowMarketSelector((v) => !v)}
+              style={{ fontSize: 12 }}
+            >
+              {showMarketSelector ? 'Hide Market Picker' : 'Add Markets'}
+            </button>
             <button className="btn btn-primary" onClick={scanMarkets} disabled={scanning} style={{ fontSize: 13, padding: '10px 20px' }}>
               {scanning ? <span className="loading-spinner" /> : <RefreshCw size={14} />}
               {scanning ? 'Analyzing...' : 'Scan All'}
@@ -1958,7 +2519,105 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
           </div>
         </div>
 
-        {error && !error.toLowerCase().includes('timeout') && (
+        {showMarketSelector && (
+          <div
+            onClick={() => setShowMarketSelector(false)}
+            style={{
+              position: 'fixed',
+              inset: 0,
+              background: 'rgba(0, 0, 0, 0.55)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              zIndex: 9999,
+              padding: 16,
+            }}
+          >
+          <div
+            className="card"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(900px, 96vw)',
+              maxHeight: '88vh',
+              overflow: 'auto',
+              padding: 14,
+            }}
+          >
+            <div className="flex justify-between items-center" style={{ marginBottom: 10, gap: 10, flexWrap: 'wrap' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                Default mode: <strong>{status?.platform === 'ibkr' ? 'IBKR popular liquid symbols' : 'Popular in Egypt'}</strong>.
+                {' '}You can add/remove extra markets below.
+                {status?.platform === 'ibkr' ? ' IBKR catalog symbols are also available in this list.' : ''}
+                {' '}Selected: <strong>{marketDraftSymbols.length || defaultPopularSymbols.length}</strong>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => setShowMarketSelector(false)}
+                >
+                  Close
+                </button>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => {
+                    saveSelectedMarkets(marketDraftSymbols.length > 0 ? marketDraftSymbols : defaultPopularSymbols);
+                    setShowMarketSelector(false);
+                  }}
+                >
+                  Save Selection
+                </button>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={resetToEgyptPopular}
+                >
+                  Reset to Popular
+                </button>
+                <button
+                  className="btn btn-primary btn-sm"
+                  onClick={async () => {
+                    const toSave = marketDraftSymbols.length > 0 ? marketDraftSymbols : defaultPopularSymbols;
+                    saveSelectedMarkets(toSave);
+                    setShowMarketSelector(false);
+                    await scanMarkets(toSave);
+                  }}
+                  disabled={scanning}
+                >
+                  Save & Scan
+                </button>
+              </div>
+            </div>
+            <input
+              className="form-input"
+              placeholder="Search symbol (e.g. XAUUSD, US30, AAPL)"
+              value={marketSearch}
+              onChange={(e) => setMarketSearch(e.target.value)}
+              style={{ marginBottom: 10, fontSize: 12 }}
+            />
+            <div style={{ maxHeight: 220, overflow: 'auto', border: '1px solid var(--border)', borderRadius: 8, padding: 8 }}>
+              {marketSelectorRows.map((row) => {
+                const symbol = String(row.name || '');
+                const checked = draftMarketSet.has(symbol) || (marketDraftSymbols.length === 0 && defaultPopularSymbols.includes(symbol));
+                return (
+                  <label
+                    key={symbol}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', borderBottom: '1px solid var(--border)' }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={(e) => setMarketSymbolChecked(symbol, e.target.checked)}
+                    />
+                    <span style={{ fontSize: 12, minWidth: 80, fontWeight: 600 }}>{symbol}</span>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{row.category || 'Other'}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+          </div>
+        )}
+
+        {error && !error.toLowerCase().includes('timeout') && !error.toLowerCase().includes('failed to fetch') && (
           <div className="error-banner" style={{ fontSize: 13 }}>
             Something went wrong: {error}
           </div>
@@ -2015,14 +2674,20 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                   <TrendingUp size={14} />
                   Trade Opportunities ({actionableRecs.length})
                   <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--text-muted)' }}>
-                    {actionableRecs.filter(r => r.signal.action === 'BUY').length} BUY
+                    {actionableRecs.filter((r) => r.signal.action === 'BUY').length} BUY
                     {' / '}
-                    {actionableRecs.filter(r => r.signal.action === 'SELL').length} SELL
+                    {actionableRecs.filter((r) => r.signal.action === 'SELL').length} SELL
                   </span>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                   {actionableRecs.map((rec, i) => (
-                    <TradeCard key={`${rec.symbol}-${i}`} rec={rec} onExecuted={refreshPositions} currency={currency} />
+                    <TradeCard
+                      key={`${rec.symbol}-${i}`}
+                      rec={rec}
+                      onExecuted={refreshPositionsBurst}
+                      currency={currency}
+                      liveTick={liveTicks[rec.symbol]}
+                    />
                   ))}
                 </div>
               </div>
@@ -2037,7 +2702,14 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                 </div>
                 <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
                   {visibleHoldRecs.map((rec, i) => (
-                    <MarketRow key={`hold-${i}`} rec={rec} currency={currency} onExecuted={refreshPositions} isLast={i === visibleHoldRecs.length - 1} />
+                    <MarketRow
+                      key={`hold-${i}`}
+                      rec={rec}
+                      currency={currency}
+                      onExecuted={refreshPositionsBurst}
+                      isLast={i === visibleHoldRecs.length - 1}
+                      liveTick={liveTicks[rec.symbol]}
+                    />
                   ))}
                 </div>
                 {holdRecs.length > visibleHoldRecs.length && (

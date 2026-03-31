@@ -332,6 +332,12 @@ CREATE TABLE IF NOT EXISTS app_runtime_state (
 
 CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp
     ON signals(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_timestamp
+    ON orders(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_signal_id
+    ON orders(signal_id);
+CREATE INDEX IF NOT EXISTS idx_risk_decisions_signal_ts
+    ON risk_decisions(signal_id, timestamp DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_eval_journal_symbol_timestamp
     ON evaluation_journal(symbol, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_trade_outcomes_symbol_closed_at
@@ -631,7 +637,14 @@ class Database:
                       r.approved, r.reason as risk_reason
                FROM orders o
                LEFT JOIN signals s ON o.signal_id = s.id
-               LEFT JOIN risk_decisions r ON r.signal_id = s.id
+               LEFT JOIN risk_decisions r
+                    ON r.id = (
+                        SELECT r2.id
+                        FROM risk_decisions r2
+                        WHERE r2.signal_id = s.id
+                        ORDER BY r2.timestamp DESC, r2.id DESC
+                        LIMIT 1
+                    )
                ORDER BY o.timestamp DESC LIMIT ?""",
             (limit,),
         )
