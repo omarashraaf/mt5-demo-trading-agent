@@ -109,6 +109,9 @@ class AppConfig(BaseModel):
     ENABLE_ADMIN_BOOTSTRAP: bool = True
     ADMIN_BOOTSTRAP_USERNAME: str = "admin"
     ADMIN_BOOTSTRAP_PASSWORD: str = "admin"
+    CLOUD_SYNC_ENABLED: bool = True
+    CLOUD_LOG_TABLE: str = "runtime_logs"
+    CLOUD_SYNC_TIMEOUT_SECONDS: float = Field(default=8.0, gt=1.0, le=30.0)
 
     @field_validator("LOG_LEVEL")
     @classmethod
@@ -231,6 +234,9 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
         "ENABLE_ADMIN_BOOTSTRAP": _read_bool(source.get("ENABLE_ADMIN_BOOTSTRAP"), True),
         "ADMIN_BOOTSTRAP_USERNAME": source.get("ADMIN_BOOTSTRAP_USERNAME", "admin").strip(),
         "ADMIN_BOOTSTRAP_PASSWORD": source.get("ADMIN_BOOTSTRAP_PASSWORD", "admin").strip(),
+        "CLOUD_SYNC_ENABLED": _read_bool(source.get("CLOUD_SYNC_ENABLED"), True),
+        "CLOUD_LOG_TABLE": source.get("CLOUD_LOG_TABLE", "runtime_logs").strip() or "runtime_logs",
+        "CLOUD_SYNC_TIMEOUT_SECONDS": float(source.get("CLOUD_SYNC_TIMEOUT_SECONDS", "8")),
     }
     return AppConfig(**data)
 

@@ -88,6 +88,29 @@ For production, set:
 - `ENABLE_ADMIN_BOOTSTRAP=false`
 - change admin bootstrap password to a strong one before disabling bootstrap.
 
+## Hybrid Runtime (Local Trading + Cloud Auth/Logs)
+
+LinkTrade now supports a hybrid model:
+- UI and trading runtime stay local (connects to local MT5/IBKR).
+- Authentication and admin/user approval stay in Supabase cloud.
+- Core runtime logs can sync to Supabase cloud (best effort).
+
+Backend env:
+- `CLOUD_SYNC_ENABLED=true`
+- `CLOUD_LOG_TABLE=runtime_logs`
+- `CLOUD_SYNC_TIMEOUT_SECONDS=8`
+
+Create this table in Supabase SQL editor:
+
+```sql
+create table if not exists public.runtime_logs (
+  id bigint generated always as identity primary key,
+  event_type text not null,
+  timestamp_utc double precision not null,
+  payload jsonb not null default '{}'::jsonb
+);
+```
+
 ## Demo Workflow
 
 1. Open MetaTrader 5 terminal on your machine

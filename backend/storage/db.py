@@ -383,6 +383,18 @@ class Database:
     def __init__(self, path: str = DB_PATH):
         self.path = path
         self._db: Optional[aiosqlite.Connection] = None
+        self._cloud_log_sink = None
+
+    def set_cloud_log_sink(self, sink):
+        self._cloud_log_sink = sink
+
+    async def _emit_cloud_log(self, event_type: str, payload: dict):
+        if self._cloud_log_sink is None:
+            return
+        try:
+            await self._cloud_log_sink(event_type, payload)
+        except Exception:
+            pass
 
     async def initialize(self):
         self._db = await aiosqlite.connect(self.path)
@@ -461,11 +473,22 @@ class Database:
     async def log_connection_event(
         self, event: str, account: int = 0, server: str = "", details: str = ""
     ):
+        ts = time.time()
         await self._db.execute(
             "INSERT INTO connection_events (timestamp, event, account, server, details) VALUES (?, ?, ?, ?, ?)",
-            (time.time(), event, account, server, details),
+            (ts, event, account, server, details),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "connection_event",
+            {
+                "timestamp": ts,
+                "event": event,
+                "account": account,
+                "server": server,
+                "details": details,
+            },
+        )
 
     async def log_signal(
         self,
@@ -479,12 +502,13 @@ class Database:
         max_holding_minutes: Optional[int],
         reason: str,
     ) -> int:
+        ts = time.time()
         cursor = await self._db.execute(
             """INSERT INTO signals
             (timestamp, agent_name, symbol, timeframe, action, confidence, stop_loss, take_profit, max_holding_minutes, reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                time.time(),
+                ts,
                 agent_name,
                 symbol,
                 timeframe,
@@ -497,6 +521,17 @@ class Database:
             ),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "signal",
+            {
+                "timestamp": ts,
+                "agent_name": agent_name,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "action": action,
+                "confidence": confidence,
+            },
+        )
         return cursor.lastrowid
 
     async def log_risk_decision(
@@ -506,11 +541,22 @@ class Database:
         reason: str,
         adjusted_volume: float = 0.0,
     ):
+        ts = time.time()
         await self._db.execute(
             "INSERT INTO risk_decisions (timestamp, signal_id, approved, reason, adjusted_volume) VALUES (?, ?, ?, ?, ?)",
-            (time.time(), signal_id, int(approved), reason, adjusted_volume),
+            (ts, signal_id, int(approved), reason, adjusted_volume),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "risk_decision",
+            {
+                "timestamp": ts,
+                "signal_id": signal_id,
+                "approved": bool(approved),
+                "reason": reason,
+                "adjusted_volume": adjusted_volume,
+            },
+        )
 
     async def log_order(
         self,
@@ -527,8 +573,9 @@ class Database:
         success: bool,
         comment: str = "",
     ):
+        ts = time.time()
         payload = (
-            time.time(),
+            ts,
             signal_id,
             symbol,
             action,
@@ -563,7 +610,7 @@ class Database:
                 (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, comment, success)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    time.time(),
+                    ts,
                     None,
                     symbol,
                     action,
@@ -579,22 +626,58 @@ class Database:
                 ),
             )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "order",
+            {
+                "timestamp": ts,
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "action": action,
+                "volume": volume,
+                "price": price,
+                "ticket": ticket,
+                "retcode": retcode,
+                "retcode_desc": retcode_desc,
+                "success": bool(success),
+            },
+        )
 
     async def log_position_change(
         self, ticket: int, event: str, symbol: str = "", details: str = ""
     ):
+        ts = time.time()
         await self._db.execute(
             "INSERT INTO position_changes (timestamp, ticket, event, symbol, details) VALUES (?, ?, ?, ?, ?)",
-            (time.time(), ticket, event, symbol, details),
+            (ts, ticket, event, symbol, details),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "position_change",
+            {
+                "timestamp": ts,
+                "ticket": ticket,
+                "event": event,
+                "symbol": symbol,
+                "details": details,
+            },
+        )
 
     async def log_error(self, source: str, message: str, details: str = ""):
+        ts = time.time()
         await self._db.execute(
             "INSERT INTO errors (timestamp, source, message, details) VALUES (?, ?, ?, ?)",
-            (time.time(), source, message, details),
+            (ts, source, message, details),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "error",
+            {
+                "timestamp": ts,
+                "source": source,
+                "message": message,
+                "details": details,
+            },
+        )
 
     async def get_logs(self, limit: int = 100, log_type: str = "all") -> list[dict]:
         results = []
@@ -769,11 +852,23 @@ class Database:
     async def log_ai_activity(
         self, action: str, symbol: str, ticket: int, detail: str, profit: float = 0.0
     ):
+        ts = time.time()
         await self._db.execute(
             "INSERT INTO ai_activity (timestamp, action, symbol, ticket, detail, profit) VALUES (?, ?, ?, ?, ?, ?)",
-            (time.time(), action, symbol, ticket, detail, profit),
+            (ts, action, symbol, ticket, detail, profit),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "ai_activity",
+            {
+                "timestamp": ts,
+                "action": action,
+                "symbol": symbol,
+                "ticket": ticket,
+                "detail": detail,
+                "profit": profit,
+            },
+        )
 
     async def get_ai_activity(self, limit: int = 50) -> list[dict]:
         cursor = await self._db.execute(

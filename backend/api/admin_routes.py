@@ -333,3 +333,18 @@ async def admin_activity(request: Request, authorization: Optional[str] = Header
         details={"limit": limit, "returned": len(logs)},
     )
     return {"activity": logs, "count": len(logs)}
+
+
+@router.get("/cloud/status")
+async def cloud_status(authorization: Optional[str] = Header(default=None)):
+    user = await _current_user(authorization)
+    role = _get_role(user)
+    return {
+        "auth_provider": "supabase",
+        "supabase_configured": supabase_admin.configured,
+        "cloud_sync_enabled": bool(config.CLOUD_SYNC_ENABLED),
+        "cloud_log_table": config.CLOUD_LOG_TABLE,
+        "user_role": role,
+        "hybrid_mode": True,
+        "runtime": "local_app + cloud_auth_and_logs",
+    }

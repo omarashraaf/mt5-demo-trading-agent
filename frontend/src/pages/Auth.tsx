@@ -83,7 +83,7 @@ export default function AuthPage() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
-              minLength={6}
+              minLength={mode === 'register' ? 6 : 1}
               disabled={busy || !supabaseEnabled}
             />
           </div>

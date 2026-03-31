@@ -20,6 +20,7 @@ from api.admin_routes import supabase_admin
 from storage.db import Database
 from config import config
 from services.meta_training_scheduler import MetaTrainingScheduler
+from services.cloud_sync_service import CloudSyncService
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
@@ -33,12 +34,20 @@ logger = logging.getLogger(__name__)
 
 db = Database(config.DB_PATH)
 meta_training_scheduler: MetaTrainingScheduler | None = None
+cloud_sync_service = CloudSyncService(
+    enabled=config.CLOUD_SYNC_ENABLED,
+    supabase_url=config.SUPABASE_URL,
+    service_role_key=config.SUPABASE_SERVICE_ROLE_KEY,
+    table=config.CLOUD_LOG_TABLE,
+    timeout_seconds=config.CLOUD_SYNC_TIMEOUT_SECONDS,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global meta_training_scheduler
     await db.initialize()
+    db.set_cloud_log_sink(cloud_sync_service.emit)
     set_database(db)
     set_admin_database(db)
     await restore_runtime_state()
