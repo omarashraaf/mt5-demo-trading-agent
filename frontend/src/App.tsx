@@ -1,4 +1,4 @@
-import { Routes, Route, NavLink } from 'react-router-dom';
+import { Routes, Route, NavLink, useLocation } from 'react-router-dom';
 import { useState, useCallback, useEffect } from 'react';
 import {
   LayoutDashboard,
@@ -15,7 +15,6 @@ import {
   ChevronRight,
   Settings,
   Newspaper,
-  Users,
 } from 'lucide-react';
 import { api } from './utils/api';
 import type { StatusResponse } from './types';
@@ -32,7 +31,7 @@ import TradeHistoryPage from './pages/TradeHistory';
 import EventsPage from './pages/Events';
 import AuthPage from './pages/Auth';
 import { useAuth } from './context/AuthContext';
-import AdminPage from './pages/Admin';
+import AdminPortal from './pages/admin/AdminPortal';
 
 const ADVANCED_NAV = [
   { path: '/chat', label: 'Gemini Chat', icon: MessageSquare },
@@ -47,6 +46,7 @@ const ADVANCED_NAV = [
 ];
 
 export default function App() {
+  const location = useLocation();
   const { loading: authLoading, user, signOut, role, approved, accessStatus } = useAuth();
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(() => {
@@ -78,6 +78,10 @@ export default function App() {
 
   const connected = Boolean(status?.connected && status?.account);
   const authed = Boolean(user);
+
+  if (location.pathname.startsWith('/admin')) {
+    return <AdminPortal />;
+  }
 
   if (authLoading) {
     return (
@@ -161,15 +165,6 @@ export default function App() {
             <History size={16} />
             Trade History
           </NavLink>
-          {role === 'admin' && (
-            <NavLink
-              to="/admin"
-              className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
-            >
-              <Users size={16} />
-              Admin
-            </NavLink>
-          )}
 
           {/* Advanced section - hidden by default */}
           <div
@@ -234,7 +229,6 @@ export default function App() {
           <Route path="/chat" element={<ChatPage connected={connected} />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/events" element={<EventsPage />} />
-          <Route path="/admin" element={role === 'admin' ? <AdminPage /> : <SimpleDashboard status={status} onRefresh={refreshStatus} />} />
         </Routes>
       </main>
     </div>

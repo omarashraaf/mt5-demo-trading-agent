@@ -107,6 +107,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+function adminAuthHeaders(): Record<string, string> {
+  const token = localStorage.getItem('linktrade_admin_token');
+  if (!token) return {};
+  return { Authorization: `Bearer ${token}` };
+}
+
 export const api = {
   // Auth/Admin
   authMe: () =>
@@ -132,32 +138,62 @@ export const api = {
     }),
 
   adminListUsers: () =>
-    request<{ users: Array<Record<string, unknown>>; count: number }>('/admin/users'),
+    request<{ users: Array<Record<string, unknown>>; count: number }>('/admin/users', {
+      headers: adminAuthHeaders(),
+    }),
 
   adminCreateUser: (data: { email: string; password: string; role: 'admin' | 'user' }) =>
     request<{ ok: boolean; user: Record<string, unknown> }>('/admin/users', {
       method: 'POST',
+      headers: adminAuthHeaders(),
       body: JSON.stringify(data),
     }),
 
   adminUpdateRole: (data: { user_id: string; role: 'admin' | 'user' }) =>
     request<{ ok: boolean; user: Record<string, unknown> }>('/admin/users/role', {
       method: 'POST',
+      headers: adminAuthHeaders(),
       body: JSON.stringify(data),
     }),
 
   adminActivity: (limit: number = 200) =>
-    request<{ activity: Array<Record<string, unknown>>; count: number }>(`/admin/activity?limit=${limit}`),
+    request<{ activity: Array<Record<string, unknown>>; count: number }>(`/admin/activity?limit=${limit}`, {
+      headers: adminAuthHeaders(),
+    }),
 
   adminListAccessRequests: (status?: 'pending' | 'approved' | 'rejected') =>
     request<{ items: Array<Record<string, unknown>>; count: number }>(
       `/admin/access-requests${status ? `?status=${status}` : ''}`,
+      { headers: adminAuthHeaders() },
     ),
 
   adminUpdateAccessRequest: (data: { user_id: string; status: 'pending' | 'approved' | 'rejected'; notes?: string }) =>
     request<{ ok: boolean }>('/admin/access-requests', {
       method: 'POST',
+      headers: adminAuthHeaders(),
       body: JSON.stringify(data),
+    }),
+
+  adminCustomers: () =>
+    request<{ items: Array<Record<string, unknown>>; count: number }>('/admin/customers', {
+      headers: adminAuthHeaders(),
+    }),
+
+  adminUserDetail: (userId: string) =>
+    request<{ user: Record<string, unknown>; activity: Array<Record<string, unknown>>; activity_count: number }>(
+      `/admin/users/${encodeURIComponent(userId)}`,
+      { headers: adminAuthHeaders() },
+    ),
+
+  adminLogin: (username: string, password: string) =>
+    request<{ ok: boolean; token: string; expires_in: number; username: string }>('/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    }),
+
+  adminSession: () =>
+    request<{ ok: boolean; username: string; expires_at: number }>('/admin/session', {
+      headers: adminAuthHeaders(),
     }),
 
   // Connection

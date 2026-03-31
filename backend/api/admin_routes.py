@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import secrets
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -17,6 +19,8 @@ supabase_admin = SupabaseAdminService(
     anon_key=config.SUPABASE_ANON_KEY,
     service_role_key=config.SUPABASE_SERVICE_ROLE_KEY,
 )
+ADMIN_SESSION_TTL_SECONDS = 60 * 60 * 12
+admin_sessions: dict[str, dict] = {}
 
 
 def set_database(database: Database):
@@ -44,6 +48,11 @@ class UpdateAccessRequest(BaseModel):
     user_id: str
     status: str
     notes: str = ""
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> str:
@@ -75,6 +84,21 @@ async def _current_user(authorization: Optional[str]) -> dict:
 
 
 async def _require_admin(authorization: Optional[str]) -> dict:
+    # 1) Dedicated admin username/password session
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+        session = admin_sessions.get(token)
+        now = time.time()
+        if session and float(session.get("expires_at", 0.0)) > now:
+            return {
+                "id": "local-admin",
+                "email": f"{config.ADMIN_BOOTSTRAP_USERNAME}@local",
+                "app_metadata": {"role": "admin"},
+            }
+        if session and float(session.get("expires_at", 0.0)) <= now:
+            admin_sessions.pop(token, None)
+
+    # 2) Supabase admin role token
     user = await _current_user(authorization)
     role = _get_role(user)
     if role != "admin":
@@ -128,6 +152,43 @@ async def auth_me(request: Request, authorization: Optional[str] = Header(defaul
         "access_status": access_status,
         "user_metadata": user.get("user_metadata") or {},
         "app_metadata": user.get("app_metadata") or {},
+    }
+
+
+@router.post("/admin/login")
+async def admin_login(req: AdminLoginRequest):
+    username = req.username.strip()
+    password = req.password
+    if username != config.ADMIN_BOOTSTRAP_USERNAME or password != config.ADMIN_BOOTSTRAP_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid admin credentials.")
+    token = secrets.token_urlsafe(32)
+    admin_sessions[token] = {
+        "username": username,
+        "issued_at": time.time(),
+        "expires_at": time.time() + ADMIN_SESSION_TTL_SECONDS,
+    }
+    return {
+        "ok": True,
+        "token": token,
+        "expires_in": ADMIN_SESSION_TTL_SECONDS,
+        "username": username,
+    }
+
+
+@router.get("/admin/session")
+async def admin_session(authorization: Optional[str] = Header(default=None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing admin token.")
+    token = authorization[7:].strip()
+    session = admin_sessions.get(token)
+    now = time.time()
+    if not session or float(session.get("expires_at", 0.0)) <= now:
+        admin_sessions.pop(token, None)
+        raise HTTPException(status_code=401, detail="Admin session expired.")
+    return {
+        "ok": True,
+        "username": session.get("username", config.ADMIN_BOOTSTRAP_USERNAME),
+        "expires_at": session.get("expires_at"),
     }
 
 
@@ -212,6 +273,21 @@ async def admin_list_users(request: Request, authorization: Optional[str] = Head
         details={"count": len(users)},
     )
     return {"users": users, "count": len(users)}
+
+
+@router.get("/admin/customers")
+async def admin_customers(request: Request, authorization: Optional[str] = Header(default=None), limit: int = 500):
+    user = await _require_admin(authorization)
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    items = await db.list_user_access_requests(status="approved", limit=limit)
+    await _log_activity(
+        user=user,
+        action="admin_customers",
+        request=request,
+        details={"count": len(items)},
+    )
+    return {"items": items, "count": len(items)}
 
 
 @router.post("/admin/users")
@@ -318,6 +394,33 @@ async def admin_update_access_request(
         details={"target_user_id": req.user_id, "status": status},
     )
     return {"ok": True}
+
+
+@router.get("/admin/users/{user_id}")
+async def admin_user_detail(user_id: str, request: Request, authorization: Optional[str] = Header(default=None), limit: int = 200):
+    user = await _require_admin(authorization)
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    access = await db.get_user_access(user_id=user_id.strip())
+    if not access:
+        raise HTTPException(status_code=404, detail="User not found")
+    all_activity = await db.get_user_activity(limit=max(200, limit * 5))
+    user_activity = [
+        row for row in all_activity
+        if str(row.get("user_id") or "") == access.get("user_id")
+        or str(row.get("user_email") or "").lower() == str(access.get("email") or "").lower()
+    ][:limit]
+    await _log_activity(
+        user=user,
+        action="admin_user_detail",
+        request=request,
+        details={"target_user_id": user_id, "activity_count": len(user_activity)},
+    )
+    return {
+        "user": access,
+        "activity": user_activity,
+        "activity_count": len(user_activity),
+    }
 
 
 @router.get("/admin/activity")

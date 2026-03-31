@@ -76,12 +76,13 @@ Open `http://localhost:5173` in your browser, or run `npm run electron:dev` for 
 - Bootstrap admin user is available from the auth page button using backend env:
   - `ADMIN_BOOTSTRAP_USERNAME=admin`
   - `ADMIN_BOOTSTRAP_PASSWORD=admin`
-- Admin users can open `/admin` to:
-  - list users
-  - approve/reject pending registrations
-  - create users
-  - change user role
-  - view user activity logs
+- Admin panel is now a separate app at `/admin` with its own login.
+- Admin login uses username/password (`admin` / `admin` by default from env), no email required.
+- Admin tabs are focused to:
+  - Registered
+  - Customers
+  - Users Activity
+- Opening a user row shows a dedicated user detail + logs page.
 
 For production, set:
 - `AUTH_REQUIRED=true`
