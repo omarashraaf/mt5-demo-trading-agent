@@ -33,8 +33,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       authHeader = { Authorization: `Bearer ${accessToken}` };
     }
   }
+  const optionHeaders = options?.headers
+    ? Object.fromEntries(new Headers(options.headers).entries())
+    : {};
   const requestOptions: RequestInit = {
-    headers: { 'Content-Type': 'application/json', ...authHeader },
+    headers: { 'Content-Type': 'application/json', ...authHeader, ...optionHeaders },
     ...options,
   };
 

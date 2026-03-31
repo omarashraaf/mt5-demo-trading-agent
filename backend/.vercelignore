@@ -1,0 +1,12 @@
+__pycache__/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.vercel/
+trading_agent.db
+trading_agent.db-journal
+trading_agent.db-shm
+trading_agent.db-wal
+*.log
+research_artifacts/
+research_exports/

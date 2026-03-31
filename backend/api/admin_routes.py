@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-import secrets
 import time
 from typing import Optional
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -14,18 +18,30 @@ from storage.db import Database
 router = APIRouter()
 
 db: Optional[Database] = None
+_db_init_lock = asyncio.Lock()
 supabase_admin = SupabaseAdminService(
     url=config.SUPABASE_URL,
     anon_key=config.SUPABASE_ANON_KEY,
     service_role_key=config.SUPABASE_SERVICE_ROLE_KEY,
 )
 ADMIN_SESSION_TTL_SECONDS = 60 * 60 * 12
-admin_sessions: dict[str, dict] = {}
 
 
 def set_database(database: Database):
     global db
     db = database
+
+
+async def _ensure_database() -> Database:
+    global db
+    if db is not None:
+        return db
+    async with _db_init_lock:
+        if db is None:
+            database = Database(config.DB_PATH)
+            await database.initialize()
+            db = database
+    return db
 
 
 class CreateAdminUserRequest(BaseModel):
@@ -55,6 +71,57 @@ class AdminLoginRequest(BaseModel):
     password: str
 
 
+def _admin_signing_secret() -> str:
+    # Use service-role key when available so stateless admin tokens survive serverless invocations.
+    base_secret = (
+        config.SUPABASE_SERVICE_ROLE_KEY
+        or config.ADMIN_BOOTSTRAP_PASSWORD
+        or "linktrade-admin-fallback"
+    )
+    return f"linktrade-admin::{base_secret}"
+
+
+def _encode_admin_token(*, username: str, expires_at: float) -> str:
+    payload = {
+        "username": username,
+        "iat": int(time.time()),
+        "exp": int(expires_at),
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    payload_b64 = base64.urlsafe_b64encode(payload_json.encode("utf-8")).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        _admin_signing_secret().encode("utf-8"),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    sig_b64 = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    return f"{payload_b64}.{sig_b64}"
+
+
+def _decode_admin_token(token: str) -> dict:
+    try:
+        payload_b64, sig_b64 = token.split(".", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Invalid admin token.") from exc
+    expected_sig = hmac.new(
+        _admin_signing_secret().encode("utf-8"),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    expected_sig_b64 = base64.urlsafe_b64encode(expected_sig).decode("ascii").rstrip("=")
+    if not hmac.compare_digest(sig_b64, expected_sig_b64):
+        raise HTTPException(status_code=401, detail="Invalid admin token signature.")
+    padded_payload = payload_b64 + "=" * (-len(payload_b64) % 4)
+    try:
+        payload_raw = base64.urlsafe_b64decode(padded_payload.encode("ascii"))
+        payload = json.loads(payload_raw.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Malformed admin token.") from exc
+    if float(payload.get("exp", 0)) <= time.time():
+        raise HTTPException(status_code=401, detail="Admin session expired.")
+    return payload
+
+
 def _extract_bearer_token(authorization: Optional[str]) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing authorization header.")
@@ -73,6 +140,14 @@ def _get_role(user: dict) -> str:
     return role or "user"
 
 
+def _user_access_status_from_metadata(user: dict) -> str:
+    meta = user.get("user_metadata") or {}
+    status = str(meta.get("access_status") or "pending").strip().lower()
+    if status not in {"pending", "approved", "rejected"}:
+        return "pending"
+    return status
+
+
 async def _current_user(authorization: Optional[str]) -> dict:
     if not supabase_admin.configured:
         raise HTTPException(status_code=503, detail="Supabase auth is not configured.")
@@ -87,16 +162,15 @@ async def _require_admin(authorization: Optional[str]) -> dict:
     # 1) Dedicated admin username/password session
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
-        session = admin_sessions.get(token)
-        now = time.time()
-        if session and float(session.get("expires_at", 0.0)) > now:
+        try:
+            payload = _decode_admin_token(token)
             return {
                 "id": "local-admin",
                 "email": f"{config.ADMIN_BOOTSTRAP_USERNAME}@local",
                 "app_metadata": {"role": "admin"},
             }
-        if session and float(session.get("expires_at", 0.0)) <= now:
-            admin_sessions.pop(token, None)
+        except HTTPException:
+            pass
 
     # 2) Supabase admin role token
     user = await _current_user(authorization)
@@ -114,9 +188,8 @@ async def _log_activity(
     status_code: int = 200,
     details: Optional[dict] = None,
 ):
-    if db is None:
-        return
-    await db.log_user_activity(
+    database = await _ensure_database()
+    await database.log_user_activity(
         user_id=str(user.get("id") or ""),
         user_email=str(user.get("email") or ""),
         role=_get_role(user),
@@ -131,10 +204,12 @@ async def _log_activity(
 @router.get("/auth/me")
 async def auth_me(request: Request, authorization: Optional[str] = Header(default=None)):
     user = await _current_user(authorization)
-    access_status = "pending"
-    approved = False
-    if db is not None:
-        access = await db.get_user_access(user_id=str(user.get("id") or ""))
+    access_status = _user_access_status_from_metadata(user)
+    approved = access_status == "approved"
+    # Legacy fallback for previously created users without metadata.
+    if access_status == "pending":
+        database = await _ensure_database()
+        access = await database.get_user_access(user_id=str(user.get("id") or ""))
         if access:
             access_status = str(access.get("status") or "pending")
             approved = access_status == "approved"
@@ -161,12 +236,8 @@ async def admin_login(req: AdminLoginRequest):
     password = req.password
     if username != config.ADMIN_BOOTSTRAP_USERNAME or password != config.ADMIN_BOOTSTRAP_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid admin credentials.")
-    token = secrets.token_urlsafe(32)
-    admin_sessions[token] = {
-        "username": username,
-        "issued_at": time.time(),
-        "expires_at": time.time() + ADMIN_SESSION_TTL_SECONDS,
-    }
+    expires_at = time.time() + ADMIN_SESSION_TTL_SECONDS
+    token = _encode_admin_token(username=username, expires_at=expires_at)
     return {
         "ok": True,
         "token": token,
@@ -180,15 +251,11 @@ async def admin_session(authorization: Optional[str] = Header(default=None)):
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing admin token.")
     token = authorization[7:].strip()
-    session = admin_sessions.get(token)
-    now = time.time()
-    if not session or float(session.get("expires_at", 0.0)) <= now:
-        admin_sessions.pop(token, None)
-        raise HTTPException(status_code=401, detail="Admin session expired.")
+    payload = _decode_admin_token(token)
     return {
         "ok": True,
-        "username": session.get("username", config.ADMIN_BOOTSTRAP_USERNAME),
-        "expires_at": session.get("expires_at"),
+        "username": payload.get("username", config.ADMIN_BOOTSTRAP_USERNAME),
+        "expires_at": payload.get("exp"),
     }
 
 
@@ -196,8 +263,7 @@ async def admin_session(authorization: Optional[str] = Header(default=None)):
 async def public_register(req: RegisterRequest):
     if not supabase_admin.configured:
         raise HTTPException(status_code=503, detail="Supabase auth is not configured.")
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
+    database = await _ensure_database()
     email = req.email.strip().lower()
     if "@" not in email or "." not in email.split("@")[-1]:
         raise HTTPException(status_code=400, detail="Valid email is required.")
@@ -209,11 +275,15 @@ async def public_register(req: RegisterRequest):
             password=req.password,
             role="user",
             email_confirm=True,
+            user_metadata={
+                "access_status": "pending",
+                "requested_at": int(time.time()),
+            },
         )
         user_id = str(created.get("id") or "")
         if not user_id:
             raise RuntimeError("Supabase did not return created user id.")
-        await db.upsert_user_access(
+        await database.upsert_user_access(
             user_id=user_id,
             email=email,
             status="pending",
@@ -229,6 +299,7 @@ async def public_register(req: RegisterRequest):
 
 @router.post("/auth/bootstrap-admin")
 async def auth_bootstrap_admin():
+    database = await _ensure_database()
     if not config.ENABLE_ADMIN_BOOTSTRAP:
         raise HTTPException(status_code=403, detail="Admin bootstrap is disabled.")
     if not supabase_admin.configured:
@@ -240,8 +311,8 @@ async def auth_bootstrap_admin():
             username=config.ADMIN_BOOTSTRAP_USERNAME,
             password=config.ADMIN_BOOTSTRAP_PASSWORD,
         )
-        if db is not None and result.get("user_id"):
-            await db.upsert_user_access(
+        if result.get("user_id"):
+            await database.upsert_user_access(
                 user_id=str(result.get("user_id")),
                 email=str(result.get("email") or ""),
                 status="approved",
@@ -278,9 +349,33 @@ async def admin_list_users(request: Request, authorization: Optional[str] = Head
 @router.get("/admin/customers")
 async def admin_customers(request: Request, authorization: Optional[str] = Header(default=None), limit: int = 500):
     user = await _require_admin(authorization)
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
-    items = await db.list_user_access_requests(status="approved", limit=limit)
+    payload = supabase_admin.list_users(page=1, per_page=max(1, min(limit, 1000)))
+    users = payload.get("users", []) if isinstance(payload, dict) else []
+    items = []
+    for entry in users:
+        role = _get_role(entry)
+        if role == "admin":
+            continue
+        status = _user_access_status_from_metadata(entry)
+        if status != "approved":
+            continue
+        created_at = entry.get("created_at")
+        ts = time.time()
+        if isinstance(created_at, str):
+            try:
+                ts = time.mktime(time.strptime(created_at.split(".")[0], "%Y-%m-%dT%H:%M:%S"))
+            except Exception:
+                ts = time.time()
+        items.append(
+            {
+                "id": len(items) + 1,
+                "user_id": str(entry.get("id") or ""),
+                "email": str(entry.get("email") or ""),
+                "status": status,
+                "requested_at": ts,
+                "approved_at": ts,
+            }
+        )
     await _log_activity(
         user=user,
         action="admin_customers",
@@ -309,8 +404,9 @@ async def admin_create_user(req: CreateAdminUserRequest, request: Request, autho
             email_confirm=True,
         )
         created_user_id = str(created.get("id") or "")
-        if created_user_id and db is not None:
-            await db.upsert_user_access(
+        if created_user_id:
+            database = await _ensure_database()
+            await database.upsert_user_access(
                 user_id=created_user_id,
                 email=email,
                 status="approved" if role == "admin" else "pending",
@@ -355,11 +451,36 @@ async def admin_access_requests(
     limit: int = 500,
 ):
     user = await _require_admin(authorization)
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
     if status and status not in {"pending", "approved", "rejected"}:
         raise HTTPException(status_code=400, detail="Invalid status filter.")
-    rows = await db.list_user_access_requests(status=status, limit=limit)
+    payload = supabase_admin.list_users(page=1, per_page=max(1, min(limit, 1000)))
+    users = payload.get("users", []) if isinstance(payload, dict) else []
+    rows = []
+    for entry in users:
+        role = _get_role(entry)
+        if role == "admin":
+            continue
+        user_status = _user_access_status_from_metadata(entry)
+        if status and user_status != status:
+            continue
+        created_at = entry.get("created_at")
+        ts = time.time()
+        if isinstance(created_at, str):
+            try:
+                ts = time.mktime(time.strptime(created_at.split(".")[0], "%Y-%m-%dT%H:%M:%S"))
+            except Exception:
+                ts = time.time()
+        rows.append(
+            {
+                "id": len(rows) + 1,
+                "user_id": str(entry.get("id") or ""),
+                "email": str(entry.get("email") or ""),
+                "status": user_status,
+                "requested_at": ts,
+                "approved_at": ts if user_status == "approved" else None,
+                "notes": "",
+            }
+        )
     await _log_activity(
         user=user,
         action="admin_access_requests",
@@ -376,17 +497,21 @@ async def admin_update_access_request(
     authorization: Optional[str] = Header(default=None),
 ):
     user = await _require_admin(authorization)
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
     status = req.status.strip().lower()
     if status not in {"approved", "rejected", "pending"}:
         raise HTTPException(status_code=400, detail="Status must be approved|rejected|pending.")
-    await db.set_user_access_status(
-        user_id=req.user_id.strip(),
-        status=status,
-        approved_by_user_id=str(user.get("id") or ""),
-        notes=req.notes.strip(),
-    )
+    target_user_id = req.user_id.strip()
+    # Keep status in Supabase metadata as the source of truth for cloud admin.
+    payload = supabase_admin.list_users(page=1, per_page=1000)
+    users = payload.get("users", []) if isinstance(payload, dict) else []
+    target = next((u for u in users if str(u.get("id") or "") == target_user_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    user_meta = dict(target.get("user_metadata") or {})
+    user_meta["access_status"] = status
+    user_meta["access_updated_at"] = int(time.time())
+    user_meta["access_notes"] = req.notes.strip()
+    supabase_admin.update_user_metadata(user_id=target_user_id, user_metadata=user_meta)
     await _log_activity(
         user=user,
         action="admin_update_access",
@@ -399,12 +524,29 @@ async def admin_update_access_request(
 @router.get("/admin/users/{user_id}")
 async def admin_user_detail(user_id: str, request: Request, authorization: Optional[str] = Header(default=None), limit: int = 200):
     user = await _require_admin(authorization)
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
-    access = await db.get_user_access(user_id=user_id.strip())
-    if not access:
+    payload = supabase_admin.list_users(page=1, per_page=1000)
+    users = payload.get("users", []) if isinstance(payload, dict) else []
+    target = next((u for u in users if str(u.get("id") or "") == user_id.strip()), None)
+    if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    all_activity = await db.get_user_activity(limit=max(200, limit * 5))
+    created_at = target.get("created_at")
+    ts = time.time()
+    if isinstance(created_at, str):
+        try:
+            ts = time.mktime(time.strptime(created_at.split(".")[0], "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            ts = time.time()
+    access = {
+        "id": 0,
+        "user_id": str(target.get("id") or ""),
+        "email": str(target.get("email") or ""),
+        "status": _user_access_status_from_metadata(target),
+        "requested_at": ts,
+        "approved_at": ts if _user_access_status_from_metadata(target) == "approved" else None,
+        "notes": "",
+    }
+    database = await _ensure_database()
+    all_activity = await database.get_user_activity(limit=max(200, limit * 5))
     user_activity = [
         row for row in all_activity
         if str(row.get("user_id") or "") == access.get("user_id")
@@ -426,9 +568,8 @@ async def admin_user_detail(user_id: str, request: Request, authorization: Optio
 @router.get("/admin/activity")
 async def admin_activity(request: Request, authorization: Optional[str] = Header(default=None), limit: int = 200):
     user = await _require_admin(authorization)
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not available")
-    logs = await db.get_user_activity(limit=limit)
+    database = await _ensure_database()
+    logs = await database.get_user_activity(limit=limit)
     await _log_activity(
         user=user,
         action="admin_view_activity",

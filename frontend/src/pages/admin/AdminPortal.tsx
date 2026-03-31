@@ -22,7 +22,7 @@ type ActivityItem = {
   status_code: number;
 };
 
-function AdminLogin() {
+function AdminLogin({ onLoggedIn }: { onLoggedIn: () => void }) {
   const navigate = useNavigate();
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('admin');
@@ -36,6 +36,7 @@ function AdminLogin() {
     try {
       const res = await api.adminLogin(username, password);
       localStorage.setItem('linktrade_admin_token', res.token);
+      onLoggedIn();
       navigate('/admin/registered', { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Admin login failed');
@@ -74,10 +75,12 @@ function AdminUsersTable({
   items,
   actionLabel,
   onAction,
+  actionBusyUserId,
 }: {
   items: AccessItem[];
   actionLabel: string;
-  onAction?: (userId: string) => void;
+  onAction?: (userId: string) => Promise<void>;
+  actionBusyUserId?: string | null;
 }) {
   const navigate = useNavigate();
   return (
@@ -100,11 +103,20 @@ function AdminUsersTable({
             <td>{item.approved_at ? new Date(item.approved_at * 1000).toLocaleString() : '-'}</td>
             <td>
               <div className="flex gap-2">
-                <button className="btn btn-secondary btn-sm" onClick={() => navigate(`/admin/user/${item.user_id}`)}>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  type="button"
+                  onClick={() => navigate(`/admin/user/${item.user_id}`)}
+                >
                   Open
                 </button>
                 {onAction && (
-                  <button className="btn btn-primary btn-sm" onClick={() => onAction(item.user_id)}>
+                  <button
+                    className="btn btn-primary btn-sm"
+                    type="button"
+                    disabled={actionBusyUserId === item.user_id}
+                    onClick={() => void onAction(item.user_id)}
+                  >
                     {actionLabel}
                   </button>
                 )}
@@ -120,8 +132,11 @@ function AdminUsersTable({
 function RegisteredTab() {
   const [items, setItems] = useState<AccessItem[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [actionBusyUserId, setActionBusyUserId] = useState<string | null>(null);
   const load = async () => {
     try {
+      setError(null);
       const res = await api.adminListAccessRequests('pending');
       setItems(res.items as AccessItem[]);
     } catch (err) {
@@ -134,15 +149,28 @@ function RegisteredTab() {
   return (
     <div className="card">
       {error && <div className="error-banner">{error}</div>}
+      {info && <div className="success-banner">{info}</div>}
       <div className="card-header">
         <h3>Registered (Pending Approval)</h3>
-        <button className="btn btn-secondary btn-sm" onClick={() => void load()}>Refresh</button>
+        <button className="btn btn-secondary btn-sm" type="button" onClick={() => void load()}>Refresh</button>
       </div>
       <AdminUsersTable
         items={items}
         actionLabel="Approve"
-        onAction={(userId) => {
-          void api.adminUpdateAccessRequest({ user_id: userId, status: 'approved' }).then(load);
+        actionBusyUserId={actionBusyUserId}
+        onAction={async (userId) => {
+          setInfo(null);
+          setError(null);
+          setActionBusyUserId(userId);
+          try {
+            await api.adminUpdateAccessRequest({ user_id: userId, status: 'approved' });
+            setInfo('User approved successfully.');
+            await load();
+          } catch (err) {
+            setError(err instanceof Error ? err.message : 'Approve failed');
+          } finally {
+            setActionBusyUserId(null);
+          }
         }}
       />
     </div>
@@ -168,7 +196,7 @@ function CustomersTab() {
       {error && <div className="error-banner">{error}</div>}
       <div className="card-header">
         <h3>Customers (Approved)</h3>
-        <button className="btn btn-secondary btn-sm" onClick={() => void load()}>Refresh</button>
+        <button className="btn btn-secondary btn-sm" type="button" onClick={() => void load()}>Refresh</button>
       </div>
       <AdminUsersTable items={items} actionLabel="" />
     </div>
@@ -194,7 +222,7 @@ function ActivityTab() {
       {error && <div className="error-banner">{error}</div>}
       <div className="card-header">
         <h3>Users Activity</h3>
-        <button className="btn btn-secondary btn-sm" onClick={() => void load()}>Refresh</button>
+        <button className="btn btn-secondary btn-sm" type="button" onClick={() => void load()}>Refresh</button>
       </div>
       <table className="table">
         <thead>
@@ -283,7 +311,7 @@ function UserDetail() {
   );
 }
 
-function AdminShell() {
+function AdminShell({ onLogout }: { onLogout: () => void }) {
   const navigate = useNavigate();
   const tabs = useMemo(() => [
     { to: '/admin/registered', label: 'Registered' },
@@ -301,8 +329,10 @@ function AdminShell() {
           </div>
           <button
             className="btn btn-secondary"
+            type="button"
             onClick={() => {
               localStorage.removeItem('linktrade_admin_token');
+              onLogout();
               navigate('/admin', { replace: true });
             }}
           >
@@ -344,6 +374,6 @@ export default function AdminPortal() {
   }, []);
 
   if (!ready) return <div className="card">Loading admin panel...</div>;
-  if (!valid) return <AdminLogin />;
-  return <AdminShell />;
+  if (!valid) return <AdminLogin onLoggedIn={() => setValid(true)} />;
+  return <AdminShell onLogout={() => setValid(false)} />;
 }

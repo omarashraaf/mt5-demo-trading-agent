@@ -114,6 +114,24 @@ class SupabaseAdminService:
             raise RuntimeError(self._extract_error(response))
         return response.json()
 
+    def update_user_metadata(self, *, user_id: str, user_metadata: dict[str, Any]) -> dict[str, Any]:
+        if not self.configured:
+            raise RuntimeError("Supabase is not configured.")
+        headers = {
+            "apikey": self.service_role_key,
+            "Authorization": f"Bearer {self.service_role_key}",
+            "Content-Type": "application/json",
+        }
+        response = requests.put(
+            f"{self.url}/auth/v1/admin/users/{user_id}",
+            headers=headers,
+            json={"user_metadata": user_metadata},
+            timeout=self.timeout_seconds,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(self._extract_error(response))
+        return response.json()
+
     def ensure_bootstrap_admin(self, *, username: str, password: str) -> dict[str, Any]:
         email = f"{username.strip().lower()}@linktrade.local"
         users = self.list_users(page=1, per_page=1000).get("users", [])

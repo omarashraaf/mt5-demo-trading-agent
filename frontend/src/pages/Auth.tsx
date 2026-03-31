@@ -94,26 +94,6 @@ export default function AuthPage() {
             <button
               className="btn btn-secondary"
               type="button"
-              disabled={busy || !supabaseEnabled}
-              onClick={async () => {
-                setBusy(true);
-                setError(null);
-                setMessage(null);
-                try {
-                  const res = await api.bootstrapAdmin();
-                  setMessage(`Bootstrap admin ready: ${res.email} / admin`);
-                } catch (err) {
-                  setError(err instanceof Error ? err.message : 'Failed to bootstrap admin');
-                } finally {
-                  setBusy(false);
-                }
-              }}
-            >
-              Bootstrap admin/admin
-            </button>
-            <button
-              className="btn btn-secondary"
-              type="button"
               onClick={() => {
                 setMode((prev) => (prev === 'login' ? 'register' : 'login'));
                 setError(null);

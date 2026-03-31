@@ -1,5 +1,11 @@
 {
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
   "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "https://linktrade-backend.vercel.app/api/$1"
+    },
     {
       "source": "/(.*)",
       "destination": "/index.html"
