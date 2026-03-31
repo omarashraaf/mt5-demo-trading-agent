@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-electron
+release
+*.log
+*.tmp
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local

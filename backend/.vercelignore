@@ -1,0 +1,15 @@
+*
+!api/
+!api/index.py
+!api/admin_routes.py
+!cloud_main.py
+!config.py
+!requirements.txt
+!storage/
+!storage/__init__.py
+!storage/db.py
+!services/
+!services/__init__.py
+!services/supabase_admin_service.py
+!services/cloud_sync_service.py
+!vercel.json
