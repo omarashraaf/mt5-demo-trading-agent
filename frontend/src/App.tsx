@@ -47,7 +47,7 @@ const ADVANCED_NAV = [
 ];
 
 export default function App() {
-  const { loading: authLoading, user, signOut, role } = useAuth();
+  const { loading: authLoading, user, signOut, role, approved, accessStatus } = useAuth();
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(() => {
     return localStorage.getItem('advancedNav') === 'true';
@@ -91,6 +91,26 @@ export default function App() {
 
   if (!authed) {
     return <AuthPage />;
+  }
+
+  if (!approved && role !== 'admin') {
+    return (
+      <div className="app-layout" style={{ alignItems: 'center', justifyContent: 'center' }}>
+        <div className="card" style={{ maxWidth: 520, marginBottom: 0 }}>
+          <div className="page-header">
+            <h2>Account Approval Required</h2>
+            <p>
+              {accessStatus === 'rejected'
+                ? 'Your registration was rejected by admin.'
+                : 'Your registration is pending admin approval.'}
+            </p>
+          </div>
+          <button className="btn btn-secondary" onClick={() => void signOut()}>
+            Logout
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (

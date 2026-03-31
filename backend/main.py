@@ -99,6 +99,7 @@ async def optional_auth_guard(request: Request, call_next):
         return await call_next(request)
     public_paths = {
         "/api/auth/bootstrap-admin",
+        "/api/public/register",
     }
     if path in public_paths:
         return await call_next(request)

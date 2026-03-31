@@ -21,9 +21,21 @@ type ActivityItem = {
   details_json: Record<string, unknown>;
 };
 
+type AccessRequestItem = {
+  id: number;
+  user_id: string;
+  email: string;
+  status: 'pending' | 'approved' | 'rejected' | string;
+  requested_at: number;
+  approved_at?: number | null;
+  approved_by_user_id?: string;
+  notes?: string;
+};
+
 export default function AdminPage() {
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
+  const [accessRequests, setAccessRequests] = useState<AccessRequestItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -36,8 +48,10 @@ export default function AdminPage() {
     setError(null);
     try {
       const [usersRes, activityRes] = await Promise.all([api.adminListUsers(), api.adminActivity(100)]);
+      const accessRes = await api.adminListAccessRequests();
       setUsers((usersRes.users || []) as AdminUser[]);
       setActivity((activityRes.activity || []) as ActivityItem[]);
+      setAccessRequests((accessRes.items || []) as AccessRequestItem[]);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load admin data');
     } finally {
@@ -79,6 +93,19 @@ export default function AdminPage() {
     }
   };
 
+  const updateAccess = async (userId: string, status: 'pending' | 'approved' | 'rejected') => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.adminUpdateAccessRequest({ user_id: userId, status });
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update access request');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (loading) {
     return <div className="card">Loading admin panel...</div>;
   }
@@ -114,6 +141,46 @@ export default function AdminPage() {
           </div>
           <button className="btn btn-primary" type="submit" disabled={busy}>Create</button>
         </form>
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <h3>Access Requests ({accessRequests.length})</h3>
+        </div>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Status</th>
+              <th>Requested</th>
+              <th>Approved</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {accessRequests.map((item) => (
+              <tr key={item.id}>
+                <td>{item.email}</td>
+                <td>{item.status}</td>
+                <td>{new Date(item.requested_at * 1000).toLocaleString()}</td>
+                <td>{item.approved_at ? new Date(item.approved_at * 1000).toLocaleString() : '-'}</td>
+                <td>
+                  <div className="flex gap-2">
+                    <button className="btn btn-secondary btn-sm" disabled={busy || item.status === 'approved'} onClick={() => void updateAccess(item.user_id, 'approved')}>
+                      Approve
+                    </button>
+                    <button className="btn btn-secondary btn-sm" disabled={busy || item.status === 'rejected'} onClick={() => void updateAccess(item.user_id, 'rejected')}>
+                      Reject
+                    </button>
+                    <button className="btn btn-secondary btn-sm" disabled={busy || item.status === 'pending'} onClick={() => void updateAccess(item.user_id, 'pending')}>
+                      Set pending
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
 
       <div className="card">

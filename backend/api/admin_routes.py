@@ -35,6 +35,17 @@ class UpdateRoleRequest(BaseModel):
     role: str
 
 
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class UpdateAccessRequest(BaseModel):
+    user_id: str
+    status: str
+    notes: str = ""
+
+
 def _extract_bearer_token(authorization: Optional[str]) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing authorization header.")
@@ -96,6 +107,13 @@ async def _log_activity(
 @router.get("/auth/me")
 async def auth_me(request: Request, authorization: Optional[str] = Header(default=None)):
     user = await _current_user(authorization)
+    access_status = "pending"
+    approved = False
+    if db is not None:
+        access = await db.get_user_access(user_id=str(user.get("id") or ""))
+        if access:
+            access_status = str(access.get("status") or "pending")
+            approved = access_status == "approved"
     await _log_activity(
         user=user,
         action="auth_me",
@@ -106,8 +124,45 @@ async def auth_me(request: Request, authorization: Optional[str] = Header(defaul
         "id": user.get("id"),
         "email": user.get("email"),
         "role": _get_role(user),
+        "approved": approved,
+        "access_status": access_status,
         "user_metadata": user.get("user_metadata") or {},
         "app_metadata": user.get("app_metadata") or {},
+    }
+
+
+@router.post("/public/register")
+async def public_register(req: RegisterRequest):
+    if not supabase_admin.configured:
+        raise HTTPException(status_code=503, detail="Supabase auth is not configured.")
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    email = req.email.strip().lower()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Valid email is required.")
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    try:
+        created = supabase_admin.create_user(
+            email=email,
+            password=req.password,
+            role="user",
+            email_confirm=True,
+        )
+        user_id = str(created.get("id") or "")
+        if not user_id:
+            raise RuntimeError("Supabase did not return created user id.")
+        await db.upsert_user_access(
+            user_id=user_id,
+            email=email,
+            status="pending",
+            notes="Pending admin approval.",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "message": "Registration submitted. Wait for admin approval before using the dashboard.",
     }
 
 
@@ -124,6 +179,14 @@ async def auth_bootstrap_admin():
             username=config.ADMIN_BOOTSTRAP_USERNAME,
             password=config.ADMIN_BOOTSTRAP_PASSWORD,
         )
+        if db is not None and result.get("user_id"):
+            await db.upsert_user_access(
+                user_id=str(result.get("user_id")),
+                email=str(result.get("email") or ""),
+                status="approved",
+                approved_by_user_id="bootstrap",
+                notes="Bootstrap admin account.",
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Bootstrap admin failed: {exc}") from exc
     return {
@@ -169,6 +232,15 @@ async def admin_create_user(req: CreateAdminUserRequest, request: Request, autho
             role=role,
             email_confirm=True,
         )
+        created_user_id = str(created.get("id") or "")
+        if created_user_id and db is not None:
+            await db.upsert_user_access(
+                user_id=created_user_id,
+                email=email,
+                status="approved" if role == "admin" else "pending",
+                approved_by_user_id=str(user.get("id") or ""),
+                notes="Created from admin panel.",
+            )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await _log_activity(
@@ -197,6 +269,55 @@ async def admin_update_role(req: UpdateRoleRequest, request: Request, authorizat
         details={"target_user_id": req.user_id, "role": role},
     )
     return {"ok": True, "user": updated}
+
+
+@router.get("/admin/access-requests")
+async def admin_access_requests(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    status: Optional[str] = None,
+    limit: int = 500,
+):
+    user = await _require_admin(authorization)
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    if status and status not in {"pending", "approved", "rejected"}:
+        raise HTTPException(status_code=400, detail="Invalid status filter.")
+    rows = await db.list_user_access_requests(status=status, limit=limit)
+    await _log_activity(
+        user=user,
+        action="admin_access_requests",
+        request=request,
+        details={"status": status or "all", "count": len(rows)},
+    )
+    return {"items": rows, "count": len(rows)}
+
+
+@router.post("/admin/access-requests")
+async def admin_update_access_request(
+    req: UpdateAccessRequest,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+):
+    user = await _require_admin(authorization)
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    status = req.status.strip().lower()
+    if status not in {"approved", "rejected", "pending"}:
+        raise HTTPException(status_code=400, detail="Status must be approved|rejected|pending.")
+    await db.set_user_access_status(
+        user_id=req.user_id.strip(),
+        status=status,
+        approved_by_user_id=str(user.get("id") or ""),
+        notes=req.notes.strip(),
+    )
+    await _log_activity(
+        user=user,
+        action="admin_update_access",
+        request=request,
+        details={"target_user_id": req.user_id, "status": status},
+    )
+    return {"ok": True}
 
 
 @router.get("/admin/activity")

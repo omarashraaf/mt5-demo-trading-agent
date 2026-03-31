@@ -3,7 +3,7 @@ import { useAuth } from '@/context/AuthContext';
 import { api } from '@/utils/api';
 
 export default function AuthPage() {
-  const { signIn, signUp, supabaseEnabled } = useAuth();
+  const { signIn, signOut, supabaseEnabled } = useAuth();
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -19,9 +19,25 @@ export default function AuthPage() {
     try {
       if (mode === 'login') {
         await signIn(email.trim(), password);
+        try {
+          const me = await api.authMe();
+          if (!me.approved) {
+            await signOut();
+            throw new Error(
+              me.access_status === 'rejected'
+                ? 'Your account request was rejected by admin.'
+                : 'Your account is pending admin approval.',
+            );
+          }
+        } catch (err) {
+          if (err instanceof Error) {
+            throw err;
+          }
+          throw new Error('Could not verify account approval status.');
+        }
       } else {
-        await signUp(email.trim(), password);
-        setMessage('Account created. If email confirmation is enabled in Supabase, verify your email before login.');
+        const res = await api.publicRegister({ email: email.trim(), password });
+        setMessage(res.message || 'Registration submitted. Wait for admin approval.');
       }
     } catch (err) {
       const detail = err instanceof Error ? err.message : 'Authentication failed';

@@ -72,11 +72,13 @@ Open `http://localhost:5173` in your browser, or run `npm run electron:dev` for 
 ## Auth + Admin (Supabase)
 
 - The app now opens on a login/register screen first.
+- Registration is pending by default (cannot access dashboard until admin approval).
 - Bootstrap admin user is available from the auth page button using backend env:
   - `ADMIN_BOOTSTRAP_USERNAME=admin`
   - `ADMIN_BOOTSTRAP_PASSWORD=admin`
-- Admin users can open `/admin` from sidebar to:
+- Admin users can open `/admin` to:
   - list users
+  - approve/reject pending registrations
   - create users
   - change user role
   - view user activity logs

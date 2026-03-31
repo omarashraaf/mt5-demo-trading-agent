@@ -114,9 +114,17 @@ export const api = {
       id: string;
       email: string;
       role: string;
+      approved: boolean;
+      access_status: 'pending' | 'approved' | 'rejected' | string;
       user_metadata: Record<string, unknown>;
       app_metadata: Record<string, unknown>;
     }>('/auth/me'),
+
+  publicRegister: (data: { email: string; password: string }) =>
+    request<{ ok: boolean; message: string }>('/public/register', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   bootstrapAdmin: () =>
     request<{ ok: boolean; username: string; email: string; created: boolean }>('/auth/bootstrap-admin', {
@@ -140,6 +148,17 @@ export const api = {
 
   adminActivity: (limit: number = 200) =>
     request<{ activity: Array<Record<string, unknown>>; count: number }>(`/admin/activity?limit=${limit}`),
+
+  adminListAccessRequests: (status?: 'pending' | 'approved' | 'rejected') =>
+    request<{ items: Array<Record<string, unknown>>; count: number }>(
+      `/admin/access-requests${status ? `?status=${status}` : ''}`,
+    ),
+
+  adminUpdateAccessRequest: (data: { user_id: string; status: 'pending' | 'approved' | 'rejected'; notes?: string }) =>
+    request<{ ok: boolean }>('/admin/access-requests', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   // Connection
   connect: (data: {

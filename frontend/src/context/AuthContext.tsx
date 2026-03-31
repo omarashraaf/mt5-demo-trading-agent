@@ -9,6 +9,8 @@ type AuthContextValue = {
   user: User | null;
   session: Session | null;
   role: 'admin' | 'user';
+  approved: boolean;
+  accessStatus: 'pending' | 'approved' | 'rejected' | string;
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
@@ -21,6 +23,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [session, setSession] = useState<Session | null>(null);
   const [role, setRole] = useState<'admin' | 'user'>('user');
+  const [approved, setApproved] = useState(false);
+  const [accessStatus, setAccessStatus] = useState<'pending' | 'approved' | 'rejected' | string>('pending');
 
   const resolveRole = (nextSession: Session | null): 'admin' | 'user' => {
     const appMetaRole = String(nextSession?.user?.app_metadata?.role || '').toLowerCase();
@@ -33,8 +37,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const me = await api.authMe();
       const nextRole = String(me.role || '').toLowerCase() === 'admin' ? 'admin' : 'user';
       setRole(nextRole);
+      setApproved(Boolean(me.approved));
+      setAccessStatus(String(me.access_status || 'pending'));
     } catch {
       setRole(resolveRole(session));
+      setApproved(false);
+      setAccessStatus('pending');
     }
   };
 
@@ -49,6 +57,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setRole(resolveRole(data.session ?? null));
       if (data.session) {
         void refreshProfile();
+      } else {
+        setApproved(false);
+        setAccessStatus('pending');
       }
       setLoading(false);
     });
@@ -60,6 +71,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setRole(resolveRole(nextSession));
       if (nextSession) {
         void refreshProfile();
+      } else {
+        setApproved(false);
+        setAccessStatus('pending');
       }
     });
 
@@ -73,6 +87,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       user: session?.user ?? null,
       session,
       role,
+      approved,
+      accessStatus,
       signIn: async (email: string, password: string) => {
         if (!supabase) throw new Error('Supabase not configured');
         const { error } = await supabase.auth.signInWithPassword({ email, password });
@@ -89,10 +105,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const { error } = await supabase.auth.signOut();
         if (error) throw new Error(error.message);
         setRole('user');
+        setApproved(false);
+        setAccessStatus('pending');
       },
       refreshProfile,
     }),
-    [loading, role, session],
+    [accessStatus, approved, loading, role, session],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

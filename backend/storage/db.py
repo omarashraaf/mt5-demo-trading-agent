@@ -343,6 +343,17 @@ CREATE TABLE IF NOT EXISTS user_activity (
     details_json TEXT DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS user_access (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requested_at REAL NOT NULL,
+    approved_at REAL,
+    approved_by_user_id TEXT DEFAULT '',
+    notes TEXT DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp
     ON signals(symbol, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_timestamp
@@ -363,6 +374,8 @@ CREATE INDEX IF NOT EXISTS idx_feature_snapshots_candidate_created
     ON feature_snapshots(candidate_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_user_activity_timestamp
     ON user_activity(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_user_access_status
+    ON user_access(status, requested_at DESC);
 """
 
 
@@ -1405,6 +1418,80 @@ class Database:
                 item["details_json"] = {}
             items.append(item)
         return items
+
+    async def upsert_user_access(
+        self,
+        *,
+        user_id: str,
+        email: str,
+        status: str = "pending",
+        approved_by_user_id: str = "",
+        notes: str = "",
+    ):
+        now = time.time()
+        approved_at = now if status == "approved" else None
+        await self._db.execute(
+            """INSERT INTO user_access
+            (user_id, email, status, requested_at, approved_at, approved_by_user_id, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                email=excluded.email,
+                status=excluded.status,
+                approved_at=excluded.approved_at,
+                approved_by_user_id=excluded.approved_by_user_id,
+                notes=excluded.notes""",
+            (
+                user_id,
+                email,
+                status,
+                now,
+                approved_at,
+                approved_by_user_id,
+                notes,
+            ),
+        )
+        await self._db.commit()
+
+    async def set_user_access_status(
+        self,
+        *,
+        user_id: str,
+        status: str,
+        approved_by_user_id: str = "",
+        notes: str = "",
+    ):
+        approved_at = time.time() if status == "approved" else None
+        await self._db.execute(
+            """UPDATE user_access
+            SET status = ?, approved_at = ?, approved_by_user_id = ?, notes = ?
+            WHERE user_id = ?""",
+            (status, approved_at, approved_by_user_id, notes, user_id),
+        )
+        await self._db.commit()
+
+    async def get_user_access(self, *, user_id: str) -> Optional[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM user_access WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
+    async def list_user_access_requests(self, *, status: Optional[str] = None, limit: int = 500) -> list[dict]:
+        query = "SELECT * FROM user_access"
+        params: list = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY requested_at DESC LIMIT ?"
+        params.append(max(1, min(limit, 5000)))
+        cursor = await self._db.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
 
     async def log_model_run(
         self,
