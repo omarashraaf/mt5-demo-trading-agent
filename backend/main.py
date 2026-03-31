@@ -3,8 +3,9 @@ import sys
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from api.routes import (
     router,
@@ -14,6 +15,8 @@ from api.routes import (
     finnhub_adapter,
     current_research_cycle_service,
 )
+from api.admin_routes import router as admin_router, set_database as set_admin_database
+from api.admin_routes import supabase_admin
 from storage.db import Database
 from config import config
 from services.meta_training_scheduler import MetaTrainingScheduler
@@ -37,6 +40,7 @@ async def lifespan(app: FastAPI):
     global meta_training_scheduler
     await db.initialize()
     set_database(db)
+    set_admin_database(db)
     await restore_runtime_state()
     active_research_service = current_research_cycle_service()
     if active_research_service is not None:
@@ -83,7 +87,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def optional_auth_guard(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    path = request.url.path
+    if not path.startswith("/api"):
+        return await call_next(request)
+    if not config.AUTH_REQUIRED:
+        return await call_next(request)
+    public_paths = {
+        "/api/auth/bootstrap-admin",
+    }
+    if path in public_paths:
+        return await call_next(request)
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return JSONResponse(status_code=401, content={"detail": "Authentication required."})
+    token = auth[7:].strip()
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Authentication required."})
+    try:
+        supabase_admin.get_user_from_token(token)
+    except Exception as exc:
+        return JSONResponse(status_code=401, content={"detail": str(exc)})
+    return await call_next(request)
+
+
 app.include_router(router, prefix="/api")
+app.include_router(admin_router, prefix="/api")
 
 
 if __name__ == "__main__":

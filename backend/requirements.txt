@@ -11,3 +11,4 @@ google-genai>=1.12.1
 keyring>=25.6.0
 requests>=2.32.3
 ib_insync>=0.9.86
+supabase>=2.15.3

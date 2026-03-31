@@ -330,6 +330,19 @@ CREATE TABLE IF NOT EXISTS app_runtime_state (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS user_activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    user_id TEXT DEFAULT '',
+    user_email TEXT DEFAULT '',
+    role TEXT DEFAULT 'user',
+    action TEXT NOT NULL,
+    path TEXT DEFAULT '',
+    method TEXT DEFAULT '',
+    status_code INTEGER DEFAULT 0,
+    details_json TEXT DEFAULT '{}'
+);
+
 CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp
     ON signals(symbol, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_timestamp
@@ -348,6 +361,8 @@ CREATE INDEX IF NOT EXISTS idx_trade_candidates_symbol_timestamp
     ON trade_candidates(symbol, timestamp_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_feature_snapshots_candidate_created
     ON feature_snapshots(candidate_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_activity_timestamp
+    ON user_activity(timestamp DESC);
 """
 
 
@@ -1343,6 +1358,53 @@ class Database:
             return json.loads(row[0])
         except Exception:
             return None
+
+    async def log_user_activity(
+        self,
+        *,
+        user_id: str,
+        user_email: str,
+        role: str,
+        action: str,
+        path: str = "",
+        method: str = "",
+        status_code: int = 0,
+        details: Optional[dict] = None,
+    ):
+        await self._db.execute(
+            """INSERT INTO user_activity
+            (timestamp, user_id, user_email, role, action, path, method, status_code, details_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                time.time(),
+                user_id or "",
+                user_email or "",
+                role or "user",
+                action,
+                path,
+                method,
+                int(status_code or 0),
+                json.dumps(details or {}),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_user_activity(self, limit: int = 200) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM user_activity ORDER BY timestamp DESC LIMIT ?",
+            (max(1, min(limit, 2000)),),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        items: list[dict] = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            try:
+                item["details_json"] = json.loads(item.get("details_json") or "{}")
+            except Exception:
+                item["details_json"] = {}
+            items.append(item)
+        return items
 
     async def log_model_run(
         self,

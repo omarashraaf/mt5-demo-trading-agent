@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Settings,
   Newspaper,
+  Users,
 } from 'lucide-react';
 import { api } from './utils/api';
 import type { StatusResponse } from './types';
@@ -31,6 +32,7 @@ import TradeHistoryPage from './pages/TradeHistory';
 import EventsPage from './pages/Events';
 import AuthPage from './pages/Auth';
 import { useAuth } from './context/AuthContext';
+import AdminPage from './pages/Admin';
 
 const ADVANCED_NAV = [
   { path: '/chat', label: 'Gemini Chat', icon: MessageSquare },
@@ -45,7 +47,7 @@ const ADVANCED_NAV = [
 ];
 
 export default function App() {
-  const { loading: authLoading, user, signOut } = useAuth();
+  const { loading: authLoading, user, signOut, role } = useAuth();
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(() => {
     return localStorage.getItem('advancedNav') === 'true';
@@ -139,6 +141,15 @@ export default function App() {
             <History size={16} />
             Trade History
           </NavLink>
+          {role === 'admin' && (
+            <NavLink
+              to="/admin"
+              className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+            >
+              <Users size={16} />
+              Admin
+            </NavLink>
+          )}
 
           {/* Advanced section - hidden by default */}
           <div
@@ -203,6 +214,7 @@ export default function App() {
           <Route path="/chat" element={<ChatPage connected={connected} />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/events" element={<EventsPage />} />
+          <Route path="/admin" element={role === 'admin' ? <AdminPage /> : <SimpleDashboard status={status} onRefresh={refreshStatus} />} />
         </Routes>
       </main>
     </div>

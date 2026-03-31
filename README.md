@@ -37,6 +37,8 @@ venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
 # Edit .env with your MT5 terminal path
+# Add Supabase values for auth/admin:
+# SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY
 ```
 
 ### 2. Frontend
@@ -66,6 +68,23 @@ npm run dev
 ```
 
 Open `http://localhost:5173` in your browser, or run `npm run electron:dev` for the desktop app.
+
+## Auth + Admin (Supabase)
+
+- The app now opens on a login/register screen first.
+- Bootstrap admin user is available from the auth page button using backend env:
+  - `ADMIN_BOOTSTRAP_USERNAME=admin`
+  - `ADMIN_BOOTSTRAP_PASSWORD=admin`
+- Admin users can open `/admin` from sidebar to:
+  - list users
+  - create users
+  - change user role
+  - view user activity logs
+
+For production, set:
+- `AUTH_REQUIRED=true`
+- `ENABLE_ADMIN_BOOTSTRAP=false`
+- change admin bootstrap password to a strong one before disabling bootstrap.
 
 ## Demo Workflow
 

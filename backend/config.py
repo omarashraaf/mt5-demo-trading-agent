@@ -102,6 +102,13 @@ class AppConfig(BaseModel):
     AUTO_META_AUTO_APPROVE: bool = True
     AUTO_META_MIN_PRECISION: float = Field(default=0.50, ge=0.0, le=1.0)
     AUTO_META_MIN_F1: float = Field(default=0.45, ge=0.0, le=1.0)
+    SUPABASE_URL: str = ""
+    SUPABASE_ANON_KEY: str = ""
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
+    AUTH_REQUIRED: bool = False
+    ENABLE_ADMIN_BOOTSTRAP: bool = True
+    ADMIN_BOOTSTRAP_USERNAME: str = "admin"
+    ADMIN_BOOTSTRAP_PASSWORD: str = "admin"
 
     @field_validator("LOG_LEVEL")
     @classmethod
@@ -159,6 +166,10 @@ class AppConfig(BaseModel):
     def finnhub_available(self) -> bool:
         return self.ENABLE_FINNHUB and bool(self.FINNHUB_API_KEY)
 
+    @property
+    def supabase_configured(self) -> bool:
+        return bool(self.SUPABASE_URL and self.SUPABASE_SERVICE_ROLE_KEY)
+
 
 def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
     source = env or os.environ
@@ -213,6 +224,13 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
         "AUTO_META_AUTO_APPROVE": _read_bool(source.get("AUTO_META_AUTO_APPROVE"), True),
         "AUTO_META_MIN_PRECISION": float(source.get("AUTO_META_MIN_PRECISION", "0.50")),
         "AUTO_META_MIN_F1": float(source.get("AUTO_META_MIN_F1", "0.45")),
+        "SUPABASE_URL": source.get("SUPABASE_URL", "").strip(),
+        "SUPABASE_ANON_KEY": source.get("SUPABASE_ANON_KEY", "").strip(),
+        "SUPABASE_SERVICE_ROLE_KEY": source.get("SUPABASE_SERVICE_ROLE_KEY", "").strip(),
+        "AUTH_REQUIRED": _read_bool(source.get("AUTH_REQUIRED"), False),
+        "ENABLE_ADMIN_BOOTSTRAP": _read_bool(source.get("ENABLE_ADMIN_BOOTSTRAP"), True),
+        "ADMIN_BOOTSTRAP_USERNAME": source.get("ADMIN_BOOTSTRAP_USERNAME", "admin").strip(),
+        "ADMIN_BOOTSTRAP_PASSWORD": source.get("ADMIN_BOOTSTRAP_PASSWORD", "admin").strip(),
     }
     return AppConfig(**data)
 

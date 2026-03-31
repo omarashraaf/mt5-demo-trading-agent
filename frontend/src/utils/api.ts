@@ -1,4 +1,5 @@
 import { runtimeConfig } from '../config';
+import { supabase } from '@/lib/supabase';
 
 const BASE_URL = runtimeConfig.apiBaseUrl;
 const LOCAL_PORT_FALLBACK_URL = BASE_URL.includes('127.0.0.1:8000')
@@ -24,8 +25,16 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  let authHeader: Record<string, string> = {};
+  if (supabase) {
+    const { data } = await supabase.auth.getSession();
+    const accessToken = data.session?.access_token;
+    if (accessToken) {
+      authHeader = { Authorization: `Bearer ${accessToken}` };
+    }
+  }
   const requestOptions: RequestInit = {
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeader },
     ...options,
   };
 
@@ -99,6 +108,39 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // Auth/Admin
+  authMe: () =>
+    request<{
+      id: string;
+      email: string;
+      role: string;
+      user_metadata: Record<string, unknown>;
+      app_metadata: Record<string, unknown>;
+    }>('/auth/me'),
+
+  bootstrapAdmin: () =>
+    request<{ ok: boolean; username: string; email: string; created: boolean }>('/auth/bootstrap-admin', {
+      method: 'POST',
+    }),
+
+  adminListUsers: () =>
+    request<{ users: Array<Record<string, unknown>>; count: number }>('/admin/users'),
+
+  adminCreateUser: (data: { email: string; password: string; role: 'admin' | 'user' }) =>
+    request<{ ok: boolean; user: Record<string, unknown> }>('/admin/users', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  adminUpdateRole: (data: { user_id: string; role: 'admin' | 'user' }) =>
+    request<{ ok: boolean; user: Record<string, unknown> }>('/admin/users/role', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  adminActivity: (limit: number = 200) =>
+    request<{ activity: Array<Record<string, unknown>>; count: number }>(`/admin/activity?limit=${limit}`),
+
   // Connection
   connect: (data: {
     platform?: 'mt5' | 'ibkr';

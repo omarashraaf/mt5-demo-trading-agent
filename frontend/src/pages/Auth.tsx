@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useAuth } from '@/context/AuthContext';
+import { api } from '@/utils/api';
 
 export default function AuthPage() {
   const { signIn, signUp, supabaseEnabled } = useAuth();
@@ -73,6 +74,26 @@ export default function AuthPage() {
           <div className="flex gap-2">
             <button className="btn btn-primary" type="submit" disabled={busy || !supabaseEnabled}>
               {busy ? 'Please wait...' : mode === 'login' ? 'Login' : 'Register'}
+            </button>
+            <button
+              className="btn btn-secondary"
+              type="button"
+              disabled={busy || !supabaseEnabled}
+              onClick={async () => {
+                setBusy(true);
+                setError(null);
+                setMessage(null);
+                try {
+                  const res = await api.bootstrapAdmin();
+                  setMessage(`Bootstrap admin ready: ${res.email} / admin`);
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : 'Failed to bootstrap admin');
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              Bootstrap admin/admin
             </button>
             <button
               className="btn btn-secondary"
