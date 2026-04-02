@@ -82,7 +82,12 @@ class MetaTrainingScheduler:
         logger.info("Meta training scheduler stopped.")
 
     async def _run_loop(self):
+        first_cycle = True
         while self._running:
+            if first_cycle:
+                # Avoid startup DB contention with UI/API requests.
+                await asyncio.sleep(min(30, max(5, self.interval_seconds // 3)))
+                first_cycle = False
             self._last_run_at = time.time()
             try:
                 await self._maybe_train_once()

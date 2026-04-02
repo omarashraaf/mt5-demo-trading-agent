@@ -1,62 +1,15 @@
-import logging
-import sys
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
-from api.admin_routes import router as admin_router, set_database as set_admin_database
-from storage.db import Database
-from config import config
-
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger(__name__)
-
-db = Database(config.DB_PATH)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await db.initialize()
-    set_admin_database(db)
-    logger.info("LinkTrade cloud admin backend started")
-    yield
-    await db.close()
-
-
-app = FastAPI(
-    title="LinkTrade Cloud Backend",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(admin_router, prefix="/api")
+app = FastAPI(title="LinkTrade Cloud Brain", version="1.0.0")
 
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "service": "linktrade-cloud-backend"}
+    return {"ok": True, "service": "linktrade-cloud-brain"}
 
 
 @app.post("/api/cloud-brain/decide")
 async def cloud_brain_decide(payload: dict):
-    """Cloud-side high-level decision API.
-
-    Receives analyzed factors from local runtime and returns action guidance.
-    This endpoint does not execute trades.
-    """
     signal = dict(payload.get("signal") or {})
     quality = dict(payload.get("quality") or {})
     user_policy = dict(payload.get("user_policy") or {})
@@ -70,20 +23,12 @@ async def cloud_brain_decide(payload: dict):
     no_trade_reasons = list(quality.get("no_trade_reasons") or [])
     mode = str(user_policy.get("mode", "balanced")).lower()
 
-    min_conf_by_mode = {
-        "safe": 0.70,
-        "balanced": 0.60,
-        "aggressive": 0.45,
-    }
-    min_quality_by_mode = {
-        "safe": 0.74,
-        "balanced": 0.66,
-        "aggressive": 0.55,
-    }
+    min_conf_by_mode = {"safe": 0.70, "balanced": 0.60, "aggressive": 0.45}
+    min_quality_by_mode = {"safe": 0.74, "balanced": 0.66, "aggressive": 0.55}
     min_conf = min_conf_by_mode.get(mode, 0.60)
     min_quality = min_quality_by_mode.get(mode, 0.66)
 
-    reasons: list[str] = []
+    reasons = []
     final_action = action if action in {"BUY", "SELL"} else "HOLD"
 
     if no_trade_zone:
@@ -121,8 +66,5 @@ async def cloud_brain_decide(payload: dict):
         "confidence": round(float(target_confidence), 4),
         "reason": "; ".join(reasons) if reasons else "Cloud brain approved local setup.",
         "mode": mode,
-        "thresholds": {
-            "min_confidence": min_conf,
-            "min_quality": min_quality,
-        },
+        "thresholds": {"min_confidence": min_conf, "min_quality": min_quality},
     }

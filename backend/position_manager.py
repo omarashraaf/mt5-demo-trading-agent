@@ -590,6 +590,16 @@ class PositionManager:
             },
         )
         await self.db.mark_evaluation_outcome(signal_id, "closed")
+        if self._on_trade_closed is not None:
+            await self._on_trade_closed(
+                {
+                    "ticket": ticket,
+                    "symbol": snapshot.get("symbol", ""),
+                    "exit_reason": exit_reason,
+                    "profit": float(snapshot.get("profit", 0.0)),
+                    "signal_id": signal_id,
+                }
+            )
 
     def _classify_passive_exit(self, snapshot: dict) -> str:
         entry = float(snapshot.get("price_open", 0.0))
@@ -665,7 +675,14 @@ class PositionManager:
 
         if self.db:
             try:
-                await self.db.log_ai_activity(action, symbol, ticket, detail, profit)
+                await self.db.log_ai_activity(
+                    action,
+                    symbol,
+                    ticket,
+                    detail,
+                    profit,
+                    decision_reason=detail,
+                )
             except Exception as exc:
                 logger.error("Failed to log AI activity: %s", exc)
 

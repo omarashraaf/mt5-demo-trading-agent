@@ -1,4 +1,4 @@
-import { Routes, Route, NavLink, useLocation } from 'react-router-dom';
+import { Routes, Route, NavLink, useLocation, Navigate } from 'react-router-dom';
 import { useState, useCallback, useEffect } from 'react';
 import {
   LayoutDashboard,
@@ -32,8 +32,8 @@ import EventsPage from './pages/Events';
 import AuthPage from './pages/Auth';
 import { useAuth } from './context/AuthContext';
 import AdminPortal from './pages/admin/AdminPortal';
-import PortalDashboard from './pages/PortalDashboard';
 import { runtimeConfig } from './config';
+import linkTradeLogo from './assets/linktrade-logo.png';
 
 const ADVANCED_NAV = [
   { path: '/chat', label: 'Gemini Chat', icon: MessageSquare },
@@ -79,7 +79,7 @@ export default function App() {
   };
 
   const connected = Boolean(status?.connected && status?.account);
-  const authed = Boolean(user);
+  const authed = Boolean(user) || !runtimeConfig.requireAuth;
 
   if (location.pathname.startsWith('/admin')) {
     return <AdminPortal />;
@@ -95,11 +95,11 @@ export default function App() {
     );
   }
 
-  if (!authed) {
+  if (runtimeConfig.requireAuth && !authed) {
     return <AuthPage />;
   }
 
-  if (!approved && role !== 'admin') {
+  if (runtimeConfig.requireAuth && !approved && role !== 'admin') {
     return (
       <div className="app-layout" style={{ alignItems: 'center', justifyContent: 'center' }}>
         <div className="card" style={{ maxWidth: 520, marginBottom: 0 }}>
@@ -120,14 +120,28 @@ export default function App() {
   }
 
   if (runtimeConfig.appMode === 'portal') {
-    return <PortalDashboard isAdmin={role === 'admin'} />;
+    return <PortalAutoRedirect isAdmin={role === 'admin'} />;
+  }
+
+  if (location.pathname === '/auth') {
+    return <Navigate to="/" replace />;
   }
 
   return (
     <div className="app-layout">
       <aside className="sidebar">
         <div className="sidebar-header">
-          <h1>TRADING ASSISTANT</h1>
+          <img
+            src={linkTradeLogo}
+            alt="LinkTrade"
+            style={{
+              width: '100%',
+              maxWidth: 170,
+              height: 'auto',
+              objectFit: 'contain',
+              marginBottom: 8,
+            }}
+          />
           <div className="subtitle">
             {connected ? (
               <span style={{ color: 'var(--accent-green)' }}>
@@ -137,14 +151,16 @@ export default function App() {
               'Demo Mode'
             )}
           </div>
-          <div style={{ marginTop: 10 }}>
-            <button
-              className="btn btn-secondary btn-sm"
-              onClick={() => void signOut()}
-            >
-              Logout
-            </button>
-          </div>
+          {runtimeConfig.requireAuth && (
+            <div style={{ marginTop: 10 }}>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => void signOut()}
+              >
+                Logout
+              </button>
+            </div>
+          )}
         </div>
         <nav className="sidebar-nav">
           <NavLink
@@ -224,6 +240,7 @@ export default function App() {
         </div>
 
         <Routes>
+          <Route path="/auth" element={<Navigate to="/" replace />} />
           <Route path="/" element={<SimpleDashboard status={status} onRefresh={refreshStatus} />} />
           <Route path="/connection" element={<Connection status={status} onRefresh={refreshStatus} />} />
           <Route path="/market" element={<Market connected={connected} />} />
@@ -235,8 +252,27 @@ export default function App() {
           <Route path="/chat" element={<ChatPage connected={connected} />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/events" element={<EventsPage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
+    </div>
+  );
+}
+
+function PortalAutoRedirect({ isAdmin }: { isAdmin: boolean }) {
+  useEffect(() => {
+    if (isAdmin) {
+      window.location.replace('/admin');
+      return;
+    }
+    window.location.replace(runtimeConfig.localRuntimeUrl);
+  }, [isAdmin]);
+
+  return (
+    <div className="app-layout" style={{ alignItems: 'center', justifyContent: 'center' }}>
+      <div className="card" style={{ marginBottom: 0 }}>
+        Redirecting...
+      </div>
     </div>
   );
 }

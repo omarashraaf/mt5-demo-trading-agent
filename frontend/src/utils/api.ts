@@ -36,9 +36,16 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const optionHeaders = options?.headers
     ? Object.fromEntries(new Headers(options.headers).entries())
     : {};
+  const method = String(options?.method || 'GET').toUpperCase();
+  const isMutation = method !== 'GET' && method !== 'HEAD';
+  const hasBody = options?.body != null && method !== 'GET' && method !== 'HEAD';
+  const mergedHeaders: Record<string, string> = { ...authHeader, ...optionHeaders };
+  if (hasBody && !Object.keys(mergedHeaders).some((k) => k.toLowerCase() === 'content-type')) {
+    mergedHeaders['Content-Type'] = 'application/json';
+  }
   const requestOptions: RequestInit = {
-    headers: { 'Content-Type': 'application/json', ...authHeader, ...optionHeaders },
     ...options,
+    headers: mergedHeaders,
   };
 
   const candidates = LOCAL_PORT_FALLBACK_URL
@@ -54,9 +61,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       || path.includes('/trade/quick-buy')
       || path.includes('/trade/execute')
     );
+    const liveTickPath = path.includes('/market/ticks');
     // Never retry trade execution requests on the client side.
     // A second attempt can feel like lag and may risk duplicate intents.
-    const maxAttemptsForBase = tradeExecutionPath ? 1 : (i === 0 ? 2 : 1);
+    const maxAttemptsForBase = (tradeExecutionPath || liveTickPath || isMutation) ? 1 : (i === 0 ? 2 : 1);
     for (let attemptIdx = 0; attemptIdx < maxAttemptsForBase; attemptIdx += 1) {
       try {
         const scanLikePath = path.includes('/agent/smart-evaluate') || path.includes('/auto-trade/activity');
@@ -66,17 +74,21 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
           || path.includes('/credentials/auto-connect')
         );
         const statusPath = path.includes('/status') || path.includes('/auto-trade/status');
-        const timeoutMs = scanLikePath
+        const timeoutMs = liveTickPath
+          ? (i === 0 ? 1200 : 1800)
+          : scanLikePath
           ? (i === 0 ? 45000 : 55000)
           : availableSymbolsPath
             ? (i === 0 ? 70000 : 80000)
           : tradeExecutionPath
-            ? (i === 0 ? 120000 : 130000)
+            ? (i === 0 ? 25000 : 30000)
             : connectPath
               ? (i === 0 ? 15000 : 22000)
             : statusPath
               ? (i === 0 ? 15000 : 22000)
-              : (i === 0 ? 25000 : 32000);
+              : isMutation
+                ? (i === 0 ? 12000 : 16000)
+                : (i === 0 ? 25000 : 32000);
         const attempt = await fetchWithTimeout(`${base}${path}`, requestOptions, timeoutMs);
         preferredBaseUrl = base;
         res = attempt;
@@ -91,7 +103,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
         } else {
           lastError = err;
         }
-        if (attemptIdx < maxAttemptsForBase - 1) {
+        if (!isMutation && attemptIdx < maxAttemptsForBase - 1) {
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
       }
@@ -105,6 +117,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
+    if (path.startsWith('/admin/') && (res.status === 401 || res.status === 403)) {
+      localStorage.removeItem('linktrade_admin_token');
+      throw new Error('Admin session expired. Please login again.');
+    }
     throw new Error(err.detail || `HTTP ${res.status}`);
   }
   return res.json();
@@ -317,6 +333,32 @@ export const api = {
 
   getTradeHistory: (limit: number = 50) =>
     request<import('@/types').TradeHistoryResponse>(`/trade-history?limit=${limit}`),
+  analyzeTradeHistoryItem: (
+    ticket: number,
+    forceRefresh: boolean = false,
+    useGemini: boolean = true,
+    tradeFallback?: {
+      signal_id?: number | null;
+      symbol?: string;
+      action?: 'BUY' | 'SELL';
+      profit_usd?: number | null;
+      started_with_usd?: number | null;
+      signal_reason?: string;
+      risk_reason?: string;
+      exit_reason?: string | null;
+    },
+  ) =>
+    request<{ ticket: number; signal_id: number | null; symbol: string; analysis: Record<string, unknown>; cached: boolean }>(
+      `/trade-history/${ticket}/analyze`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          force_refresh: forceRefresh,
+          use_gemini: useGemini,
+          ...tradeFallback,
+        }),
+      },
+    ),
 
   // Credentials
   getCredentials: () =>
@@ -376,6 +418,10 @@ export const api = {
         quality_score?: number;
         detail: string;
         success: boolean;
+        signal_id?: number | null;
+        decision_reason?: string;
+        gemini_summary?: string;
+        meta_model_summary?: string;
       }>;
       panic_stop: boolean;
       position_manager_running?: boolean;
@@ -407,6 +453,11 @@ export const api = {
       db_activity: Array<{
         id: number; timestamp: number; action: string;
         symbol: string; ticket: number; detail: string; profit: number;
+        signal_id?: number | null;
+        profit_pct?: number | null;
+        decision_reason?: string;
+        gemini_summary?: string;
+        meta_model_summary?: string;
       }>;
       position_manager: {
         running: boolean;

@@ -1,9 +1,11 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/context/AuthContext';
-import { api } from '@/utils/api';
+import { supabase } from '@/lib/supabase';
 
 export default function AuthPage() {
-  const { signIn, signOut, supabaseEnabled } = useAuth();
+  const navigate = useNavigate();
+  const { signIn, signUp, signOut, supabaseEnabled, refreshProfile } = useAuth();
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -19,25 +21,24 @@ export default function AuthPage() {
     try {
       if (mode === 'login') {
         await signIn(email.trim(), password);
-        try {
-          const me = await api.authMe();
-          if (!me.approved) {
-            await signOut();
-            throw new Error(
-              me.access_status === 'rejected'
-                ? 'Your account request was rejected by admin.'
-                : 'Your account is pending admin approval.',
-            );
-          }
-        } catch (err) {
-          if (err instanceof Error) {
-            throw err;
-          }
-          throw new Error('Could not verify account approval status.');
+        await refreshProfile();
+        const { data } = await supabase!.auth.getUser();
+        const normalizedStatus = String(data.user?.user_metadata?.access_status || 'pending').toLowerCase();
+        const normalizedRole = String(data.user?.app_metadata?.role || '').toLowerCase();
+        const isApproved = normalizedRole === 'admin' || normalizedStatus === 'approved';
+        if (!isApproved) {
+          await signOut();
+          throw new Error(
+            normalizedStatus === 'rejected'
+              ? 'Your account request was rejected by admin.'
+              : 'Your account is pending admin approval.',
+          );
         }
+        navigate('/', { replace: true });
       } else {
-        const res = await api.publicRegister({ email: email.trim(), password });
-        setMessage(res.message || 'Registration submitted. Wait for admin approval.');
+        await signUp(email.trim(), password);
+        setMessage('Registration submitted. Wait for admin approval.');
+        setMode('login');
       }
     } catch (err) {
       const detail = err instanceof Error ? err.message : 'Authentication failed';

@@ -1,7 +1,9 @@
 {
   "functions": {
     "api/index.py": {
-      "runtime": "@vercel/python@4.7.1"
+      "runtime": "@vercel/python@4.7.1",
+      "includeFiles": "{api/index.py,backend/cloud_main.py,backend/config.py,backend/api/**/*.py,backend/services/**/*.py,backend/storage/**/*.py,backend/domain/**/*.py}",
+      "excludeFiles": "{backend/venv/**,backend/.venv/**,backend/env/**,backend/ENV/**,backend/research_exports/**,backend/research_artifacts/**,backend/trading_agent.db*,backend/*.log,frontend/**}"
     }
   },
   "rewrites": [

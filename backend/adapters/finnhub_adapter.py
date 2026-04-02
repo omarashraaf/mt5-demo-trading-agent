@@ -33,6 +33,8 @@ class FinnhubAdapter:
         self.max_retries = max_retries
         self.session = session or requests.Session()
         self._last_error: str | None = None
+        self._healthcheck_cache: dict[str, Any] | None = None
+        self._healthcheck_cache_until: float = 0.0
 
     @property
     def available(self) -> bool:
@@ -42,24 +44,33 @@ class FinnhubAdapter:
     def last_error(self) -> str | None:
         return self._last_error
 
-    def healthcheck(self) -> dict[str, Any]:
+    def healthcheck(self, *, force_refresh: bool = False) -> dict[str, Any]:
+        now = time.time()
+        if not force_refresh and self._healthcheck_cache and now < self._healthcheck_cache_until:
+            return dict(self._healthcheck_cache)
         if not self.enabled:
-            return {
+            payload = {
                 "provider": "finnhub",
                 "enabled": False,
                 "available": False,
                 "degraded": False,
                 "reason": "Finnhub is disabled by configuration.",
             }
+            self._healthcheck_cache = payload
+            self._healthcheck_cache_until = now + 15.0
+            return dict(payload)
         if not self.api_key:
             self._last_error = "FINNHUB_API_KEY missing while ENABLE_FINNHUB=true."
-            return {
+            payload = {
                 "provider": "finnhub",
                 "enabled": True,
                 "available": False,
                 "degraded": True,
                 "reason": self._last_error,
             }
+            self._healthcheck_cache = payload
+            self._healthcheck_cache_until = now + 30.0
+            return dict(payload)
 
         news_ok = False
         calendar_ok = False
@@ -96,7 +107,7 @@ class FinnhubAdapter:
         reason = " | ".join(reason_parts)
         self._last_error = reason or None
 
-        return {
+        payload = {
             "provider": "finnhub",
             "enabled": True,
             "available": available,
@@ -111,6 +122,11 @@ class FinnhubAdapter:
             "sample_count": sample_count,
             "calendar_count": calendar_count,
         }
+        # Cache for a short window to avoid repeated external requests on /status polling.
+        # Keep cache longer while degraded to reduce log/API noise.
+        self._healthcheck_cache = payload
+        self._healthcheck_cache_until = now + (90.0 if degraded else 45.0)
+        return dict(payload)
 
     def get_economic_calendar(self, from_date: str, to_date: str) -> list[dict[str, Any]]:
         payload = self._get(

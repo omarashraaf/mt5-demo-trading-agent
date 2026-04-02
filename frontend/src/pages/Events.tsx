@@ -18,7 +18,8 @@ function parseJsonField(raw?: string): unknown {
 }
 
 export default function EventsPage() {
-  const LIVE_REFRESH_MS = 1000;
+  const UI_REFRESH_MS = 5000;
+  const INGEST_REFRESH_MS = 30000;
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -30,6 +31,9 @@ export default function EventsPage() {
   const [mappings, setMappings] = useState<EventAssetMappingRecord[]>([]);
   const [assessments, setAssessments] = useState<GeminiEventAssessmentRecord[]>([]);
   const [refreshSummary, setRefreshSummary] = useState<string>('');
+  const [liveEnabled, setLiveEnabled] = useState(true);
+  const [lastLiveSyncAt, setLastLiveSyncAt] = useState<number | null>(null);
+  const [liveBusy, setLiveBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -67,9 +71,34 @@ export default function EventsPage() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, LIVE_REFRESH_MS);
+    const t = setInterval(load, UI_REFRESH_MS);
     return () => clearInterval(t);
   }, [load]);
+
+  const runLiveIngest = useCallback(async () => {
+    if (!liveEnabled || liveBusy) return;
+    try {
+      setLiveBusy(true);
+      setError(null);
+      await api.refreshEvents({ news_category: 'general', classify_with_gemini: false });
+      setLastLiveSyncAt(Date.now());
+      await load();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Live refresh failed.';
+      setError(message);
+    } finally {
+      setLiveBusy(false);
+    }
+  }, [liveBusy, liveEnabled, load]);
+
+  useEffect(() => {
+    if (!liveEnabled) return;
+    void runLiveIngest();
+    const t = setInterval(() => {
+      void runLiveIngest();
+    }, INGEST_REFRESH_MS);
+    return () => clearInterval(t);
+  }, [liveEnabled, runLiveIngest]);
 
   useEffect(() => {
     if (activePlatform !== 'ibkr' && activeTab === 'ibkr') {
@@ -133,10 +162,20 @@ export default function EventsPage() {
             Live external events, mapped assets, and Gemini event assessments.
           </p>
         </div>
-        <button className="btn btn-secondary" onClick={onRefreshNow} disabled={refreshing}>
-          <RefreshCcw size={14} />
-          {refreshing ? 'Refreshing...' : 'Refresh Now'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            className={`btn btn-sm ${liveEnabled ? 'btn-primary' : 'btn-secondary'}`}
+            onClick={() => setLiveEnabled((prev) => !prev)}
+            disabled={refreshing}
+            title="Enable/disable live auto-refresh"
+          >
+            {liveEnabled ? 'Live On' : 'Live Off'}
+          </button>
+          <button className="btn btn-secondary" onClick={onRefreshNow} disabled={refreshing}>
+            <RefreshCcw size={14} />
+            {refreshing ? 'Refreshing...' : 'Refresh Now'}
+          </button>
+        </div>
       </div>
 
       {health && (
@@ -155,6 +194,11 @@ export default function EventsPage() {
             </div>
           )}
           {refreshSummary && <div className="text-sm text-muted mt-2">{refreshSummary}</div>}
+          <div className="text-sm text-muted mt-2">
+            Auto refresh: {liveEnabled ? `On (every ${Math.round(INGEST_REFRESH_MS / 1000)}s)` : 'Off'}
+            {lastLiveSyncAt ? ` • Last sync: ${new Date(lastLiveSyncAt).toLocaleTimeString()}` : ''}
+            {liveBusy ? ' • syncing...' : ''}
+          </div>
         </div>
       )}
 

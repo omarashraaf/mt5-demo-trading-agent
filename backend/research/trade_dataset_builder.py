@@ -12,6 +12,43 @@ DEFAULT_FEATURE_SCHEMA_VERSION = "v2"
 DEFAULT_LABEL_SCHEMA_VERSION = "v2"
 
 
+def _post_analysis_features(post_analysis: dict) -> dict:
+    if not isinstance(post_analysis, dict):
+        return {
+            "f_post_analysis_available": 0,
+        }
+    quality_scores = post_analysis.get("quality_scores", {}) or {}
+    mistakes = post_analysis.get("mistakes", []) if isinstance(post_analysis.get("mistakes"), list) else []
+    improvements = post_analysis.get("improvement_actions", []) if isinstance(post_analysis.get("improvement_actions"), list) else []
+    root_causes = post_analysis.get("root_causes", []) if isinstance(post_analysis.get("root_causes"), list) else []
+    diagnostics = post_analysis.get("diagnostics", {}) if isinstance(post_analysis.get("diagnostics"), dict) else {}
+    recommendation = post_analysis.get("recommendation", {}) if isinstance(post_analysis.get("recommendation"), dict) else {}
+
+    return {
+        "f_post_analysis_available": int(bool(post_analysis)),
+        "f_post_generated_by": str(post_analysis.get("generated_by", "")),
+        "f_post_future_confidence_adjustment": float(post_analysis.get("future_confidence_adjustment", 0.0) or 0.0),
+        "f_post_execution_quality": float(quality_scores.get("execution_quality", 0.0) or 0.0),
+        "f_post_risk_discipline": float(quality_scores.get("risk_discipline", 0.0) or 0.0),
+        "f_post_timing_quality": float(quality_scores.get("timing_quality", 0.0) or 0.0),
+        "f_post_mistakes_count": float(len(mistakes)),
+        "f_post_improvements_count": float(len(improvements)),
+        "f_post_root_causes_count": float(len(root_causes)),
+        "f_post_diag_late_entry": float(int(diagnostics.get("late_entry_flag", 0) or 0)),
+        "f_post_diag_spread_stress": float(int(diagnostics.get("spread_stress_flag", 0) or 0)),
+        "f_post_diag_trend_conflict": float(int(diagnostics.get("trend_conflict_flag", 0) or 0)),
+        "f_post_diag_overexposure": float(int(diagnostics.get("risk_overexposure_flag", 0) or 0)),
+        "f_post_diag_stop_too_tight": float(int(diagnostics.get("stop_too_tight_flag", 0) or 0)),
+        "f_post_diag_target_too_far": float(int(diagnostics.get("target_too_far_flag", 0) or 0)),
+        "f_post_diag_news_shock": float(int(diagnostics.get("news_shock_flag", 0) or 0)),
+        "f_post_diag_execution_delay": float(int(diagnostics.get("execution_delay_flag", 0) or 0)),
+        "f_post_rec_expected_winrate_adj": float(recommendation.get("expected_win_rate_adjustment", 0.0) or 0.0),
+        "f_post_rec_suggested_sl_pct": float(recommendation.get("suggested_sl_pct_of_start", 0.0) or 0.0),
+        "f_post_rec_suggested_tp_pct": float(recommendation.get("suggested_tp_pct_of_start", 0.0) or 0.0),
+        "f_post_rec_size_adjustment_pct": float(recommendation.get("next_trade_size_adjustment_pct", 0.0) or 0.0),
+    }
+
+
 def _safe_json_load(raw: str | None, default):
     if not raw:
         return default
@@ -98,6 +135,16 @@ class TradeDatasetBuilder:
                 by_signal[int(signal_id)] = item
         return by_signal
 
+    async def _fetch_post_analysis_by_signal(self, signal_ids: list[int]) -> dict[int, dict]:
+        if not signal_ids:
+            return {}
+        if not hasattr(self.db, "get_trade_post_analysis_by_signal_ids"):
+            return {}
+        try:
+            return await self.db.get_trade_post_analysis_by_signal_ids(signal_ids)
+        except Exception:
+            return {}
+
     async def build_dataset(
         self,
         *,
@@ -112,6 +159,7 @@ class TradeDatasetBuilder:
         feature_map = await self._fetch_feature_snapshots(candidate_ids)
         signal_ids = [int(c["signal_id"]) for c in candidates if c.get("signal_id") is not None]
         outcome_map = await self._fetch_outcomes_by_signal(signal_ids)
+        post_analysis_map = await self._fetch_post_analysis_by_signal(signal_ids)
 
         all_feature_names: set[str] = set()
         for info in feature_map.values():
@@ -130,7 +178,10 @@ class TradeDatasetBuilder:
                 candidate=candidate,
                 outcome=outcome_map.get(int(signal_id)) if signal_id is not None else None,
             )
-
+            post_analysis = {}
+            if signal_id is not None:
+                post = post_analysis_map.get(int(signal_id), {})
+                post_analysis = post.get("analysis_json", {}) if isinstance(post, dict) else {}
             row = {
                 "candidate_id": candidate_id,
                 "signal_id": signal_id,
@@ -147,6 +198,7 @@ class TradeDatasetBuilder:
                 "gemini_changed_decision": int(bool(candidate.get("gemini_changed_decision", False))),
                 "meta_model_changed_decision": int(bool(candidate.get("meta_model_changed_decision", False))),
             }
+            row.update(_post_analysis_features(post_analysis))
             row.update({f"f_{k}": v for k, v in normalized_features.items()})
             row.update(labels)
             rows.append(row)

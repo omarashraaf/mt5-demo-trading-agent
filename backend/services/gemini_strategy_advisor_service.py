@@ -126,6 +126,17 @@ class GeminiStrategyAdvisorService:
             except Exception as exc:  # pragma: no cover - defensive runtime guard
                 last_error = exc
                 text = str(exc)
+                upper = text.upper()
+                if "API_KEY_INVALID" in upper or "API KEY EXPIRED" in upper:
+                    self._last_error = "Gemini API key is invalid or expired."
+                    self._unavailable_reason = self._last_error
+                    self._client = None
+                    return self._fallback(
+                        "Gemini API key is invalid or expired; technical strategy is active.",
+                        used=False,
+                        degraded=False,
+                        error="api_key_invalid",
+                    )
                 if "429" in text or "RESOURCE_EXHAUSTED" in text:
                     retry = self._quota_min_cooldown_seconds
                     match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", text, flags=re.IGNORECASE)
@@ -143,7 +154,7 @@ class GeminiStrategyAdvisorService:
 
         self._last_error = str(last_error) if last_error else "Gemini strategy advisor failed."
         return self._fallback(
-            "Gemini strategy advisor failed; using deterministic defaults.",
+            "Gemini strategy advisor is temporarily unavailable; technical strategy is active.",
             used=True,
             error=self._last_error,
             degraded=True,

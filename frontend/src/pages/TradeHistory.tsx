@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { api } from '../utils/api';
-import type { TradeHistoryResponse, TradeHistoryItem } from '../types';
+import type { TradeHistoryResponse, TradeHistoryItem, ResearchStatusResponse } from '../types';
 
 function formatMoney(value?: number | null) {
   if (value == null || Number.isNaN(value)) return '-';
@@ -18,7 +18,10 @@ function formatDurationMins(mins?: number | null) {
 }
 
 function getTradeReason(trade: TradeHistoryItem) {
-  return trade.exit_reason || trade.signal_reason || trade.risk_reason || '-';
+  if (trade.exit_reason) return trade.exit_reason;
+  if (trade.decision_reason) return trade.decision_reason;
+  if (trade.trade_reasons && trade.trade_reasons.length > 0) return trade.trade_reasons[0];
+  return trade.signal_reason || trade.risk_reason || '-';
 }
 
 function formatTargetValue(started: number | null | undefined, delta: number | null | undefined, isTp: boolean) {
@@ -48,18 +51,28 @@ const EMPTY_HISTORY: TradeHistoryResponse = {
 
 export default function TradeHistory({ connected }: { connected: boolean }) {
   const [history, setHistory] = useState<TradeHistoryResponse>(EMPTY_HISTORY);
+  const [research, setResearch] = useState<ResearchStatusResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [limit, setLimit] = useState(100);
+  const [analyzingTicket, setAnalyzingTicket] = useState<number | null>(null);
+  const [analyzeMessage, setAnalyzeMessage] = useState('');
+  const [analyzeError, setAnalyzeError] = useState('');
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
       const data = await api.getTradeHistory(limit);
       setHistory(data);
+      void api.getResearchStatus()
+        .then((researchStatus) => setResearch(researchStatus))
+        .catch(() => setResearch(null));
+    } catch {
+      setHistory(EMPTY_HISTORY);
+      setResearch(null);
     } finally {
       setLoading(false);
     }
-  }, [connected, limit]);
+  }, [limit]);
 
   useEffect(() => {
     refresh();
@@ -71,6 +84,43 @@ export default function TradeHistory({ connected }: { connected: boolean }) {
     const t = setInterval(tick, 45000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  const analyzeTrade = useCallback(async (trade: TradeHistoryItem, forceRefresh: boolean = false) => {
+    if (!trade.ticket || trade.status !== 'closed') return;
+    setAnalyzingTicket(trade.ticket);
+    setAnalyzeError('');
+    setAnalyzeMessage('');
+    try {
+      const res = await api.analyzeTradeHistoryItem(
+        trade.ticket,
+        forceRefresh,
+        true,
+        {
+          signal_id: trade.signal_id,
+          symbol: trade.symbol,
+          action: trade.action,
+          profit_usd: trade.profit_usd,
+          started_with_usd: trade.started_with_usd,
+          signal_reason: trade.signal_reason,
+          risk_reason: trade.risk_reason,
+          exit_reason: trade.exit_reason,
+        },
+      );
+      setHistory((prev) => ({
+        ...prev,
+        trades: prev.trades.map((t) =>
+          t.ticket === trade.ticket
+            ? { ...t, post_analysis: (res.analysis as TradeHistoryItem['post_analysis']) || null }
+            : t,
+        ),
+      }));
+      setAnalyzeMessage(res.cached ? 'Loaded saved analysis.' : 'Trade analysis completed and saved.');
+    } catch (e: any) {
+      setAnalyzeError(e?.message || 'Trade analysis failed.');
+    } finally {
+      setAnalyzingTicket(null);
+    }
+  }, []);
 
   const summary = history.summary;
 
@@ -104,6 +154,8 @@ export default function TradeHistory({ connected }: { connected: boolean }) {
           </div>
         </div>
       </div>
+      {analyzeError && <div className="error-banner" style={{ marginBottom: 10 }}>{analyzeError}</div>}
+      {analyzeMessage && <div className="success-banner" style={{ marginBottom: 10 }}>{analyzeMessage}</div>}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 12, marginBottom: 12 }}>
         <div className="card" style={{ padding: '12px 14px' }}>
@@ -133,6 +185,18 @@ export default function TradeHistory({ connected }: { connected: boolean }) {
           <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--accent-red)' }}>{formatMoney(summary.worst_trade_usd)}</div>
         </div>
       </div>
+      <div className="card" style={{ padding: '10px 14px', marginBottom: 12 }}>
+        <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+          Meta model:{' '}
+          <span style={{ color: research?.meta_model_active ? 'var(--accent-green)' : 'var(--accent-red)', fontWeight: 600 }}>
+            {research?.meta_model_active ? 'Active' : 'Inactive'}
+          </span>
+          {research?.meta_model_active_version ? ` • ${research.meta_model_active_version}` : ''}
+          {research?.incremental_training?.last_closed_count != null
+            ? ` • trained on ${research.incremental_training.last_closed_count} closed trades`
+            : ''}
+        </div>
+      </div>
 
       <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
         {loading && history.trades.length === 0 ? (
@@ -153,6 +217,7 @@ export default function TradeHistory({ connected }: { connected: boolean }) {
                   <th>SL / TP Target</th>
                   <th>Duration</th>
                   <th>Reason</th>
+                  <th>AI Review</th>
                 </tr>
               </thead>
               <tbody>
@@ -191,7 +256,72 @@ export default function TradeHistory({ connected }: { connected: boolean }) {
                     </td>
                     <td>{formatDurationMins(trade.duration_minutes)}</td>
                     <td style={{ maxWidth: 380, whiteSpace: 'normal', wordBreak: 'break-word', fontSize: 12 }}>
-                      {getTradeReason(trade)}
+                      <div>{getTradeReason(trade)}</div>
+                      {trade.trade_reasons && trade.trade_reasons.length > 1 && (
+                        <div className="text-muted" style={{ fontSize: 11, marginTop: 3 }}>
+                          {trade.trade_reasons.slice(1).join(' • ')}
+                        </div>
+                      )}
+                      {trade.gemini_response && (
+                        <div style={{ fontSize: 11, marginTop: 4, color: 'var(--accent-blue)' }}>
+                          Gemini: {trade.gemini_response}
+                        </div>
+                      )}
+                      {trade.meta_model && (
+                        <div className="text-muted" style={{ fontSize: 11, marginTop: 4 }}>
+                          Meta model ({trade.meta_model.version_id || 'active'}): p={Math.round((trade.meta_model.profit_probability || 0) * 100)}%
+                          {trade.meta_model.changed_decision ? ' • changed decision' : ''}
+                          {trade.meta_model.blocked ? ' • blocked' : ''}
+                        </div>
+                      )}
+                    </td>
+                    <td style={{ minWidth: 220, maxWidth: 320 }}>
+                      {trade.status !== 'closed' || !trade.ticket ? (
+                        <span className="text-muted" style={{ fontSize: 11 }}>Available after close</span>
+                      ) : (
+                        <div style={{ display: 'grid', gap: 6 }}>
+                          <button
+                            className="btn btn-secondary"
+                            style={{ width: 'fit-content', fontSize: 11, padding: '4px 10px' }}
+                            onClick={() => analyzeTrade(trade, false)}
+                            disabled={analyzingTicket === trade.ticket}
+                          >
+                            {analyzingTicket === trade.ticket ? <span className="loading-spinner" /> : 'Analyze'}
+                          </button>
+                          {trade.post_analysis?.summary && (
+                            <div style={{ fontSize: 11, color: 'var(--text-secondary)', whiteSpace: 'normal', wordBreak: 'break-word' }}>
+                              {trade.post_analysis.summary}
+                            </div>
+                          )}
+                          {trade.post_analysis?.quality_scores && (
+                            <div className="text-muted" style={{ fontSize: 10 }}>
+                              Q: exec {Math.round((trade.post_analysis.quality_scores.execution_quality || 0) * 100)}%
+                              {' • '}risk {Math.round((trade.post_analysis.quality_scores.risk_discipline || 0) * 100)}%
+                              {' • '}timing {Math.round((trade.post_analysis.quality_scores.timing_quality || 0) * 100)}%
+                            </div>
+                          )}
+                          {trade.post_analysis?.diagnostics && (
+                            <div className="text-muted" style={{ fontSize: 10, whiteSpace: 'normal', wordBreak: 'break-word' }}>
+                              Flags:
+                              {trade.post_analysis.diagnostics.late_entry_flag ? ' late-entry' : ''}
+                              {trade.post_analysis.diagnostics.spread_stress_flag ? ' spread-stress' : ''}
+                              {trade.post_analysis.diagnostics.trend_conflict_flag ? ' trend-conflict' : ''}
+                              {trade.post_analysis.diagnostics.risk_overexposure_flag ? ' overexposure' : ''}
+                              {trade.post_analysis.diagnostics.stop_too_tight_flag ? ' stop-tight' : ''}
+                              {trade.post_analysis.diagnostics.target_too_far_flag ? ' target-far' : ''}
+                              {trade.post_analysis.diagnostics.news_shock_flag ? ' news-shock' : ''}
+                              {trade.post_analysis.diagnostics.execution_delay_flag ? ' execution-delay' : ''}
+                            </div>
+                          )}
+                          {trade.post_analysis?.recommendation && (
+                            <div className="text-muted" style={{ fontSize: 10 }}>
+                              Learnings: SL {Math.round((trade.post_analysis.recommendation.suggested_sl_pct_of_start || 0) * 100)}%
+                              {' • '}TP {Math.round((trade.post_analysis.recommendation.suggested_tp_pct_of_start || 0) * 100)}%
+                              {' • '}size adj {trade.post_analysis.recommendation.next_trade_size_adjustment_pct || 0}%
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </td>
                   </tr>
                 ))}

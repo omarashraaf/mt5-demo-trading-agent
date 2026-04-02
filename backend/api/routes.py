@@ -141,6 +141,12 @@ RUNTIME_STATE_KEY = "runtime_controls_v1"
 CHAT_HISTORY_STATE_KEY = "chat_history_v1"
 DEFAULT_MARGIN_SL_PCT = 0.08
 DEFAULT_MARGIN_TP_PCT = 0.12
+_cloud_brain_state: dict = {
+    "last_command_at": 0.0,
+    "last_command_payload": {},
+    "last_apply_result": {},
+    "last_error": None,
+}
 
 
 def _recommended_trade_amount_from_free_margin(
@@ -240,10 +246,15 @@ async def _on_position_manager_trade_closed(_payload: dict):
     _schedule_incremental_meta_training("position_manager_close")
 
 
+async def _on_trade_outcome_logged(_payload: dict):
+    _schedule_incremental_meta_training("trade_outcome_logged")
+
+
 def set_database(database: Database):
     global db
     global research_cycle_service
     db = database
+    db.set_trade_outcome_callback(_on_trade_outcome_logged)
     signal_pipeline.set_database(database)
     execution_service.db = database
     auto_trader.set_database(database)
@@ -257,6 +268,75 @@ def set_database(database: Database):
 
 def current_research_cycle_service() -> Optional[ResearchCycleService]:
     return research_cycle_service
+
+
+async def apply_cloud_brain_command(command: dict) -> dict:
+    """Apply cloud command as high-level runtime policy controls only.
+
+    Execution/risk checks remain local and deterministic.
+    """
+    global _cloud_brain_state
+    cmd = dict(command or {})
+    applied: dict[str, object] = {"updated": []}
+
+    try:
+        mode = cmd.get("mode")
+        if isinstance(mode, str) and mode.strip().lower() in {"safe", "balanced", "aggressive"}:
+            policy = risk_engine.user_policy.model_copy(update={"mode": mode.strip().lower()})
+            risk_engine.update_user_policy(policy)
+            applied["updated"].append("mode")
+
+        if "allowed_symbols" in cmd and isinstance(cmd.get("allowed_symbols"), list):
+            symbols = [str(s).strip().upper() for s in cmd.get("allowed_symbols", []) if str(s).strip()]
+            policy = risk_engine.user_policy.model_copy(update={"allowed_symbols": symbols})
+            risk_engine.update_user_policy(policy)
+            applied["updated"].append("allowed_symbols")
+
+        if "auto_trade_enabled" in cmd:
+            risk_engine.auto_trade_enabled = bool(cmd.get("auto_trade_enabled"))
+            if risk_engine.auto_trade_enabled and not auto_trader.is_running and connector.connected:
+                task_orchestrator.start_auto_trade()
+            elif not risk_engine.auto_trade_enabled and auto_trader.is_running:
+                task_orchestrator.stop_auto_trade()
+            applied["updated"].append("auto_trade_enabled")
+
+        if "scan_interval_seconds" in cmd:
+            try:
+                interval = int(cmd.get("scan_interval_seconds"))
+                risk_engine.auto_trade_scan_interval_seconds = max(5, min(interval, 30))
+                applied["updated"].append("scan_interval_seconds")
+            except (TypeError, ValueError):
+                pass
+
+        if "panic_stop" in cmd:
+            panic_enabled = bool(cmd.get("panic_stop"))
+            if panic_enabled:
+                risk_engine.panic_stopped = True
+                task_orchestrator.stop_auto_trade()
+            else:
+                risk_engine.panic_stopped = False
+            applied["updated"].append("panic_stop")
+
+        await _persist_runtime_state()
+        _cloud_brain_state = {
+            "last_command_at": time.time(),
+            "last_command_payload": cmd,
+            "last_apply_result": applied,
+            "last_error": None,
+        }
+        return applied
+    except Exception as exc:
+        _cloud_brain_state = {
+            "last_command_at": time.time(),
+            "last_command_payload": cmd,
+            "last_apply_result": {},
+            "last_error": str(exc),
+        }
+        raise
+
+
+def cloud_brain_snapshot() -> dict:
+    return dict(_cloud_brain_state or {})
 
 
 def _runtime_state_payload() -> dict:
@@ -333,13 +413,22 @@ def _schedule_incremental_meta_training(trigger: str):
 
     async def _runner():
         try:
-            result = await service.maybe_train_from_new_trade_outcome(
-                min_rows=config.AUTO_META_TRAIN_MIN_CLOSED_TRADES,
-                cooldown_seconds=max(60, int(config.AUTO_META_TRAIN_INTERVAL_SECONDS // 2)),
-                auto_approve=config.AUTO_META_AUTO_APPROVE,
-                min_precision=config.AUTO_META_MIN_PRECISION,
-                min_f1=config.AUTO_META_MIN_F1,
-            )
+            if trigger == "post_trade_analysis_saved":
+                result = await service.maybe_train_from_post_analysis_update(
+                    min_rows=config.AUTO_META_TRAIN_MIN_CLOSED_TRADES,
+                    cooldown_seconds=max(120, int(config.AUTO_META_TRAIN_INTERVAL_SECONDS)),
+                    auto_approve=config.AUTO_META_AUTO_APPROVE,
+                    min_precision=config.AUTO_META_MIN_PRECISION,
+                    min_f1=config.AUTO_META_MIN_F1,
+                )
+            else:
+                result = await service.maybe_train_from_new_trade_outcome(
+                    min_rows=config.AUTO_META_TRAIN_MIN_CLOSED_TRADES,
+                    cooldown_seconds=max(60, int(config.AUTO_META_TRAIN_INTERVAL_SECONDS // 2)),
+                    auto_approve=config.AUTO_META_AUTO_APPROVE,
+                    min_precision=config.AUTO_META_MIN_PRECISION,
+                    min_f1=config.AUTO_META_MIN_F1,
+                )
             logger.info("Incremental meta-training trigger=%s result=%s", trigger, result)
         except Exception as exc:
             logger.warning("Incremental meta-training failed after %s: %s", trigger, exc)
@@ -352,10 +441,16 @@ def _requested_agent_from_final_name(agent_name: str) -> str:
 
 
 def _resolve_market_symbol(symbol: str) -> str:
+    normalized = universe_service.canonical_symbol(symbol)
+    # Fast path: if the symbol is directly available in MT5, avoid expensive universe scans.
+    info = market_data.get_symbol_info(normalized)
+    if info:
+        return normalized
+    # Fallback path only when direct symbol lookup fails.
     tradeable = market_data.get_tradeable_symbols()
     visible = market_data.get_visible_symbols() if not tradeable else []
-    resolved = universe_service.resolve_requested_symbols([symbol], tradeable + visible)
-    return resolved[0] if resolved else symbol
+    resolved = universe_service.resolve_requested_symbols([normalized], tradeable + visible)
+    return resolved[0] if resolved else normalized
 
 
 def _reward_risk_ratio(entry_price: float, stop_loss: float | None, take_profit: float | None) -> float:
@@ -639,14 +734,6 @@ def _build_fast_execution_context(
         "spread": float(getattr(tick, "spread", 0.0) or 0.0),
         "time": float(getattr(tick, "time", 0.0) or 0.0),
     }
-
-
-async def _run_ibkr(callable_obj, *args, **kwargs):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _ibkr_executor,
-        lambda: callable_obj(*args, **kwargs),
-    )
     normalized_symbol_info = signal_pipeline._normalize_symbol_info(symbol, tick_payload) if symbol_info else None
     profile = (
         signal_pipeline.profile_service.resolve_profile(symbol, normalized_symbol_info)
@@ -679,6 +766,14 @@ async def _run_ibkr(callable_obj, *args, **kwargs):
         bars_by_timeframe={},
         symbol_open_positions=symbol_positions,
         all_open_positions=open_positions,
+    )
+
+
+async def _run_ibkr(callable_obj, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _ibkr_executor,
+        lambda: callable_obj(*args, **kwargs),
     )
 
 
@@ -1210,13 +1305,15 @@ async def connect(req: ConnectRequest):
                 detail=ibkr_connector.last_error or f"IBKR connection failed: {exc}",
             )
 
-    if req.account is None or not req.password.strip() or not req.server.strip():
+    mt5_password = (req.password or "").strip()
+    mt5_server = (req.server or "").strip()
+    if req.account is None or not mt5_password or not mt5_server:
         raise HTTPException(status_code=400, detail="MT5 requires account, password, and server.")
     raw_path = (req.terminal_path or config.DEFAULT_TERMINAL_PATH).strip().strip('"').strip("'")
     params = ConnectionParams(
         account=req.account,
-        password=req.password,
-        server=req.server,
+        password=mt5_password,
+        server=mt5_server,
         terminal_path=raw_path,
     )
     success = connector.connect(params)
@@ -1243,8 +1340,8 @@ async def connect(req: ConnectRequest):
 
         credential_status = await _persist_credentials_if_requested(
             account=req.account,
-            server=req.server,
-            password=req.password,
+            server=mt5_server,
+            password=mt5_password,
             terminal_path=raw_path,
             save_credentials=req.save_credentials,
         )
@@ -1256,7 +1353,13 @@ async def connect(req: ConnectRequest):
     if not success:
         if db:
             await db.log_error("connection", connector.last_error or "Unknown error")
-        raise HTTPException(status_code=400, detail=connector.last_error)
+        detail = connector.last_error or "Unknown error"
+        if "Authorization failed" in detail:
+            detail = (
+                f"{detail}. Verify MT5 account password (not investor password) "
+                "and exact server name."
+            )
+        raise HTTPException(status_code=400, detail=detail)
 
     return {
         "connected": True,
@@ -1297,10 +1400,8 @@ async def status():
         is_demo = connector.is_demo()
         positions_snapshot = execution.get_positions()
 
-    # Normalize stale MT5 IPC state: if connector says connected but account refresh failed,
-    # report disconnected so UI shows reconnection flow instead of a blank "connected" shell.
-    if active_platform == "mt5" and connected_flag and account is None:
-        connected_flag = False
+    # Keep runtime connected state stable even if one account refresh call fails.
+    # Temporary MT5 IPC hiccups should not flip UI to disconnected and stop live polling.
     portfolio_snapshot = signal_pipeline.portfolio_risk_service.snapshot(
         account,
         positions_snapshot,
@@ -1338,6 +1439,103 @@ async def status():
         "finnhub": finnhub_adapter.healthcheck(),
         "portfolio": portfolio_snapshot,
         "services": task_orchestrator.status_snapshot(),
+        "cloud_brain": cloud_brain_snapshot(),
+        "cloud_decision": {
+            "enabled": bool(config.CLOUD_BRAIN_DECISION_ENABLED),
+            "configured": bool(getattr(signal_pipeline.cloud_brain_decision_client, "configured", False)),
+            "url": config.CLOUD_BRAIN_DECISION_URL,
+            "last_error": getattr(signal_pipeline.cloud_brain_decision_client, "last_error", None),
+        },
+    }
+
+
+@router.post("/cloud-brain/apply")
+async def cloud_brain_apply(command: dict):
+    """Apply a cloud-brain command immediately (manual/testing endpoint)."""
+    result = await apply_cloud_brain_command(command)
+    return {
+        "ok": True,
+        "result": result,
+        "cloud_brain": cloud_brain_snapshot(),
+    }
+
+
+@router.post("/cloud-brain/decide")
+async def cloud_brain_decide(payload: dict):
+    """Cloud-side high-level decision API.
+
+    Receives analyzed factors from local runtime and returns action guidance.
+    This endpoint does not execute trades.
+    """
+    signal = dict(payload.get("signal") or {})
+    quality = dict(payload.get("quality") or {})
+    user_policy = dict(payload.get("user_policy") or {})
+    gemini = dict(payload.get("gemini") or {}) if isinstance(payload.get("gemini"), dict) else {}
+    meta_model = dict(payload.get("meta_model") or {}) if isinstance(payload.get("meta_model"), dict) else {}
+
+    action = str(signal.get("action", "HOLD")).upper()
+    confidence = float(signal.get("confidence", 0.0) or 0.0)
+    quality_score = float(quality.get("score", 0.0) or 0.0)
+    no_trade_zone = bool(quality.get("no_trade_zone", False))
+    no_trade_reasons = list(quality.get("no_trade_reasons") or [])
+    mode = str(user_policy.get("mode", "balanced")).lower()
+
+    # Cloud policy thresholds can evolve centrally.
+    min_conf_by_mode = {
+        "safe": 0.70,
+        "balanced": 0.60,
+        "aggressive": 0.45,
+    }
+    min_quality_by_mode = {
+        "safe": 0.74,
+        "balanced": 0.66,
+        "aggressive": 0.55,
+    }
+    min_conf = min_conf_by_mode.get(mode, 0.60)
+    min_quality = min_quality_by_mode.get(mode, 0.66)
+
+    reasons: list[str] = []
+    final_action = action if action in {"BUY", "SELL"} else "HOLD"
+
+    if no_trade_zone:
+        final_action = "HOLD"
+        reasons.append("No-trade zone from local quality gate.")
+        reasons.extend(no_trade_reasons[:2])
+
+    if confidence < min_conf:
+        final_action = "HOLD"
+        reasons.append(f"Confidence below {min_conf:.0%} threshold for {mode} mode.")
+
+    if quality_score < min_quality:
+        final_action = "HOLD"
+        reasons.append(f"Quality below {min_quality:.0%} threshold for {mode} mode.")
+
+    contradiction = bool(gemini.get("contradiction_flag", False))
+    if contradiction and mode in {"safe", "balanced"}:
+        final_action = "HOLD"
+        reasons.append("Gemini contradiction in non-aggressive mode.")
+
+    no_trade_prob = float(meta_model.get("no_trade_probability", 0.0) or 0.0)
+    if no_trade_prob >= 0.60:
+        final_action = "HOLD"
+        reasons.append("Meta-model no-trade probability is high.")
+
+    target_confidence = confidence
+    if final_action == "HOLD":
+        target_confidence = min(confidence, max(0.0, confidence - 0.08))
+    else:
+        target_confidence = max(confidence, min(0.95, confidence + 0.02))
+
+    return {
+        "source": "cloud_brain",
+        "action": final_action,
+        "confidence": round(float(target_confidence), 4),
+        "reason": "; ".join(reasons) if reasons else "Cloud brain approved local setup.",
+        "mode": mode,
+        "thresholds": {
+            "min_confidence": min_conf,
+            "min_quality": min_quality,
+        },
     }
 
 
@@ -1433,12 +1631,12 @@ async def get_ticks(symbols: str):
                 "time": int(time.time()),
             }
     else:
+        # Bulk lookup first for lower latency under fast dashboard polling.
+        bulk = market_data.get_ticks(requested)
         for sym in requested:
-            resolved = _resolve_market_symbol(sym)
-            tick = market_data.get_tick(resolved)
-            if tick is None:
-                continue
-            ticks[sym] = tick.model_dump()
+            tick = bulk.get(sym)
+            if tick is not None:
+                ticks[sym] = tick.model_dump()
 
     return {"ticks": ticks}
 
@@ -3120,13 +3318,15 @@ async def get_logs(limit: int = 100, log_type: str = "all"):
 
 @router.get("/trade-history")
 async def get_trade_history(limit: int = 50):
+    _t0 = time.time()
+    logger.info("trade-history:start limit=%s platform=%s connected=%s", limit, active_platform, connector.connected)
     if active_platform == "ibkr" and ibkr_connector.connected:
         broker_trades = await _run_ibkr(ibkr_connector.get_recent_executions, limit=max(limit, 50))
-        closed = [t for t in broker_trades if t.get("status") == "closed"]
+        closed = [t for t in broker_trades if str(t.get("status", "")).lower() == "closed"]
         summary = {
-            "total_trades": len(broker_trades),
+            "total_trades": len(closed),
             "closed_trades": len(closed),
-            "open_trades": len([t for t in broker_trades if t.get("status") != "closed"]),
+            "open_trades": 0,
             "winning_trades": 0,
             "losing_trades": 0,
             "breakeven_trades": 0,
@@ -3140,7 +3340,7 @@ async def get_trade_history(limit: int = 50):
         }
         return {
             "summary": summary,
-            "trades": broker_trades[:limit],
+            "trades": closed[:limit],
             "source": "ibkr_broker_executions",
         }
 
@@ -3164,11 +3364,45 @@ async def get_trade_history(limit: int = 50):
             "trades": [],
         }
 
-    raw_orders = await db.get_trade_history(max(limit * 3, 90))
+    raw_limit = max(limit * 3, 90)
+    cursor = await db._db.execute(
+        """SELECT
+               o.id,
+               o.timestamp,
+               o.signal_id,
+               o.symbol,
+               o.action,
+               o.volume,
+               o.price,
+               o.stop_loss,
+               o.take_profit,
+               o.ticket,
+               o.success,
+               o.comment,
+               s.agent_name,
+               s.confidence,
+               s.reason AS signal_reason
+           FROM orders o
+           LEFT JOIN signals s ON s.id = o.signal_id
+           WHERE o.success = 1
+           ORDER BY o.timestamp DESC
+           LIMIT ?""",
+        (raw_limit,),
+    )
+    raw_rows = await cursor.fetchall()
+    raw_cols = [d[0] for d in cursor.description]
+    raw_orders = [dict(zip(raw_cols, row)) for row in raw_rows]
     outcomes = await db.get_trade_outcomes(max(limit * 4, 100))
+    logger.info(
+        "trade-history:data-loaded raw_orders=%s outcomes=%s elapsed_ms=%s",
+        len(raw_orders),
+        len(outcomes),
+        int((time.time() - _t0) * 1000),
+    )
 
-    account = connector.refresh_account() if connector.connected else None
-    leverage = float(getattr(account, "leverage", 100) or 100)
+    # Keep trade-history endpoint fast and deterministic by using persisted DB values only.
+    # MT5 enrichment calls can block under terminal load and cause UI hangs.
+    leverage = 100.0
 
     def _to_float(v, default: float = 0.0) -> float:
         try:
@@ -3205,6 +3439,21 @@ async def get_trade_history(limit: int = 50):
             return max(0.0, (time.time() - opened_at) / 60.0)
         return max(0.0, (closed_at - opened_at) / 60.0)
 
+    def _parse_json_blob(value):
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return json.loads(text)
+            except Exception:
+                return None
+        return None
+
     outcome_by_ticket: dict[int, dict] = {}
     outcome_by_signal: dict[int, dict] = {}
     for outcome in outcomes:
@@ -3215,19 +3464,19 @@ async def get_trade_history(limit: int = 50):
         if isinstance(signal_id, int) and signal_id not in outcome_by_signal:
             outcome_by_signal[signal_id] = outcome
 
-    # Cache MT5 symbol-info calls by symbol to avoid repeated terminal round-trips.
-    symbol_contract_size_cache: dict[str, Optional[float]] = {}
+    # Keep list endpoint responsive: skip heavy bulk enrichment lookups.
+    signal_ids = []
+    candidate_by_signal: dict[int, dict] = {}
+    journal_by_signal: dict[int, dict] = {}
+    post_analysis_by_signal: dict[int, dict] = {}
 
+    # No MT5 symbol-info enrichment in history route to avoid long blocking calls.
     def _contract_size_for_symbol(symbol_name: str) -> Optional[float]:
-        if symbol_name in symbol_contract_size_cache:
-            return symbol_contract_size_cache[symbol_name]
-        info = market_data.get_symbol_info(symbol_name) or {}
-        contract_size_value = _to_float(info.get("trade_contract_size"), 0.0)
-        contract_size = contract_size_value if contract_size_value > 0 else None
-        symbol_contract_size_cache[symbol_name] = contract_size
-        return contract_size
+        _ = symbol_name
+        return None
 
     trades: list[dict] = []
+    open_profit_by_ticket: dict[int, float] = {}
     for row in raw_orders:
         action = str(row.get("action", "")).upper()
         if action not in {"BUY", "SELL"}:
@@ -3251,16 +3500,26 @@ async def get_trade_history(limit: int = 50):
             candidate = outcome_by_signal.get(signal_id)
             if candidate and str(candidate.get("symbol", "")).upper() == symbol:
                 outcome = candidate
+        if outcome is None:
+            # Trade history view should include only completed trades.
+            continue
 
         closed_at = _to_float(outcome.get("closed_at"), 0.0) if outcome else 0.0
         closed_at_value = closed_at if closed_at > 0 else None
         profit = _to_float(outcome.get("profit"), 0.0) if outcome else None
-        status = "closed" if outcome else "open"
+        status = "closed"
         exit_reason = str(outcome.get("exit_reason", "")) if outcome else ""
-
-        contract_size = _contract_size_for_symbol(symbol)
+        if status == "open" and isinstance(ticket, int) and ticket in open_profit_by_ticket:
+            profit = float(open_profit_by_ticket[ticket])
 
         started_with, started_source = _extract_started_amount(row.get("comment"), row.get("signal_reason"))
+        contract_size: Optional[float] = None
+        if (
+            started_with is None
+            and entry_price > 0
+            and volume > 0
+        ):
+            contract_size = _contract_size_for_symbol(symbol)
         if (
             started_with is None
             and contract_size is not None
@@ -3282,14 +3541,68 @@ async def get_trade_history(limit: int = 50):
         tp_amount = _extract_comment_named_amount(row.get("comment"), "TPA")
         sl_pct = None
         tp_pct = None
+        if sl_amount is None and stop_loss > 0 and entry_price > 0 and volume > 0:
+            if contract_size is None:
+                contract_size = _contract_size_for_symbol(symbol)
         if sl_amount is None and stop_loss > 0 and entry_price > 0 and volume > 0 and contract_size is not None:
             sl_amount = abs(entry_price - stop_loss) * volume * contract_size
+        if tp_amount is None and take_profit > 0 and entry_price > 0 and volume > 0:
+            if contract_size is None:
+                contract_size = _contract_size_for_symbol(symbol)
         if tp_amount is None and take_profit > 0 and entry_price > 0 and volume > 0 and contract_size is not None:
             tp_amount = abs(take_profit - entry_price) * volume * contract_size
         if started_with and started_with > 0 and sl_amount is not None:
             sl_pct = (sl_amount / started_with) * 100.0
         if started_with and started_with > 0 and tp_amount is not None:
             tp_pct = (tp_amount / started_with) * 100.0
+
+        candidate = candidate_by_signal.get(signal_id) if isinstance(signal_id, int) else None
+        journal = journal_by_signal.get(signal_id) if isinstance(signal_id, int) else None
+        journal_exec = _parse_json_blob(journal.get("execution_decision")) if journal else None
+        journal_gemini = _parse_json_blob(journal.get("gemini_assessment")) if journal else None
+        decision_reason = (
+            (journal_exec or {}).get("reason")
+            or row.get("signal_reason")
+            or row.get("risk_reason")
+            or (candidate or {}).get("risk_decision")
+            or ""
+        )
+        trade_reasons: list[str] = []
+        if isinstance(journal_exec, dict):
+            tda = journal_exec.get("trade_decision_assessment") or {}
+            if isinstance(tda, dict):
+                reasons = tda.get("reasons") or []
+                if isinstance(reasons, list):
+                    trade_reasons.extend(str(r) for r in reasons if str(r).strip())
+
+        gemini_response = (
+            (journal_gemini or {}).get("summary_reason")
+            or (journal_gemini or {}).get("reason")
+            or (candidate or {}).get("gemini_summary")
+            or None
+        )
+
+        meta_model_summary = None
+        if isinstance(journal_exec, dict):
+            sig_dec = journal_exec.get("signal_decision") or {}
+            final_signal = sig_dec.get("final_signal") if isinstance(sig_dec, dict) else {}
+            metadata = final_signal.get("metadata") if isinstance(final_signal, dict) else {}
+            meta_model = metadata.get("meta_model") if isinstance(metadata, dict) else {}
+            if isinstance(meta_model, dict) and meta_model:
+                meta_model_summary = {
+                    "version_id": str(meta_model.get("version_id") or ""),
+                    "profit_probability": float(meta_model.get("profit_probability") or 0.0),
+                    "expected_edge": float(meta_model.get("expected_edge") or 0.0),
+                    "blocked": bool(meta_model.get("blocked", False)),
+                    "changed_decision": bool(meta_model.get("changed_decision", False)),
+                    "quality_before": float(meta_model.get("quality_before") or 0.0),
+                    "quality_after": float(meta_model.get("quality_after") or 0.0),
+                }
+        post_analysis = None
+        if isinstance(signal_id, int):
+            pa = post_analysis_by_signal.get(signal_id)
+            if pa:
+                post_analysis = pa.get("analysis_json")
 
         trades.append(
             {
@@ -3320,28 +3633,19 @@ async def get_trade_history(limit: int = 50):
                 "signal_reason": row.get("signal_reason"),
                 "risk_approved": row.get("approved"),
                 "risk_reason": row.get("risk_reason"),
+                "decision_reason": decision_reason or None,
+                "trade_reasons": list(dict.fromkeys(trade_reasons)),
+                "gemini_response": gemini_response,
+                "meta_model": meta_model_summary,
+                "post_analysis": post_analysis,
                 "exit_reason": exit_reason or None,
             }
         )
         if len(trades) >= limit:
             break
+    logger.info("trade-history:rows-built trades=%s elapsed_ms=%s", len(trades), int((time.time() - _t0) * 1000))
 
-    if connector.connected:
-        mt5_tickets = [
-            int(t["ticket"])
-            for t in trades
-            if t.get("status") == "closed" and isinstance(t.get("ticket"), int)
-        ]
-        if mt5_tickets:
-            pnl_map = execution.get_realized_profit_map(mt5_tickets, lookback_days=60)
-            for t in trades:
-                tk = t.get("ticket")
-                if t.get("status") == "closed" and isinstance(tk, int) and tk in pnl_map:
-                    mt5_profit = float(pnl_map[tk])
-                    t["profit_usd"] = mt5_profit
-                    started_with = t.get("started_with_usd")
-                    t["ended_with_usd"] = (started_with + mt5_profit) if started_with is not None else None
-                    t["profit_pct"] = ((mt5_profit / started_with) * 100.0) if started_with else None
+    # Realized PnL MT5 reconciliation is intentionally skipped here for responsiveness.
 
     closed = [t for t in trades if t.get("status") == "closed" and t.get("profit_usd") is not None]
     wins = [t for t in closed if _to_float(t.get("profit_usd")) > 0]
@@ -3351,9 +3655,9 @@ async def get_trade_history(limit: int = 50):
     total_started = sum(_to_float(t.get("started_with_usd")) for t in closed if t.get("started_with_usd") is not None)
 
     summary = {
-        "total_trades": len(trades),
+        "total_trades": len(closed),
         "closed_trades": len(closed),
-        "open_trades": len([t for t in trades if t.get("status") == "open"]),
+        "open_trades": 0,
         "winning_trades": len(wins),
         "losing_trades": len(losses),
         "breakeven_trades": len(breakeven),
@@ -3366,7 +3670,312 @@ async def get_trade_history(limit: int = 50):
         "worst_trade_usd": min((_to_float(t.get("profit_usd")) for t in closed), default=0.0),
     }
 
+    logger.info("trade-history:done total=%s elapsed_ms=%s", len(trades), int((time.time() - _t0) * 1000))
     return {"summary": summary, "trades": trades}
+
+
+class TradePostAnalyzeRequest(BaseModel):
+    force_refresh: bool = False
+    use_gemini: bool = True
+    signal_id: Optional[int] = None
+    symbol: Optional[str] = None
+    action: Optional[str] = None
+    profit_usd: Optional[float] = None
+    started_with_usd: Optional[float] = None
+    signal_reason: Optional[str] = None
+    risk_reason: Optional[str] = None
+    exit_reason: Optional[str] = None
+
+
+def _deterministic_trade_post_analysis(
+    *,
+    symbol: str,
+    action: str,
+    profit_usd: float,
+    started_with_usd: float,
+    signal_reason: str,
+    risk_reason: str,
+    exit_reason: str,
+) -> dict:
+    pnl_pct = (profit_usd / started_with_usd * 100.0) if started_with_usd else 0.0
+    won = profit_usd > 0
+    quality = {
+        "execution_quality": 0.68 if won else 0.42,
+        "risk_discipline": 0.72 if abs(pnl_pct) <= 15 else 0.48,
+        "timing_quality": 0.62 if won else 0.45,
+    }
+    mistakes: list[str] = []
+    improvements: list[str] = []
+    if not won:
+        if "spread" in (risk_reason or "").lower():
+            mistakes.append("Entered under unfavorable spread/cost conditions.")
+            improvements.append("Wait for spread normalization before entry.")
+        if "late" in (signal_reason or "").lower() or "extended" in (signal_reason or "").lower():
+            mistakes.append("Entry likely happened after move extension.")
+            improvements.append("Prefer pullback entry instead of chasing.")
+        improvements.append("Reduce position size until quality score improves.")
+    else:
+        improvements.append("Maintain same setup profile and risk discipline.")
+
+    if not improvements:
+        improvements = ["Keep stop-loss and take-profit discipline consistent."]
+
+    reasons_blob = " ".join([signal_reason or "", risk_reason or "", exit_reason or ""]).lower()
+    diagnostics = {
+        "late_entry_flag": 1 if any(k in reasons_blob for k in ["late", "extended", "chasing"]) else 0,
+        "spread_stress_flag": 1 if "spread" in reasons_blob else 0,
+        "trend_conflict_flag": 1 if any(k in reasons_blob for k in ["counter", "disagree", "trend conflict"]) else 0,
+        "risk_overexposure_flag": 1 if any(k in reasons_blob for k in ["exposure", "margin", "overlever", "over-size"]) else 0,
+        "stop_too_tight_flag": 1 if any(k in reasons_blob for k in ["stop too close", "sl too close", "stopped out"]) else 0,
+        "target_too_far_flag": 1 if any(k in reasons_blob for k in ["tp too far", "unrealistic target"]) else 0,
+        "news_shock_flag": 1 if any(k in reasons_blob for k in ["news", "event", "headline", "macro"]) else 0,
+        "execution_delay_flag": 1 if any(k in reasons_blob for k in ["delay", "slippage", "requote"]) else 0,
+    }
+    expected_win_rate_adjustment = float(max(-0.2, min(0.2, (-0.06 if not won else 0.03))))
+    recommended_sl_pct = 0.10
+    recommended_tp_pct = 0.20
+    if started_with_usd > 0:
+        pnl_pct_local = (profit_usd / started_with_usd) * 100.0
+        if pnl_pct_local < -10:
+            recommended_sl_pct = 0.08
+            recommended_tp_pct = 0.16
+        elif pnl_pct_local > 10:
+            recommended_sl_pct = 0.11
+            recommended_tp_pct = 0.22
+
+    return {
+        "symbol": symbol,
+        "action": action,
+        "profit_usd": round(float(profit_usd), 2),
+        "profit_pct": round(float(pnl_pct), 2),
+        "summary": (
+            f"{'Winning' if won else 'Losing'} {action} trade on {symbol}. "
+            f"Outcome was {pnl_pct:+.2f}% ({profit_usd:+.2f} USD)."
+        ),
+        "what_went_well": [] if not won else ["Direction and risk profile aligned with market movement."],
+        "mistakes": mistakes,
+        "improvement_actions": improvements,
+        "root_causes": [
+            reason for reason in [signal_reason, risk_reason, exit_reason] if str(reason or "").strip()
+        ][:3],
+        "future_confidence_adjustment": -0.08 if not won else 0.04,
+        "quality_scores": quality,
+        "diagnostics": diagnostics,
+        "recommendation": {
+            "expected_win_rate_adjustment": expected_win_rate_adjustment,
+            "suggested_sl_pct_of_start": recommended_sl_pct,
+            "suggested_tp_pct_of_start": recommended_tp_pct,
+            "next_trade_size_adjustment_pct": -10.0 if not won else 0.0,
+        },
+        "generated_by": "deterministic_fallback",
+        "generated_at": time.time(),
+    }
+
+
+@router.post("/trade-history/{ticket}/analyze")
+async def analyze_trade_history_item(ticket: int, req: TradePostAnalyzeRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    order = await db.get_order_with_context_by_ticket(ticket)
+    outcome = await db.get_trade_outcome_by_ticket(ticket)
+
+    signal_id = (
+        order.get("signal_id") if (order and isinstance(order.get("signal_id"), int))
+        else (int(req.signal_id) if req.signal_id is not None else None)
+    )
+    if outcome is None and signal_id is not None:
+        outcome = await db.get_trade_outcome_by_signal_id(signal_id)
+
+    symbol = (
+        str((order or {}).get("symbol") or (outcome or {}).get("symbol") or req.symbol or "").upper()
+    )
+    action = (
+        str((order or {}).get("action") or (outcome or {}).get("action") or req.action or "HOLD").upper()
+    )
+    if not symbol:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Trade ticket {ticket} has no analyzable symbol context. "
+                "Please refresh trade history and retry."
+            ),
+        )
+
+    if not req.force_refresh:
+        existing = await db.get_trade_post_analysis(ticket=ticket, signal_id=signal_id)
+        if existing and isinstance(existing.get("analysis_json"), dict) and existing.get("analysis_json"):
+            return {
+                "ticket": ticket,
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "analysis": existing.get("analysis_json"),
+                "cached": True,
+            }
+
+    signal_reason = str((order or {}).get("signal_reason") or req.signal_reason or "")
+    risk_reason = str((order or {}).get("risk_reason") or req.risk_reason or "")
+    exit_reason = str((outcome or {}).get("exit_reason") or req.exit_reason or "")
+    profit_usd = float((outcome or {}).get("profit") or req.profit_usd or 0.0)
+    started_with_usd = float(req.started_with_usd or 0.0)
+    entry_price = float((order or {}).get("price") or 0.0)
+    volume = float((order or {}).get("volume") or 0.0)
+    if started_with_usd <= 0 and entry_price > 0 and volume > 0 and connector.connected:
+        try:
+            info = market_data.get_symbol_info(symbol) or {}
+            contract_size = float(info.get("trade_contract_size") or 0.0)
+            account = connector.refresh_account()
+            leverage = float(getattr(account, "leverage", 100) or 100)
+            if contract_size > 0:
+                started_with_usd = (entry_price * volume * contract_size) / max(leverage, 1.0)
+        except Exception:
+            started_with_usd = 0.0
+
+    journal = None
+    candidate = None
+    if signal_id is not None:
+        try:
+            journal_map = await db.get_evaluation_journal_by_signal_ids([signal_id])
+            journal = journal_map.get(signal_id)
+        except Exception:
+            journal = None
+        try:
+            candidate_map = await db.get_trade_candidates_by_signal_ids([signal_id])
+            candidate = candidate_map.get(signal_id)
+        except Exception:
+            candidate = None
+
+    analysis = _deterministic_trade_post_analysis(
+        symbol=symbol,
+        action=action,
+        profit_usd=profit_usd,
+        started_with_usd=started_with_usd,
+        signal_reason=signal_reason,
+        risk_reason=risk_reason,
+        exit_reason=exit_reason,
+    )
+
+    if req.use_gemini and gemini_agent.available and getattr(gemini_agent, "_client", None) is not None:
+        try:
+            from google.genai import types as genai_types
+
+            prompt_payload = {
+                "ticket": ticket,
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "action": action,
+                "profit_usd": profit_usd,
+                "started_with_usd": started_with_usd,
+                "signal_reason": signal_reason,
+                "risk_reason": risk_reason,
+                "exit_reason": exit_reason,
+                "trade_outcome": outcome or {},
+                "journal": journal or {},
+                "candidate": candidate or {},
+            }
+            system_prompt = """
+You are a post-trade analyst for a demo trading system.
+Return STRICT JSON only with this shape:
+{
+  "summary": "one concise paragraph",
+  "what_went_well": ["..."],
+  "mistakes": ["..."],
+  "improvement_actions": ["..."],
+  "root_causes": ["..."],
+  "future_confidence_adjustment": number,
+  "quality_scores": {
+    "execution_quality": number,
+    "risk_discipline": number,
+    "timing_quality": number
+  },
+  "diagnostics": {
+    "late_entry_flag": 0|1,
+    "spread_stress_flag": 0|1,
+    "trend_conflict_flag": 0|1,
+    "risk_overexposure_flag": 0|1,
+    "stop_too_tight_flag": 0|1,
+    "target_too_far_flag": 0|1,
+    "news_shock_flag": 0|1,
+    "execution_delay_flag": 0|1
+  },
+  "recommendation": {
+    "expected_win_rate_adjustment": number,
+    "suggested_sl_pct_of_start": number,
+    "suggested_tp_pct_of_start": number,
+    "next_trade_size_adjustment_pct": number
+  }
+}
+Rules:
+- Keep values bounded and realistic.
+- Do not provide order execution instructions.
+- This is analysis only; never claim guaranteed outcomes.
+"""
+            response = await asyncio.to_thread(
+                gemini_agent._client.models.generate_content,
+                model="gemini-2.5-flash",
+                contents=[{"role": "user", "parts": [{"text": json.dumps(prompt_payload, ensure_ascii=True)}]}],
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.15,
+                    response_mime_type="application/json",
+                ),
+            )
+            parsed = _extract_json_object((response.text or "").strip())
+            parsed_diagnostics = parsed.get("diagnostics") or {}
+            base_diagnostics = analysis.get("diagnostics") or {}
+            parsed_recommendation = parsed.get("recommendation") or {}
+            base_recommendation = analysis.get("recommendation") or {}
+            analysis.update(
+                {
+                    "summary": str(parsed.get("summary") or analysis["summary"]),
+                    "what_went_well": list(parsed.get("what_went_well") or analysis.get("what_went_well", [])),
+                    "mistakes": list(parsed.get("mistakes") or analysis.get("mistakes", [])),
+                    "improvement_actions": list(parsed.get("improvement_actions") or analysis.get("improvement_actions", [])),
+                    "root_causes": list(parsed.get("root_causes") or analysis.get("root_causes", [])),
+                    "future_confidence_adjustment": float(parsed.get("future_confidence_adjustment") or analysis.get("future_confidence_adjustment", 0.0)),
+                    "quality_scores": {
+                        "execution_quality": float(((parsed.get("quality_scores") or {}).get("execution_quality") or (analysis.get("quality_scores") or {}).get("execution_quality", 0.5))),
+                        "risk_discipline": float(((parsed.get("quality_scores") or {}).get("risk_discipline") or (analysis.get("quality_scores") or {}).get("risk_discipline", 0.5))),
+                        "timing_quality": float(((parsed.get("quality_scores") or {}).get("timing_quality") or (analysis.get("quality_scores") or {}).get("timing_quality", 0.5))),
+                    },
+                    "diagnostics": {
+                        "late_entry_flag": int(parsed_diagnostics.get("late_entry_flag", base_diagnostics.get("late_entry_flag", 0)) or 0),
+                        "spread_stress_flag": int(parsed_diagnostics.get("spread_stress_flag", base_diagnostics.get("spread_stress_flag", 0)) or 0),
+                        "trend_conflict_flag": int(parsed_diagnostics.get("trend_conflict_flag", base_diagnostics.get("trend_conflict_flag", 0)) or 0),
+                        "risk_overexposure_flag": int(parsed_diagnostics.get("risk_overexposure_flag", base_diagnostics.get("risk_overexposure_flag", 0)) or 0),
+                        "stop_too_tight_flag": int(parsed_diagnostics.get("stop_too_tight_flag", base_diagnostics.get("stop_too_tight_flag", 0)) or 0),
+                        "target_too_far_flag": int(parsed_diagnostics.get("target_too_far_flag", base_diagnostics.get("target_too_far_flag", 0)) or 0),
+                        "news_shock_flag": int(parsed_diagnostics.get("news_shock_flag", base_diagnostics.get("news_shock_flag", 0)) or 0),
+                        "execution_delay_flag": int(parsed_diagnostics.get("execution_delay_flag", base_diagnostics.get("execution_delay_flag", 0)) or 0),
+                    },
+                    "recommendation": {
+                        "expected_win_rate_adjustment": float(parsed_recommendation.get("expected_win_rate_adjustment", base_recommendation.get("expected_win_rate_adjustment", 0.0)) or 0.0),
+                        "suggested_sl_pct_of_start": float(parsed_recommendation.get("suggested_sl_pct_of_start", base_recommendation.get("suggested_sl_pct_of_start", 0.10)) or 0.10),
+                        "suggested_tp_pct_of_start": float(parsed_recommendation.get("suggested_tp_pct_of_start", base_recommendation.get("suggested_tp_pct_of_start", 0.20)) or 0.20),
+                        "next_trade_size_adjustment_pct": float(parsed_recommendation.get("next_trade_size_adjustment_pct", base_recommendation.get("next_trade_size_adjustment_pct", 0.0)) or 0.0),
+                    },
+                    "generated_by": "gemini_assisted",
+                    "generated_at": time.time(),
+                }
+            )
+        except Exception as exc:
+            logger.warning("Trade post-analysis Gemini fallback for ticket %s: %s", ticket, exc)
+
+    await db.save_trade_post_analysis(
+        ticket=ticket,
+        signal_id=signal_id,
+        symbol=symbol,
+        analysis=analysis,
+    )
+    _schedule_incremental_meta_training("post_trade_analysis_saved")
+
+    return {
+        "ticket": ticket,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "analysis": analysis,
+        "cached": False,
+    }
 
 
 # --- Credentials Routes ---

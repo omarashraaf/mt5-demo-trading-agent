@@ -2,6 +2,8 @@ import MetaTrader5 as mt5
 import logging
 import pandas as pd
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from pydantic import BaseModel
 
@@ -36,6 +38,19 @@ class BarData(BaseModel):
 
 
 class MarketDataService:
+    def __init__(self):
+        self._point_cache: dict[str, float] = {}
+
+    def _point_for_symbol(self, symbol: str) -> float:
+        cached = self._point_cache.get(symbol)
+        if cached is not None and cached > 0:
+            return cached
+        info = mt5.symbol_info(symbol)
+        point = float(getattr(info, "point", 0.00001) or 0.00001) if info else 0.00001
+        if point > 0:
+            self._point_cache[symbol] = point
+        return point
+
     def _extract_commission_fields(self, symbol_info) -> dict:
         """
         Build a normalized commission snapshot for a symbol.
@@ -117,8 +132,7 @@ class MarketDataService:
         if tick is None:
             logger.error(f"Failed to get tick for {symbol}: {mt5.last_error()}")
             return None
-        info = mt5.symbol_info(symbol)
-        point = info.point if info else 0.00001
+        point = self._point_for_symbol(symbol)
         spread = round((tick.ask - tick.bid) / point) if point > 0 else 0
         return TickData(
             symbol=symbol,
@@ -127,6 +141,41 @@ class MarketDataService:
             spread=spread,
             time=tick.time,
         )
+
+    def _tick_for_symbol(self, symbol: str) -> Optional[TickData]:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None
+        point = self._point_for_symbol(symbol)
+        spread = round((tick.ask - tick.bid) / point) if point > 0 else 0
+        return TickData(
+            symbol=symbol,
+            bid=tick.bid,
+            ask=tick.ask,
+            spread=spread,
+            time=tick.time,
+        )
+
+    def get_ticks(self, symbols: list[str]) -> dict[str, TickData]:
+        """Bulk tick retrieval optimized for fast dashboard refresh loops."""
+        requested = [str(s or "").strip() for s in symbols if str(s or "").strip()]
+        if not requested:
+            return {}
+
+        out: dict[str, TickData] = {}
+        # MT5 IPC calls can block; dispatch in a small pool for lower end-to-end latency.
+        max_workers = max(1, min(8, len(requested)))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(self._tick_for_symbol, symbol): symbol for symbol in requested}
+            for fut in as_completed(futures):
+                symbol = futures[fut]
+                try:
+                    tick = fut.result()
+                except Exception:
+                    tick = None
+                if tick is not None:
+                    out[symbol] = tick
+        return out
 
     def get_bars(
         self, symbol: str, timeframe: str, count: int = 100

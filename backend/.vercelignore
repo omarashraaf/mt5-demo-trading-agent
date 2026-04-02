@@ -3,6 +3,10 @@ __pycache__/
 **/*.pyc
 .pytest_cache/
 .vercel/
+venv/
+.venv/
+env/
+ENV/
 trading_agent.db
 trading_agent.db-journal
 trading_agent.db-shm

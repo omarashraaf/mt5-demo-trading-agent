@@ -14,6 +14,8 @@ from api.routes import (
     connector,
     finnhub_adapter,
     current_research_cycle_service,
+    apply_cloud_brain_command,
+    cloud_brain_snapshot,
 )
 from api.admin_routes import router as admin_router, set_database as set_admin_database
 from api.admin_routes import supabase_admin
@@ -21,6 +23,7 @@ from storage.db import Database
 from config import config
 from services.meta_training_scheduler import MetaTrainingScheduler
 from services.cloud_sync_service import CloudSyncService
+from services.cloud_brain_service import CloudBrainService
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
@@ -34,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 db = Database(config.DB_PATH)
 meta_training_scheduler: MetaTrainingScheduler | None = None
+cloud_brain_service: CloudBrainService | None = None
 cloud_sync_service = CloudSyncService(
     enabled=config.CLOUD_SYNC_ENABLED,
     supabase_url=config.SUPABASE_URL,
@@ -46,6 +50,7 @@ cloud_sync_service = CloudSyncService(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global meta_training_scheduler
+    global cloud_brain_service
     await db.initialize()
     db.set_cloud_log_sink(cloud_sync_service.emit)
     set_database(db)
@@ -69,12 +74,26 @@ async def lifespan(app: FastAPI):
     finnhub_health = finnhub_adapter.healthcheck()
     if finnhub_health.get("degraded"):
         logger.warning("Finnhub integration started in degraded mode: %s", finnhub_health.get("reason"))
+    cloud_brain_service = CloudBrainService(
+        enabled=config.CLOUD_BRAIN_ENABLED,
+        supabase_url=config.SUPABASE_URL,
+        service_role_key=config.SUPABASE_SERVICE_ROLE_KEY,
+        table=config.CLOUD_BRAIN_TABLE,
+        timeout_seconds=config.CLOUD_SYNC_TIMEOUT_SECONDS,
+        poll_seconds=config.CLOUD_BRAIN_POLL_SECONDS,
+        apply_command=apply_cloud_brain_command,
+    )
+    cloud_brain_service.start()
+    logger.info("Cloud brain state: %s", cloud_brain_snapshot())
     logger.info("MT5 Demo Trading Agent backend started")
     yield
     # Shutdown: disconnect MT5 and close DB
     if meta_training_scheduler is not None:
         await meta_training_scheduler.stop()
         meta_training_scheduler = None
+    if cloud_brain_service is not None:
+        await cloud_brain_service.stop()
+        cloud_brain_service = None
     if connector.connected:
         connector.disconnect()
         logger.info("MT5 disconnected on shutdown")
@@ -131,7 +150,7 @@ app.include_router(admin_router, prefix="/api")
 
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",
+        app,
         host=config.API_HOST,
         port=config.API_PORT,
         reload=False,

@@ -32,6 +32,8 @@ from services.symbol_universe_service import SymbolUniverseService
 from services.trade_decision_service import TradeDecisionService
 from services.trade_quality_service import TradeQualityService
 from services.meta_model_service import MetaModelService
+from services.cloud_brain_decision_client import CloudBrainDecisionClient
+from config import config
 from research.feature_builder import build_feature_snapshot
 from storage.research_repository import ResearchRepository
 
@@ -101,6 +103,11 @@ class SignalPipelineService:
             execution_engine=self.execution,
         )
         self.meta_model_service = meta_model_service or MetaModelService(db=db)
+        self.cloud_brain_decision_client = CloudBrainDecisionClient(
+            enabled=config.CLOUD_BRAIN_DECISION_ENABLED,
+            url=config.CLOUD_BRAIN_DECISION_URL,
+            timeout_seconds=config.CLOUD_BRAIN_DECISION_TIMEOUT_SECONDS,
+        )
         self.research_repository = ResearchRepository(db) if db is not None else None
 
     def _session_allowed_for_symbol(self, symbol: str, market_symbols: list[dict]) -> bool:
@@ -375,6 +382,88 @@ class SignalPipelineService:
                 f"(last tick {int(age_seconds)}s ago)."
             )
         return None
+
+    def _build_cloud_decision_payload(
+        self,
+        *,
+        context: MarketContext,
+        trade_decision: TradeDecisionAssessment,
+        gemini_assessment: GeminiAssessment | None,
+        meta_assessment: dict,
+    ) -> dict:
+        final_signal = trade_decision.final_signal
+        qa = trade_decision.trade_quality_assessment
+        return {
+            "symbol": context.symbol,
+            "timeframe": context.requested_timeframe,
+            "evaluation_mode": context.evaluation_mode,
+            "user_policy": context.user_policy or {},
+            "signal": {
+                "action": final_signal.action,
+                "confidence": float(final_signal.confidence or 0.0),
+                "strategy": final_signal.strategy,
+                "reason": final_signal.reason,
+                "stop_loss": final_signal.stop_loss,
+                "take_profit": final_signal.take_profit,
+            },
+            "quality": {
+                "score": float(qa.final_trade_quality_score or 0.0),
+                "threshold": float(qa.threshold or 0.0),
+                "projected_margin_after_costs_pct": float(qa.projected_margin_after_costs_pct or 0.0),
+                "no_trade_zone": bool(qa.no_trade_zone),
+                "no_trade_reasons": list(qa.no_trade_reasons or []),
+            },
+            "gemini": gemini_assessment.model_dump() if gemini_assessment else None,
+            "meta_model": dict(meta_assessment or {}),
+            "market": {
+                "tick": context.tick or {},
+                "symbol_category": context.symbol_info.category if context.symbol_info else "Other",
+                "degraded_reasons": list(context.degraded_reasons or []),
+            },
+        }
+
+    def _apply_cloud_decision(
+        self,
+        *,
+        trade_decision: TradeDecisionAssessment,
+        cloud_decision: dict,
+    ) -> tuple[TradeDecisionAssessment, dict]:
+        if not cloud_decision.get("used"):
+            return trade_decision, cloud_decision
+
+        requested_action = str(cloud_decision.get("action", "")).upper()
+        final_signal = trade_decision.final_signal.model_copy(deep=True)
+        cloud_reason = str(cloud_decision.get("reason", "cloud_brain_applied")).strip()
+        cloud_confidence = cloud_decision.get("confidence")
+        try:
+            cloud_confidence = float(cloud_confidence) if cloud_confidence is not None else None
+        except (TypeError, ValueError):
+            cloud_confidence = None
+
+        # Safety rule: opposite-direction cloud command is converted to HOLD.
+        if requested_action in {"BUY", "SELL"} and requested_action != final_signal.action:
+            final_signal.action = "HOLD"
+            final_signal.reason = f"{final_signal.reason} Cloud brain opposed local direction; holding for safety."
+            if cloud_confidence is not None:
+                final_signal.confidence = max(0.0, min(0.95, cloud_confidence))
+            cloud_decision["applied_action"] = "HOLD"
+        elif requested_action in {"BUY", "SELL", "HOLD"}:
+            final_signal.action = requested_action
+            if cloud_confidence is not None:
+                final_signal.confidence = max(0.0, min(0.95, cloud_confidence))
+            if cloud_reason:
+                final_signal.reason = f"{final_signal.reason} Cloud brain: {cloud_reason}"
+            cloud_decision["applied_action"] = requested_action
+        else:
+            cloud_decision["applied_action"] = final_signal.action
+
+        meta = dict(final_signal.metadata or {})
+        meta["cloud_brain"] = cloud_decision
+        final_signal.metadata = meta
+
+        new_trade_flag = final_signal.action in {"BUY", "SELL"}
+        updated = trade_decision.model_copy(update={"final_signal": final_signal, "trade": new_trade_flag})
+        return updated, cloud_decision
 
     def _market_unavailable_decision(
         self,
@@ -1220,6 +1309,10 @@ class SignalPipelineService:
             "no_trade_probability": 1.0,
             "reason": "not_evaluated",
         }
+        cloud_decision = {
+            "used": False,
+            "reason": "cloud_decision_not_evaluated",
+        }
         if self.meta_model_service is not None:
             trade_decision, meta_assessment = await self.meta_model_service.assess_trade_decision(
                 context=context,
@@ -1229,6 +1322,18 @@ class SignalPipelineService:
                     portfolio_fit_score=preview_portfolio_fit,
                 ),
                 anti_churn_blocked=False,
+            )
+        if self.cloud_brain_decision_client is not None:
+            payload = self._build_cloud_decision_payload(
+                context=context,
+                trade_decision=trade_decision,
+                gemini_assessment=gemini_assessment,
+                meta_assessment=meta_assessment,
+            )
+            cloud_decision = await self.cloud_brain_decision_client.decide(payload)
+            trade_decision, cloud_decision = self._apply_cloud_decision(
+                trade_decision=trade_decision,
+                cloud_decision=cloud_decision,
             )
 
         risk_approval = self.risk_service.assess(
@@ -1305,6 +1410,7 @@ class SignalPipelineService:
             "trade_quality_score": trade_decision.trade_quality_assessment.final_trade_quality_score,
             "trade_quality_threshold": trade_decision.trade_quality_assessment.threshold,
             "meta_model": meta_assessment,
+            "cloud_brain": cloud_decision,
         }
 
         position_management_plan = self._build_position_management_plan(
@@ -1327,6 +1433,8 @@ class SignalPipelineService:
             final_agent_parts.append("StrategyAdvisor")
         if meta_assessment.get("active"):
             final_agent_parts.append("MetaModel")
+        if cloud_decision.get("used"):
+            final_agent_parts.append("CloudBrain")
 
         signal_decision = SignalDecision(
             requested_agent_name=requested_agent_name or primary_agent_name,

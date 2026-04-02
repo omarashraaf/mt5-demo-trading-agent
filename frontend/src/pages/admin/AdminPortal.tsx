@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams, Routes, Route, NavLink } from 'react-router-dom';
+import { useNavigate, useParams, NavLink, useLocation } from 'react-router-dom';
 import { api } from '@/utils/api';
 
 type AccessItem = {
@@ -21,6 +21,15 @@ type ActivityItem = {
   method: string;
   status_code: number;
 };
+
+function normalizeAdminError(err: unknown): string {
+  if (err instanceof Error) {
+    const msg = String(err.message || '').trim();
+    if (!msg) return 'Request failed. Please try again.';
+    return msg;
+  }
+  return 'Request failed. Please try again.';
+}
 
 function AdminLogin({ onLoggedIn }: { onLoggedIn: () => void }) {
   const navigate = useNavigate();
@@ -133,14 +142,20 @@ function RegisteredTab() {
   const [items, setItems] = useState<AccessItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [actionBusyUserId, setActionBusyUserId] = useState<string | null>(null);
   const load = async () => {
+    setLoading(true);
     try {
       setError(null);
+      setInfo(null);
       const res = await api.adminListAccessRequests('pending');
       setItems(res.items as AccessItem[]);
+      setInfo('Pending list refreshed.');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load registered users');
+      setError(normalizeAdminError(err) || 'Failed to load registered users');
+    } finally {
+      setLoading(false);
     }
   };
   useEffect(() => {
@@ -152,7 +167,9 @@ function RegisteredTab() {
       {info && <div className="success-banner">{info}</div>}
       <div className="card-header">
         <h3>Registered (Pending Approval)</h3>
-        <button className="btn btn-secondary btn-sm" type="button" onClick={() => void load()}>Refresh</button>
+        <button className="btn btn-secondary btn-sm" type="button" disabled={loading} onClick={() => void load()}>
+          {loading ? 'Refreshing...' : 'Refresh'}
+        </button>
       </div>
       <AdminUsersTable
         items={items}
@@ -167,7 +184,7 @@ function RegisteredTab() {
             setInfo('User approved successfully.');
             await load();
           } catch (err) {
-            setError(err instanceof Error ? err.message : 'Approve failed');
+            setError(normalizeAdminError(err) || 'Approve failed');
           } finally {
             setActionBusyUserId(null);
           }
@@ -180,12 +197,20 @@ function RegisteredTab() {
 function CustomersTab() {
   const [items, setItems] = useState<AccessItem[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const load = async () => {
+    setLoading(true);
     try {
+      setError(null);
+      setInfo(null);
       const res = await api.adminCustomers();
       setItems(res.items as AccessItem[]);
+      setInfo('Customers list refreshed.');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load customers');
+      setError(normalizeAdminError(err) || 'Failed to load customers');
+    } finally {
+      setLoading(false);
     }
   };
   useEffect(() => {
@@ -194,9 +219,12 @@ function CustomersTab() {
   return (
     <div className="card">
       {error && <div className="error-banner">{error}</div>}
+      {info && <div className="success-banner">{info}</div>}
       <div className="card-header">
         <h3>Customers (Approved)</h3>
-        <button className="btn btn-secondary btn-sm" type="button" onClick={() => void load()}>Refresh</button>
+        <button className="btn btn-secondary btn-sm" type="button" disabled={loading} onClick={() => void load()}>
+          {loading ? 'Refreshing...' : 'Refresh'}
+        </button>
       </div>
       <AdminUsersTable items={items} actionLabel="" />
     </div>
@@ -206,12 +234,20 @@ function CustomersTab() {
 function ActivityTab() {
   const [items, setItems] = useState<ActivityItem[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const load = async () => {
+    setLoading(true);
     try {
+      setError(null);
+      setInfo(null);
       const res = await api.adminActivity(200);
       setItems(res.activity as ActivityItem[]);
+      setInfo('Activity list refreshed.');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load users activity');
+      setError(normalizeAdminError(err) || 'Failed to load users activity');
+    } finally {
+      setLoading(false);
     }
   };
   useEffect(() => {
@@ -220,9 +256,12 @@ function ActivityTab() {
   return (
     <div className="card">
       {error && <div className="error-banner">{error}</div>}
+      {info && <div className="success-banner">{info}</div>}
       <div className="card-header">
         <h3>Users Activity</h3>
-        <button className="btn btn-secondary btn-sm" type="button" onClick={() => void load()}>Refresh</button>
+        <button className="btn btn-secondary btn-sm" type="button" disabled={loading} onClick={() => void load()}>
+          {loading ? 'Refreshing...' : 'Refresh'}
+        </button>
       </div>
       <table className="table">
         <thead>
@@ -254,12 +293,27 @@ function UserDetail() {
   const { userId } = useParams();
   const [payload, setPayload] = useState<{ user?: AccessItem; activity?: ActivityItem[] }>({});
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = async () => {
+    if (!userId) return;
+    setLoading(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const res = await api.adminUserDetail(userId);
+      setPayload({ user: res.user as AccessItem, activity: res.activity as ActivityItem[] });
+      setInfo('User detail refreshed.');
+    } catch (err) {
+      setError(normalizeAdminError(err) || 'Failed to load user detail');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    if (!userId) return;
-    api.adminUserDetail(userId)
-      .then((res) => setPayload({ user: res.user as AccessItem, activity: res.activity as ActivityItem[] }))
-      .catch((err) => setError(err instanceof Error ? err.message : 'Failed to load user detail'));
+    void load();
   }, [userId]);
 
   if (error) return <div className="error-banner">{error}</div>;
@@ -267,8 +321,12 @@ function UserDetail() {
 
   return (
     <div className="card">
+      {info && <div className="success-banner">{info}</div>}
       <div className="card-header">
         <h3>User Detail</h3>
+        <button className="btn btn-secondary btn-sm" type="button" disabled={loading} onClick={() => void load()}>
+          {loading ? 'Refreshing...' : 'Refresh'}
+        </button>
       </div>
       <div className="grid-3">
         <div>
@@ -313,11 +371,21 @@ function UserDetail() {
 
 function AdminShell({ onLogout }: { onLogout: () => void }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const tabs = useMemo(() => [
     { to: '/admin/registered', label: 'Registered' },
     { to: '/admin/customers', label: 'Customers' },
     { to: '/admin/activity', label: 'Users Activity' },
   ], []);
+
+  const isUserDetail = /^\/admin\/user\/[^/]+$/i.test(location.pathname);
+  const activeTab = isUserDetail
+    ? 'detail'
+    : location.pathname.startsWith('/admin/customers')
+      ? 'customers'
+      : location.pathname.startsWith('/admin/activity')
+        ? 'activity'
+        : 'registered';
 
   return (
     <div style={{ minHeight: '100vh', padding: 24, background: 'radial-gradient(circle at 10% 10%, rgba(59,130,246,0.2), transparent 45%), var(--bg-primary)' }}>
@@ -344,7 +412,13 @@ function AdminShell({ onLogout }: { onLogout: () => void }) {
             <NavLink
               key={tab.to}
               to={tab.to}
-              className={({ isActive }) => `btn ${isActive ? 'btn-primary' : 'btn-secondary'}`}
+              className={`btn ${
+                (activeTab === 'customers' && tab.to.endsWith('/customers'))
+                || (activeTab === 'activity' && tab.to.endsWith('/activity'))
+                || (activeTab === 'registered' && tab.to.endsWith('/registered'))
+                  ? 'btn-primary'
+                  : 'btn-secondary'
+              }`}
               style={{ minWidth: 140, justifyContent: 'center' }}
             >
               {tab.label}
@@ -352,13 +426,15 @@ function AdminShell({ onLogout }: { onLogout: () => void }) {
           ))}
         </div>
       </div>
-      <Routes>
-        <Route path="registered" element={<RegisteredTab />} />
-        <Route path="customers" element={<CustomersTab />} />
-        <Route path="activity" element={<ActivityTab />} />
-        <Route path="user/:userId" element={<UserDetail />} />
-        <Route path="*" element={<RegisteredTab />} />
-      </Routes>
+      {isUserDetail ? (
+        <UserDetail />
+      ) : activeTab === 'customers' ? (
+        <CustomersTab />
+      ) : activeTab === 'activity' ? (
+        <ActivityTab />
+      ) : (
+        <RegisteredTab />
+      )}
     </div>
   );
 }
@@ -367,10 +443,30 @@ export default function AdminPortal() {
   const [ready, setReady] = useState(false);
   const [valid, setValid] = useState(false);
   useEffect(() => {
-    api.adminSession()
-      .then(() => setValid(true))
-      .catch(() => setValid(false))
-      .finally(() => setReady(true));
+    let active = true;
+    const checkSession = async () => {
+      try {
+        await api.adminSession();
+        if (active) setValid(true);
+      } catch {
+        if (active) setValid(false);
+      } finally {
+        if (active) setReady(true);
+      }
+    };
+    void checkSession();
+    const t = setInterval(() => { void checkSession(); }, 45000);
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void checkSession();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      active = false;
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, []);
 
   if (!ready) return <div className="card">Loading admin panel...</div>;

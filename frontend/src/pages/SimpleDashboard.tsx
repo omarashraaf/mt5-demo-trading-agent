@@ -20,6 +20,7 @@ type AvailableSymbolRow = {
 };
 
 const MARKET_SELECTION_STORAGE_KEY = 'trading_selected_markets_v2';
+const MARKET_SELECTION_MANUAL_KEY = 'trading_selected_markets_manual_v1';
 const EGYPT_POPULAR_MARKET_HINTS = [
   'XAUUSD', 'GOLD',
   'XAGUSD', 'SILVER',
@@ -204,6 +205,10 @@ function formatCooldown(seconds?: number | null) {
 function toFiniteNumber(value: unknown): number | null {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+function symbolKey(symbol: string | null | undefined): string {
+  return String(symbol || '').trim().toUpperCase();
 }
 
 function pickEgyptPopularSymbols(allSymbols: AvailableSymbolRow[]): string[] {
@@ -837,14 +842,33 @@ function TradeCard({ rec, onExecuted, currency, liveTick }: { rec: Recommendatio
 }
 
 // Beginner-friendly position card
-function PositionCard({ position, currency, onClose, leverage = 100 }: { position: PositionInfo; currency: string; onClose: (ticket: number) => void; leverage?: number }) {
+function PositionCard({
+  position,
+  currency,
+  onClose,
+  leverage = 100,
+  liveTick,
+}: {
+  position: PositionInfo;
+  currency: string;
+  onClose: (ticket: number) => void;
+  leverage?: number;
+  liveTick?: TickData;
+}) {
   const [closing, setClosing] = useState(false);
   const [contractSize, setContractSize] = useState<number | null>(null);
   const symbolName = getSymbolName(position.symbol);
   const emoji = getSymbolEmoji(position.symbol);
   const isBuy = position.type === 'BUY';
-  const profitColor = position.profit >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
-  const profitText = explainProfitLoss(position.profit, currency);
+  const liveNowPrice = liveTick
+    ? (isBuy ? liveTick.bid : liveTick.ask)
+    : position.price_current;
+  const liveProfit = contractSize && liveNowPrice > 0
+    ? ((isBuy ? (liveNowPrice - position.price_open) : (position.price_open - liveNowPrice)) * position.volume * contractSize)
+    : position.profit;
+  const displayProfit = Number.isFinite(liveProfit) ? liveProfit : position.profit;
+  const profitColor = displayProfit >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+  const profitText = explainProfitLoss(displayProfit, currency);
   const digs = position.price_open < 50 ? 5 : 2;
 
   // Fetch contract size for dollar SL/TP calculation
@@ -874,7 +898,7 @@ function PositionCard({ position, currency, onClose, leverage = 100 }: { positio
     ? Math.round(position.volume * position.price_open * contractSize / leverage)
     : 0;
   const investedNum = commentAmount ? parseFloat(commentAmount) : computedInvestment;
-  const currentValue = investedNum > 0 ? investedNum + position.profit : 0;
+  const currentValue = investedNum > 0 ? investedNum + displayProfit : 0;
   const slTargetValue = investedNum > 0 && slDollars != null ? Math.max(0, investedNum - slDollars) : null;
   const tpTargetValue = investedNum > 0 && tpDollars != null ? investedNum + tpDollars : null;
   const slPct = investedNum > 0 && slDollars != null ? (slDollars / investedNum) * 100 : null;
@@ -916,7 +940,7 @@ function PositionCard({ position, currency, onClose, leverage = 100 }: { positio
         </div>
         <div style={{ textAlign: 'right' }}>
           <div style={{ fontSize: 18, fontWeight: 700, color: profitColor, fontFamily: 'monospace' }}>
-            {position.profit >= 0 ? '+' : ''}{position.profit.toFixed(2)} {currency}
+            {displayProfit >= 0 ? '+' : ''}{displayProfit.toFixed(2)} {currency}
           </div>
           <div className="text-muted" style={{ fontSize: 11 }}>{profitText}</div>
         </div>
@@ -941,7 +965,7 @@ function PositionCard({ position, currency, onClose, leverage = 100 }: { positio
           <div style={{ textAlign: 'center' }}>
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 2 }}>Return</div>
             <div style={{ fontSize: 16, fontWeight: 700, fontFamily: 'monospace', color: profitColor }}>
-              {position.profit >= 0 ? '+' : ''}{investedNum > 0 ? ((position.profit / investedNum) * 100).toFixed(1) : '0'}%
+              {displayProfit >= 0 ? '+' : ''}{investedNum > 0 ? ((displayProfit / investedNum) * 100).toFixed(1) : '0'}%
             </div>
           </div>
         </div>
@@ -959,7 +983,7 @@ function PositionCard({ position, currency, onClose, leverage = 100 }: { positio
         </span>
         <span>
           <span style={{ fontWeight: 600, color: 'var(--text-secondary)' }}>Now:</span>{' '}
-          <span className="font-mono">{position.price_current.toFixed(digs)}</span>
+          <span className="font-mono">{liveNowPrice.toFixed(digs)}</span>
         </span>
         {position.stop_loss > 0 && (
           <span>
@@ -1361,6 +1385,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [allSymbols, setAllSymbols] = useState<AvailableSymbolRow[]>([]);
   const [selectedMarketSymbols, setSelectedMarketSymbols] = useState<string[]>([]);
+  const [hasManualMarketSelection, setHasManualMarketSelection] = useState(false);
   const [marketDraftSymbols, setMarketDraftSymbols] = useState<string[]>([]);
   const [showMarketSelector, setShowMarketSelector] = useState(false);
   const [marketSearch, setMarketSearch] = useState('');
@@ -1405,12 +1430,16 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
 
   useEffect(() => {
     try {
+      const manualFlag = localStorage.getItem(MARKET_SELECTION_MANUAL_KEY);
+      if (manualFlag === '1') {
+        setHasManualMarketSelection(true);
+      }
       const raw = localStorage.getItem(MARKET_SELECTION_STORAGE_KEY);
       if (!raw) return;
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         const cleaned = parsed.map((x) => String(x || '').trim()).filter(Boolean);
-        if (cleaned.length > 0) setSelectedMarketSymbols(cleaned);
+        setSelectedMarketSymbols(cleaned);
       }
     } catch {
       // ignore malformed local cache
@@ -1422,9 +1451,9 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
     const popular = status?.platform === 'ibkr'
       ? pickIbkrPopularSymbols(allSymbols)
       : pickEgyptPopularSymbols(allSymbols);
-    const base = selectedMarketSymbols.length > 0 ? selectedMarketSymbols : popular;
+    const base = hasManualMarketSelection ? selectedMarketSymbols : popular;
     setMarketDraftSymbols(base);
-  }, [showMarketSelector, selectedMarketSymbols, allSymbols, status?.platform]);
+  }, [showMarketSelector, selectedMarketSymbols, hasManualMarketSelection, allSymbols, status?.platform]);
 
   useEffect(() => {
     if (status?.portfolio) setPortfolioSnapshot(status.portfolio);
@@ -1468,8 +1497,10 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
 
   const saveSelectedMarkets = useCallback((symbols: string[]) => {
     const unique = Array.from(new Set(symbols.map((s) => String(s || '').trim()).filter(Boolean)));
+    setHasManualMarketSelection(true);
     setSelectedMarketSymbols(unique);
     localStorage.setItem(MARKET_SELECTION_STORAGE_KEY, JSON.stringify(unique));
+    localStorage.setItem(MARKET_SELECTION_MANUAL_KEY, '1');
   }, []);
 
 
@@ -1515,7 +1546,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
         : pickEgyptPopularSymbols(fullUniverse);
       const selectedInputRaw = (symbolsOverride && symbolsOverride.length > 0)
         ? symbolsOverride
-        : (selectedMarketSymbols.length > 0 ? selectedMarketSymbols : defaultPopular);
+        : (hasManualMarketSelection ? selectedMarketSymbols : defaultPopular);
       const selectedInput = status?.platform === 'ibkr'
         ? selectedInputRaw.map((sym) => normalizeIbkrSymbolAlias(sym))
         : selectedInputRaw;
@@ -1527,7 +1558,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
         if (savedRaw.join(',') !== savedNormalized.join(',')) {
           saveSelectedMarkets(selectedNow);
         }
-      } else if (selectedMarketSymbols.length === 0 && defaultPopular.length > 0) {
+      } else if (!hasManualMarketSelection && defaultPopular.length > 0) {
         saveSelectedMarkets(defaultPopular);
       }
 
@@ -1614,13 +1645,14 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       scanningRef.current = false;
       setScanning(false);
     }
-  }, [connected, status?.platform, status?.user_policy?.mode, selectedMarketSymbols, saveSelectedMarkets, allSymbols]);
+  }, [connected, status?.platform, status?.user_policy?.mode, selectedMarketSymbols, hasManualMarketSelection, saveSelectedMarkets, allSymbols]);
 
   useEffect(() => {
     refreshPositions();
-    const t = setInterval(refreshPositions, 5000);
+    const pollMs = positions.length > 0 ? 500 : 2000;
+    const t = setInterval(refreshPositions, pollMs);
     return () => clearInterval(t);
-  }, [refreshPositions]);
+  }, [refreshPositions, positions.length]);
 
 
   useEffect(() => {
@@ -1784,7 +1816,6 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   const totalProfit = positions.reduce((s, p) => s + p.profit, 0);
 
   const draftMarketSet = useMemo(() => new Set(marketDraftSymbols), [marketDraftSymbols]);
-  const defaultPopularSymbols = useMemo(() => pickEgyptPopularSymbols(allSymbols), [allSymbols]);
   const marketSelectorRows = useMemo(() => {
     const term = marketSearch.trim().toLowerCase();
     const rows = [...allSymbols];
@@ -1800,9 +1831,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
 
   const setMarketSymbolChecked = (symbol: string, checked: boolean) => {
     if (!symbol) return;
-    const base = marketDraftSymbols.length > 0
-      ? [...marketDraftSymbols]
-      : [...defaultPopularSymbols];
+    const base = [...marketDraftSymbols];
     const has = base.includes(symbol);
     if (checked && !has) {
       setMarketDraftSymbols([...base, symbol]);
@@ -1813,9 +1842,32 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
     }
   };
 
+  const removeMarketFromDraft = (symbol: string) => {
+    setMarketDraftSymbols((prev) => prev.filter((s) => s !== symbol));
+  };
+
+  const moveDraftMarket = (symbol: string, direction: -1 | 1) => {
+    setMarketDraftSymbols((prev) => {
+      const idx = prev.indexOf(symbol);
+      if (idx < 0) return prev;
+      const nextIdx = idx + direction;
+      if (nextIdx < 0 || nextIdx >= prev.length) return prev;
+      const copy = [...prev];
+      const [item] = copy.splice(idx, 1);
+      copy.splice(nextIdx, 0, item);
+      return copy;
+    });
+  };
+
   const resetToEgyptPopular = () => {
-    const popular = pickEgyptPopularSymbols(allSymbols);
+    const popular = status?.platform === 'ibkr'
+      ? pickIbkrPopularSymbols(allSymbols)
+      : pickEgyptPopularSymbols(allSymbols);
     setMarketDraftSymbols(popular);
+  };
+
+  const clearAllDraftMarkets = () => {
+    setMarketDraftSymbols([]);
   };
 
   // Category filter
@@ -1854,8 +1906,19 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   const liveTickSymbols = useMemo(() => {
     const hot = actionableRecs.slice(0, 25).map((r) => r.symbol);
     const warm = visibleHoldRecs.slice(0, 80).map((r) => r.symbol);
-    return Array.from(new Set([...hot, ...warm].filter(Boolean)));
-  }, [actionableRecs, visibleHoldRecs]);
+    const opened = positions.map((p) => p.symbol);
+    return Array.from(new Set([...hot, ...warm, ...opened].map((s) => symbolKey(s)).filter(Boolean)));
+  }, [actionableRecs, visibleHoldRecs, positions]);
+
+  const liveTickBySymbol = useMemo(() => {
+    const out: Record<string, TickData> = {};
+    for (const [rawSymbol, tick] of Object.entries(liveTicks || {})) {
+      const key = symbolKey(rawSymbol);
+      if (!key || !tick) continue;
+      out[key] = tick;
+    }
+    return out;
+  }, [liveTicks]);
 
   // Live prices in one bulk request so bid/ask updates feel instant without request storms.
   useEffect(() => {
@@ -1868,7 +1931,10 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       return;
     }
     let cancelled = false;
+    let inFlight = false;
     const refreshTicks = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const resp = await api.getTicks(liveTickSymbols);
         if (!cancelled) {
@@ -1876,10 +1942,12 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
         }
       } catch {
         // keep previous ticks on transient errors
+      } finally {
+        inFlight = false;
       }
     };
     refreshTicks();
-    const t = setInterval(refreshTicks, 1500);
+    const t = setInterval(refreshTicks, 120);
     return () => {
       cancelled = true;
       clearInterval(t);
@@ -1898,7 +1966,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
           margin: '0 auto',
         }}>
           <div style={{ fontSize: 48, marginBottom: 16 }}>&#128202;</div>
-          <h2 style={{ fontSize: 22, fontWeight: 600, marginBottom: 8 }}>Welcome to Your Trading Assistant</h2>
+          <h2 style={{ fontSize: 22, fontWeight: 600, marginBottom: 8 }}>Welcome to LinkTrade</h2>
           <p style={{ color: 'var(--text-secondary)', fontSize: 14, lineHeight: 1.7, marginBottom: 24 }}>
             This app uses AI to analyze currency and commodity markets, then gives you
             simple buy/sell recommendations. You just click a button to trade.
@@ -2417,6 +2485,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                 currency={currency}
                 onClose={handleClosePosition}
                 leverage={account?.leverage || 100}
+                liveTick={liveTickBySymbol[symbolKey(p.symbol)]}
               />
             ))}
           </div>
@@ -2548,7 +2617,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                 Default mode: <strong>{status?.platform === 'ibkr' ? 'IBKR popular liquid symbols' : 'Popular in Egypt'}</strong>.
                 {' '}You can add/remove extra markets below.
                 {status?.platform === 'ibkr' ? ' IBKR catalog symbols are also available in this list.' : ''}
-                {' '}Selected: <strong>{marketDraftSymbols.length || defaultPopularSymbols.length}</strong>
+                {' '}Selected: <strong>{marketDraftSymbols.length}</strong>
               </div>
               <div className="flex gap-2">
                 <button
@@ -2560,7 +2629,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                 <button
                   className="btn btn-secondary btn-sm"
                   onClick={() => {
-                    saveSelectedMarkets(marketDraftSymbols.length > 0 ? marketDraftSymbols : defaultPopularSymbols);
+                    saveSelectedMarkets(marketDraftSymbols);
                     setShowMarketSelector(false);
                   }}
                 >
@@ -2573,9 +2642,15 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                   Reset to Popular
                 </button>
                 <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={clearAllDraftMarkets}
+                >
+                  Clear All
+                </button>
+                <button
                   className="btn btn-primary btn-sm"
                   onClick={async () => {
-                    const toSave = marketDraftSymbols.length > 0 ? marketDraftSymbols : defaultPopularSymbols;
+                    const toSave = marketDraftSymbols;
                     saveSelectedMarkets(toSave);
                     setShowMarketSelector(false);
                     await scanMarkets(toSave);
@@ -2593,25 +2668,58 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
               onChange={(e) => setMarketSearch(e.target.value)}
               style={{ marginBottom: 10, fontSize: 12 }}
             />
-            <div style={{ maxHeight: 220, overflow: 'auto', border: '1px solid var(--border)', borderRadius: 8, padding: 8 }}>
-              {marketSelectorRows.map((row) => {
-                const symbol = String(row.name || '');
-                const checked = draftMarketSet.has(symbol) || (marketDraftSymbols.length === 0 && defaultPopularSymbols.includes(symbol));
-                return (
-                  <label
-                    key={symbol}
-                    style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', borderBottom: '1px solid var(--border)' }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={(e) => setMarketSymbolChecked(symbol, e.target.checked)}
-                    />
-                    <span style={{ fontSize: 12, minWidth: 80, fontWeight: 600 }}>{symbol}</span>
-                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{row.category || 'Other'}</span>
-                  </label>
-                );
-              })}
+            <div style={{ display: 'grid', gridTemplateColumns: '1.05fr 1fr', gap: 10 }}>
+              <div style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>
+                  Selected Markets ({marketDraftSymbols.length})
+                </div>
+                <div style={{ maxHeight: 260, overflow: 'auto' }}>
+                  {marketDraftSymbols.length === 0 ? (
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 6px' }}>
+                      No markets selected. Pick from the list on the right.
+                    </div>
+                  ) : marketDraftSymbols.map((symbol, idx) => (
+                    <div
+                      key={`draft-${symbol}-${idx}`}
+                      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', borderBottom: '1px solid var(--border)' }}
+                    >
+                      <span style={{ fontSize: 11, width: 20, color: 'var(--text-muted)' }}>{idx + 1}</span>
+                      <span style={{ fontSize: 12, fontWeight: 600, minWidth: 70 }}>{symbol}</span>
+                      <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+                        <button className="btn btn-secondary btn-sm" onClick={() => moveDraftMarket(symbol, -1)} disabled={idx === 0} title="Move up">↑</button>
+                        <button className="btn btn-secondary btn-sm" onClick={() => moveDraftMarket(symbol, 1)} disabled={idx === marketDraftSymbols.length - 1} title="Move down">↓</button>
+                        <button className="btn btn-secondary btn-sm" onClick={() => removeMarketFromDraft(symbol)} title="Remove">×</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>
+                  Available Markets ({marketSelectorRows.length})
+                </div>
+                <div style={{ maxHeight: 260, overflow: 'auto' }}>
+                  {marketSelectorRows.map((row) => {
+                    const symbol = String(row.name || '');
+                    const checked = draftMarketSet.has(symbol);
+                    return (
+                      <label
+                        key={symbol}
+                        style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', borderBottom: '1px solid var(--border)' }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => setMarketSymbolChecked(symbol, e.target.checked)}
+                        />
+                        <span style={{ fontSize: 12, minWidth: 80, fontWeight: 600 }}>{symbol}</span>
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{row.category || 'Other'}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
           </div>
           </div>
@@ -2686,7 +2794,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                       rec={rec}
                       onExecuted={refreshPositionsBurst}
                       currency={currency}
-                      liveTick={liveTicks[rec.symbol]}
+                      liveTick={liveTickBySymbol[symbolKey(rec.symbol)]}
                     />
                   ))}
                 </div>
@@ -2708,7 +2816,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
                       currency={currency}
                       onExecuted={refreshPositionsBurst}
                       isLast={i === visibleHoldRecs.length - 1}
-                      liveTick={liveTicks[rec.symbol]}
+                      liveTick={liveTickBySymbol[symbolKey(rec.symbol)]}
                     />
                   ))}
                 </div>

@@ -248,12 +248,28 @@ class AutoTrader:
 
                 if signal.action == "HOLD":
                     hold_detail = signal.reason or decision.reason
-                    self._log_auto_trade(sym, signal, hold_detail, False, quality.final_trade_quality_score)
+                    self._log_auto_trade(
+                        sym,
+                        signal,
+                        hold_detail,
+                        False,
+                        quality.final_trade_quality_score,
+                        signal_id=signal_id,
+                        decision=decision,
+                    )
                     continue
 
                 if not decision.allow_execute:
                     logger.info("Auto-trader: %s %s rejected: %s", sym, signal.action, decision.reason)
-                    self._log_auto_trade(sym, signal, decision.reason, False, quality.final_trade_quality_score)
+                    self._log_auto_trade(
+                        sym,
+                        signal,
+                        decision.reason,
+                        False,
+                        quality.final_trade_quality_score,
+                        signal_id=signal_id,
+                        decision=decision,
+                    )
                     continue
 
                 logger.info(
@@ -267,7 +283,15 @@ class AutoTrader:
 
                 tick = self.market_data.get_tick(sym)
                 if not tick:
-                    self._log_auto_trade(sym, signal, "Live tick unavailable at execution time", False, quality.final_trade_quality_score)
+                    self._log_auto_trade(
+                        sym,
+                        signal,
+                        "Live tick unavailable at execution time",
+                        False,
+                        quality.final_trade_quality_score,
+                        signal_id=signal_id,
+                        decision=decision,
+                    )
                     continue
                 symbol_point = context.symbol_info.point if context.symbol_info and context.symbol_info.point else 0.0
                 spread_limit_points = (
@@ -280,7 +304,15 @@ class AutoTrader:
                     tick.spread,
                     spread_limit_points,
                 ):
-                    self._log_auto_trade(sym, signal, "Spread deteriorated before execution", False, quality.final_trade_quality_score)
+                    self._log_auto_trade(
+                        sym,
+                        signal,
+                        "Spread deteriorated before execution",
+                        False,
+                        quality.final_trade_quality_score,
+                        signal_id=signal_id,
+                        decision=decision,
+                    )
                     continue
 
                 entry_price = tick.ask if signal.action == "BUY" else tick.bid
@@ -332,7 +364,15 @@ class AutoTrader:
                     vol_max=vol_max,
                 )
                 if rebalance_error:
-                    self._log_auto_trade(sym, signal, rebalance_error, False, quality.final_trade_quality_score)
+                    self._log_auto_trade(
+                        sym,
+                        signal,
+                        rebalance_error,
+                        False,
+                        quality.final_trade_quality_score,
+                        signal_id=signal_id,
+                        decision=decision,
+                    )
                     continue
                 if rebalanced_volume > 0 and rebalanced_volume < volume:
                     volume = rebalanced_volume
@@ -373,7 +413,15 @@ class AutoTrader:
                     scan_window_id=scan_window_id,
                 )
                 if not preflight.approved:
-                    self._log_auto_trade(sym, signal, preflight.reason, False, quality.final_trade_quality_score)
+                    self._log_auto_trade(
+                        sym,
+                        signal,
+                        preflight.reason,
+                        False,
+                        quality.final_trade_quality_score,
+                        signal_id=signal_id,
+                        decision=decision,
+                    )
                     continue
                 result = self.execution_service.place_order_if_approved(order_req, preflight)
 
@@ -424,18 +472,82 @@ class AutoTrader:
 
                 if result.success:
                     logger.info("AUTO-TRADE SUCCESS: %s ticket=%s price=%s", sym, result.ticket, result.price)
-                    self._log_auto_trade(sym, signal, f"Order #{result.ticket} filled at {result.price}", True, quality.final_trade_quality_score)
+                    self._log_auto_trade(
+                        sym,
+                        signal,
+                        f"Order #{result.ticket} filled at {result.price}",
+                        True,
+                        quality.final_trade_quality_score,
+                        signal_id=signal_id,
+                        decision=decision,
+                    )
                     self.signal_pipeline.anti_churn_service.mark_symbol_opened(scan_window_id, sym)
                     all_positions = self.execution.get_positions()
                 else:
                     logger.warning("AUTO-TRADE FAILED: %s %s", sym, result.retcode_desc)
-                    self._log_auto_trade(sym, signal, result.retcode_desc, False, quality.final_trade_quality_score)
+                    self._log_auto_trade(
+                        sym,
+                        signal,
+                        result.retcode_desc,
+                        False,
+                        quality.final_trade_quality_score,
+                        signal_id=signal_id,
+                        decision=decision,
+                    )
 
             except Exception as e:
                 logger.error(f"Auto-trader error for {sym}: {e}", exc_info=True)
 
-    def _log_auto_trade(self, symbol: str, signal: TradeSignal, detail: str, success: bool, quality_score: float = 0.0):
-        self._trade_log.append({
+    def _log_auto_trade(
+        self,
+        symbol: str,
+        signal: TradeSignal,
+        detail: str,
+        success: bool,
+        quality_score: float = 0.0,
+        *,
+        signal_id: Optional[int] = None,
+        decision=None,
+    ):
+        decision_reason = signal.reason or detail
+        gemini_summary = ""
+        meta_model_summary = ""
+        if decision is not None:
+            try:
+                decision_reason = (
+                    str(getattr(decision, "reason", "") or "")
+                    or str(getattr(decision.signal_decision.final_signal, "reason", "") or "")
+                    or detail
+                )
+                gemini = getattr(decision.signal_decision, "gemini_confirmation", None)
+                if gemini is not None:
+                    gemini_summary = (
+                        str(getattr(gemini, "summary_reason", "") or "")
+                        or str(getattr(gemini, "reason", "") or "")
+                    )
+                    if not gemini_summary:
+                        if bool(getattr(gemini, "degraded", False)):
+                            gemini_summary = "Gemini degraded; technical-only fallback used."
+                        elif not bool(getattr(gemini, "used", False)):
+                            gemini_summary = "Gemini advisory not used for this decision."
+                else:
+                    gemini_summary = "Gemini not attached to this decision."
+
+                meta = getattr(decision.signal_decision.final_signal, "metadata", {}) or {}
+                meta_model = meta.get("meta_model") or {}
+                if meta_model:
+                    p = float(meta_model.get("profit_probability", 0.0) or 0.0)
+                    qa = float(meta_model.get("quality_after", 0.0) or 0.0)
+                    changed = bool(meta_model.get("changed_decision", False))
+                    blocked = bool(meta_model.get("blocked", False))
+                    meta_model_summary = (
+                        f"v={meta_model.get('version_id', '')} "
+                        f"p={p:.2f} q={qa:.2f} changed={changed} blocked={blocked}"
+                    ).strip()
+            except Exception:
+                pass
+
+        entry = {
             "timestamp": time.time(),
             "symbol": symbol,
             "action": signal.action,
@@ -443,10 +555,34 @@ class AutoTrader:
             "quality_score": quality_score,
             "detail": detail,
             "success": success,
-        })
+            "signal_id": signal_id,
+            "decision_reason": decision_reason or detail,
+            "gemini_summary": gemini_summary,
+            "meta_model_summary": meta_model_summary,
+        }
+        self._trade_log.append(entry)
         # Keep only last 50
         if len(self._trade_log) > 50:
             self._trade_log = self._trade_log[-50:]
+        if self.db:
+            try:
+                # Auto-trader decisions are scanner events; profit fields are not
+                # available at decision time, so they are left as 0 here.
+                asyncio.create_task(
+                    self.db.log_ai_activity(
+                        action=signal.action,
+                        symbol=symbol,
+                        ticket=0,
+                        detail=detail,
+                        profit=0.0,
+                        signal_id=signal_id,
+                        decision_reason=entry.get("decision_reason", ""),
+                        gemini_summary=entry.get("gemini_summary", ""),
+                        meta_model_summary=entry.get("meta_model_summary", ""),
+                    )
+                )
+            except Exception:
+                pass
 
     def _clamp(self, value: float, minimum: float, maximum: float) -> float:
         return max(minimum, min(maximum, value))

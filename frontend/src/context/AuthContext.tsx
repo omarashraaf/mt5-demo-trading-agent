@@ -31,8 +31,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return appMetaRole === 'admin' ? 'admin' : 'user';
   };
 
+  const resolveApprovalFromSession = (nextSession: Session | null) => {
+    const status = String(nextSession?.user?.user_metadata?.access_status || 'pending').toLowerCase();
+    const nextApproved = status === 'approved' || resolveRole(nextSession) === 'admin';
+    return { status, approved: nextApproved };
+  };
+
   const refreshProfile = async () => {
     if (!supabase) return;
+    try {
+      const { data, error } = await supabase.auth.getUser();
+      if (!error && data?.user) {
+        const currentSession = await supabase.auth.getSession();
+        const nextSession = currentSession.data.session ?? session;
+        const status = String(data.user.user_metadata?.access_status || 'pending').toLowerCase();
+        const nextRole = resolveRole(nextSession);
+        setRole(nextRole);
+        setApproved(status === 'approved' || nextRole === 'admin');
+        setAccessStatus(status);
+        return;
+      }
+    } catch {
+      // fallback to backend me endpoint below
+    }
+
     try {
       const me = await api.authMe();
       const nextRole = String(me.role || '').toLowerCase() === 'admin' ? 'admin' : 'user';
@@ -56,6 +78,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setSession(data.session ?? null);
       setRole(resolveRole(data.session ?? null));
       if (data.session) {
+        const { status, approved } = resolveApprovalFromSession(data.session);
+        setApproved(approved);
+        setAccessStatus(status);
         void refreshProfile();
       } else {
         setApproved(false);
@@ -70,6 +95,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setSession(nextSession);
       setRole(resolveRole(nextSession));
       if (nextSession) {
+        const { status, approved } = resolveApprovalFromSession(nextSession);
+        setApproved(approved);
+        setAccessStatus(status);
         void refreshProfile();
       } else {
         setApproved(false);
@@ -97,7 +125,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       },
       signUp: async (email: string, password: string) => {
         if (!supabase) throw new Error('Supabase not configured');
-        const { error } = await supabase.auth.signUp({ email, password });
+        const { error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            data: {
+              access_status: 'pending',
+            },
+          },
+        });
         if (error) throw new Error(error.message);
       },
       signOut: async () => {

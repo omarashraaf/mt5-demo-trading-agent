@@ -2,7 +2,10 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 
+const isElectronBuild = process.env.ELECTRON_BUILD === '1';
+
 export default defineConfig({
+  base: isElectronBuild ? './' : '/',
   plugins: [react()],
   resolve: {
     alias: {

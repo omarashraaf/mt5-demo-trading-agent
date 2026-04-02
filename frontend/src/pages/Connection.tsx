@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Plug, PlugZap, Search, Trash2, AlertTriangle, HelpCircle, CheckCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { api } from '../utils/api';
 import type { StatusResponse, SavedCredentials } from '../types';
@@ -21,6 +22,7 @@ type SavedIbkrAccount = {
 const SAVED_IBKR_KEY = 'trading_saved_ibkr_accounts_v1';
 
 export default function Connection({ status, onRefresh }: Props) {
+  const navigate = useNavigate();
   const [platform, setPlatform] = useState<'mt5' | 'ibkr'>((status?.platform as 'mt5' | 'ibkr') || 'mt5');
   const [account, setAccount] = useState('');
   const [password, setPassword] = useState('');
@@ -281,6 +283,11 @@ export default function Connection({ status, onRefresh }: Props) {
 
       {connected && status?.account && (
         <div className="card" style={{ marginBottom: 20 }}>
+          {error && (
+            <div className="error-banner" style={{ fontSize: 13, marginBottom: 12 }}>
+              {error}
+            </div>
+          )}
           <div className="flex items-center gap-3" style={{ marginBottom: 16 }}>
             <CheckCircle size={24} style={{ color: 'var(--accent-green)' }} />
             <div>
@@ -318,9 +325,13 @@ export default function Connection({ status, onRefresh }: Props) {
             </div>
           </div>
           <div className="flex gap-2">
-            <a href="#/" className="btn btn-primary" style={{ textDecoration: 'none' }}>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => navigate('/')}
+            >
               Go to Dashboard
-            </a>
+            </button>
             <button className="btn btn-secondary" onClick={handleDisconnect} disabled={loading}>
               <PlugZap size={14} /> Disconnect
             </button>
@@ -576,6 +587,7 @@ export default function Connection({ status, onRefresh }: Props) {
                     setAccount(String(c.account));
                     setServer(c.server);
                     setTerminalPath(c.terminal_path || '');
+                    setPassword('');
                   }}
                 >
                   Load

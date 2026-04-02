@@ -32,16 +32,12 @@ export default function Market({ connected }: Props) {
 
   const refreshTicks = useCallback(async () => {
     if (!connected || selectedSymbols.length === 0) return;
-    const newTicks: Record<string, TickData> = {};
-    for (const sym of selectedSymbols) {
-      try {
-        const tick = await api.getTick(sym);
-        newTicks[sym] = tick;
-      } catch {
-        // skip
-      }
+    try {
+      const resp = await api.getTicks(selectedSymbols);
+      setTicks(resp.ticks || {});
+    } catch {
+      // keep previous ticks on transient failures
     }
-    setTicks(newTicks);
   }, [connected, selectedSymbols]);
 
   const fetchBars = useCallback(async () => {
@@ -92,9 +88,23 @@ export default function Market({ connected }: Props) {
   }, [connected]);
 
   useEffect(() => {
-    refreshTicks();
-    const t = setInterval(refreshTicks, 2000);
-    return () => clearInterval(t);
+    let cancelled = false;
+    let inFlight = false;
+    const run = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        await refreshTicks();
+      } finally {
+        inFlight = false;
+      }
+    };
+    void run();
+    const t = setInterval(run, 150);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
   }, [refreshTicks]);
 
   useEffect(() => {

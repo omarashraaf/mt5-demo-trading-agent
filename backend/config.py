@@ -44,6 +44,29 @@ def _read_json_map(value: str | Mapping[str, str] | None) -> dict[str, str]:
     return {str(key).strip().upper(): str(val).strip() for key, val in data.items() if str(key).strip()}
 
 
+def _resolve_db_path(value: str) -> str:
+    """Resolve DB path with backward-compatible fallback.
+
+    If DB_PATH is relative and the file is missing in current cwd, try one-level
+    parent (legacy layout where DB sat at repo root while backend cwd is /backend).
+    """
+    cleaned = (value or "trading_agent.db").strip().strip('"').strip("'")
+    if not cleaned:
+        cleaned = "trading_agent.db"
+    if os.path.isabs(cleaned):
+        return cleaned
+
+    primary = os.path.abspath(cleaned)
+    if os.path.exists(primary):
+        return primary
+
+    parent_candidate = os.path.abspath(os.path.join(os.getcwd(), "..", cleaned))
+    if os.path.exists(parent_candidate):
+        return parent_candidate
+
+    return primary
+
+
 class AppConfig(BaseModel):
     LIVE_TRADING_ENABLED: bool = False
     DEFAULT_TERMINAL_PATH: str = r"C:\Program Files\MetaTrader 5\terminal64.exe"
@@ -112,6 +135,12 @@ class AppConfig(BaseModel):
     CLOUD_SYNC_ENABLED: bool = True
     CLOUD_LOG_TABLE: str = "runtime_logs"
     CLOUD_SYNC_TIMEOUT_SECONDS: float = Field(default=8.0, gt=1.0, le=30.0)
+    CLOUD_BRAIN_ENABLED: bool = True
+    CLOUD_BRAIN_TABLE: str = "brain_commands"
+    CLOUD_BRAIN_POLL_SECONDS: int = Field(default=8, ge=3, le=300)
+    CLOUD_BRAIN_DECISION_ENABLED: bool = False
+    CLOUD_BRAIN_DECISION_URL: str = ""
+    CLOUD_BRAIN_DECISION_TIMEOUT_SECONDS: float = Field(default=6.0, gt=1.0, le=30.0)
 
     @field_validator("LOG_LEVEL")
     @classmethod
@@ -182,7 +211,7 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
             "MT5_TERMINAL_PATH",
             r"C:\Program Files\MetaTrader 5\terminal64.exe",
         ),
-        "DB_PATH": source.get("DB_PATH", "trading_agent.db"),
+        "DB_PATH": _resolve_db_path(source.get("DB_PATH", "trading_agent.db")),
         "LOG_LEVEL": source.get("LOG_LEVEL", "INFO"),
         "API_HOST": source.get("API_HOST", "127.0.0.1"),
         "API_PORT": int(source.get("API_PORT", "8000")),
@@ -237,6 +266,12 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
         "CLOUD_SYNC_ENABLED": _read_bool(source.get("CLOUD_SYNC_ENABLED"), True),
         "CLOUD_LOG_TABLE": source.get("CLOUD_LOG_TABLE", "runtime_logs").strip() or "runtime_logs",
         "CLOUD_SYNC_TIMEOUT_SECONDS": float(source.get("CLOUD_SYNC_TIMEOUT_SECONDS", "8")),
+        "CLOUD_BRAIN_ENABLED": _read_bool(source.get("CLOUD_BRAIN_ENABLED"), True),
+        "CLOUD_BRAIN_TABLE": source.get("CLOUD_BRAIN_TABLE", "brain_commands").strip() or "brain_commands",
+        "CLOUD_BRAIN_POLL_SECONDS": int(source.get("CLOUD_BRAIN_POLL_SECONDS", "8")),
+        "CLOUD_BRAIN_DECISION_ENABLED": _read_bool(source.get("CLOUD_BRAIN_DECISION_ENABLED"), False),
+        "CLOUD_BRAIN_DECISION_URL": source.get("CLOUD_BRAIN_DECISION_URL", "").strip(),
+        "CLOUD_BRAIN_DECISION_TIMEOUT_SECONDS": float(source.get("CLOUD_BRAIN_DECISION_TIMEOUT_SECONDS", "6")),
     }
     return AppConfig(**data)
 

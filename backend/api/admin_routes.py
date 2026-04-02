@@ -349,7 +349,10 @@ async def admin_list_users(request: Request, authorization: Optional[str] = Head
 @router.get("/admin/customers")
 async def admin_customers(request: Request, authorization: Optional[str] = Header(default=None), limit: int = 500):
     user = await _require_admin(authorization)
-    payload = supabase_admin.list_users(page=1, per_page=max(1, min(limit, 1000)))
+    try:
+        payload = supabase_admin.list_users(page=1, per_page=max(1, min(limit, 1000)))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Could not load customers: {exc}") from exc
     users = payload.get("users", []) if isinstance(payload, dict) else []
     items = []
     for entry in users:
@@ -453,7 +456,10 @@ async def admin_access_requests(
     user = await _require_admin(authorization)
     if status and status not in {"pending", "approved", "rejected"}:
         raise HTTPException(status_code=400, detail="Invalid status filter.")
-    payload = supabase_admin.list_users(page=1, per_page=max(1, min(limit, 1000)))
+    try:
+        payload = supabase_admin.list_users(page=1, per_page=max(1, min(limit, 1000)))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Could not load access requests: {exc}") from exc
     users = payload.get("users", []) if isinstance(payload, dict) else []
     rows = []
     for entry in users:
@@ -502,7 +508,10 @@ async def admin_update_access_request(
         raise HTTPException(status_code=400, detail="Status must be approved|rejected|pending.")
     target_user_id = req.user_id.strip()
     # Keep status in Supabase metadata as the source of truth for cloud admin.
-    payload = supabase_admin.list_users(page=1, per_page=1000)
+    try:
+        payload = supabase_admin.list_users(page=1, per_page=1000)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Could not load target user: {exc}") from exc
     users = payload.get("users", []) if isinstance(payload, dict) else []
     target = next((u for u in users if str(u.get("id") or "") == target_user_id), None)
     if target is None:
@@ -511,7 +520,10 @@ async def admin_update_access_request(
     user_meta["access_status"] = status
     user_meta["access_updated_at"] = int(time.time())
     user_meta["access_notes"] = req.notes.strip()
-    supabase_admin.update_user_metadata(user_id=target_user_id, user_metadata=user_meta)
+    try:
+        supabase_admin.update_user_metadata(user_id=target_user_id, user_metadata=user_meta)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not update access status: {exc}") from exc
     await _log_activity(
         user=user,
         action="admin_update_access",
@@ -524,7 +536,10 @@ async def admin_update_access_request(
 @router.get("/admin/users/{user_id}")
 async def admin_user_detail(user_id: str, request: Request, authorization: Optional[str] = Header(default=None), limit: int = 200):
     user = await _require_admin(authorization)
-    payload = supabase_admin.list_users(page=1, per_page=1000)
+    try:
+        payload = supabase_admin.list_users(page=1, per_page=1000)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Could not load user details: {exc}") from exc
     users = payload.get("users", []) if isinstance(payload, dict) else []
     target = next((u for u in users if str(u.get("id") or "") == user_id.strip()), None)
     if not target:

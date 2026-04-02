@@ -373,8 +373,13 @@ export interface AIActivity {
   action: string;
   symbol: string;
   ticket: number;
+  signal_id?: number | null;
   detail: string;
   profit: number;
+  profit_pct?: number | null;
+  decision_reason?: string;
+  gemini_summary?: string;
+  meta_model_summary?: string;
   source?: string;
   confidence?: number;
   success?: boolean;
@@ -463,6 +468,49 @@ export interface TradeHistoryItem {
   signal_reason?: string;
   risk_approved?: number;
   risk_reason?: string;
+  decision_reason?: string | null;
+  trade_reasons?: string[];
+  gemini_response?: string | null;
+  meta_model?: {
+    version_id: string;
+    profit_probability: number;
+    expected_edge: number;
+    blocked: boolean;
+    changed_decision: boolean;
+    quality_before: number;
+    quality_after: number;
+  } | null;
+  post_analysis?: {
+    summary?: string;
+    what_went_well?: string[];
+    mistakes?: string[];
+    improvement_actions?: string[];
+    root_causes?: string[];
+    future_confidence_adjustment?: number;
+    quality_scores?: {
+      execution_quality?: number;
+      risk_discipline?: number;
+      timing_quality?: number;
+    };
+    diagnostics?: {
+      late_entry_flag?: number;
+      spread_stress_flag?: number;
+      trend_conflict_flag?: number;
+      risk_overexposure_flag?: number;
+      stop_too_tight_flag?: number;
+      target_too_far_flag?: number;
+      news_shock_flag?: number;
+      execution_delay_flag?: number;
+    };
+    recommendation?: {
+      expected_win_rate_adjustment?: number;
+      suggested_sl_pct_of_start?: number;
+      suggested_tp_pct_of_start?: number;
+      next_trade_size_adjustment_pct?: number;
+    };
+    generated_by?: string;
+    generated_at?: number;
+  } | null;
   exit_reason?: string | null;
 }
 
@@ -520,4 +568,8 @@ export interface ResearchStatusResponse {
   last_walk_forward_run?: Record<string, unknown> | null;
   best_candidate_model?: ResearchModelVersion | null;
   recent_attribution_reports?: Array<Record<string, unknown>>;
+  incremental_training?: {
+    last_run_at: number;
+    last_closed_count: number;
+  };
 }

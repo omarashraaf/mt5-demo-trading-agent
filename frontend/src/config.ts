@@ -27,4 +27,7 @@ export const runtimeConfig = {
   apiBaseUrl: buildApiBaseUrl(),
   appMode: (env.VITE_APP_MODE?.trim().toLowerCase() || 'runtime') as 'runtime' | 'portal',
   localRuntimeUrl: (env.VITE_LOCAL_RUNTIME_URL?.trim() || 'http://127.0.0.1:5173').replace(/\/+$/, ''),
+  requireAuth:
+    (env.VITE_REQUIRE_AUTH?.trim().toLowerCase() === 'true')
+    || ((env.VITE_REQUIRE_AUTH?.trim() ?? '') === '' && (env.VITE_APP_MODE?.trim().toLowerCase() || 'runtime') === 'portal'),
 };

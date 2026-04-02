@@ -1,14 +1,15 @@
 {
-  "name": "mt5-demo-trading-agent",
-  "version": "1.0.0",
-  "description": "MT5 Demo Trading Agent - Desktop Application",
+  "name": "linktrade",
+  "version": "1.0.2",
+  "description": "LinkTrade - Desktop Application",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
+    "build:backend": "powershell -ExecutionPolicy Bypass -File ..\\backend\\build_backend_exe.ps1",
     "electron:build-main": "tsc -p tsconfig.electron.json",
     "build": "vite build",
     "build:web": "vite build",
-    "build:desktop": "npm run electron:build-main && vite build && electron-builder",
+    "build:desktop": "npm run build:backend && npm run electron:build-main && cmd /c \"set ELECTRON_BUILD=1&& npx vite build\" && electron-builder --config.win.signAndEditExecutable=false",
     "preview": "vite preview",
     "electron:dev": "concurrently -k \"vite\" \"npm run electron:build-main -- --watch --preserveWatchOutput\" \"wait-on http://localhost:5173 dist-electron/main.js && electron .\"",
     "electron:build": "npm run build:desktop"
@@ -34,13 +35,57 @@
     "wait-on": "^7.2.0"
   },
   "build": {
-    "appId": "com.tradingagent.mt5demo",
-    "productName": "MT5 Demo Trading Agent",
+    "appId": "com.linktrade.desktop",
+    "productName": "LinkTrade",
+    "asar": true,
+    "compression": "maximum",
     "directories": {
       "output": "release"
     },
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "package.json",
+      "!**/*.map",
+      "!**/*.ts",
+      "!src/**",
+      "!release/**",
+      "!release-*/**",
+      "!release*/**",
+      "!.vercel/**",
+      "!.env",
+      "!.env.*",
+      "!frontend.err.log",
+      "!frontend.out.log"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.ico",
+        "to": "build/icon.ico"
+      },
+      {
+        "from": "../backend_dist/LinkTradeBackend",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "win": {
+      "icon": "build/icon.ico",
       "target": "nsis"
+    },
+    "electronLanguages": [
+      "en-US",
+      "ar"
+    ],
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "LinkTrade-Setup-${version}.exe",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico"
     }
   }
 }

@@ -3,7 +3,8 @@ import json
 import time
 import logging
 import sqlite3
-from typing import Optional
+import inspect
+from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +84,14 @@ CREATE TABLE IF NOT EXISTS ai_activity (
     timestamp REAL NOT NULL,
     action TEXT NOT NULL,
     symbol TEXT NOT NULL,
+    signal_id INTEGER,
     ticket INTEGER,
     detail TEXT NOT NULL,
-    profit REAL DEFAULT 0.0
+    profit REAL DEFAULT 0.0,
+    profit_pct REAL DEFAULT 0.0,
+    decision_reason TEXT DEFAULT '',
+    gemini_summary TEXT DEFAULT '',
+    meta_model_summary TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS saved_credentials (
@@ -324,6 +330,17 @@ CREATE TABLE IF NOT EXISTS attribution_reports (
     report_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS trade_post_analysis (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket INTEGER,
+    signal_id INTEGER,
+    symbol TEXT NOT NULL,
+    analysis_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(ticket, signal_id)
+);
+
 CREATE TABLE IF NOT EXISTS app_runtime_state (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL,
@@ -384,9 +401,13 @@ class Database:
         self.path = path
         self._db: Optional[aiosqlite.Connection] = None
         self._cloud_log_sink = None
+        self._trade_outcome_callback: Optional[Callable[[dict], Awaitable[None] | None]] = None
 
     def set_cloud_log_sink(self, sink):
         self._cloud_log_sink = sink
+
+    def set_trade_outcome_callback(self, callback: Optional[Callable[[dict], Awaitable[None] | None]]):
+        self._trade_outcome_callback = callback
 
     async def _emit_cloud_log(self, event_type: str, payload: dict):
         if self._cloud_log_sink is None:
@@ -469,6 +490,36 @@ class Database:
                 await self._db.execute(
                     "ALTER TABLE orders ADD COLUMN comment TEXT DEFAULT ''"
                 )
+        cursor = await self._db.execute("PRAGMA table_info(ai_activity)")
+        rows = await cursor.fetchall()
+        if rows:
+            ai_columns = {row[1] for row in rows}
+            if "signal_id" not in ai_columns:
+                await self._db.execute(
+                    "ALTER TABLE ai_activity ADD COLUMN signal_id INTEGER"
+                )
+            if "profit_pct" not in ai_columns:
+                await self._db.execute(
+                    "ALTER TABLE ai_activity ADD COLUMN profit_pct REAL DEFAULT 0.0"
+                )
+            if "decision_reason" not in ai_columns:
+                await self._db.execute(
+                    "ALTER TABLE ai_activity ADD COLUMN decision_reason TEXT DEFAULT ''"
+                )
+            if "gemini_summary" not in ai_columns:
+                await self._db.execute(
+                    "ALTER TABLE ai_activity ADD COLUMN gemini_summary TEXT DEFAULT ''"
+                )
+            if "meta_model_summary" not in ai_columns:
+                await self._db.execute(
+                    "ALTER TABLE ai_activity ADD COLUMN meta_model_summary TEXT DEFAULT ''"
+                )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trade_post_analysis_ticket ON trade_post_analysis(ticket)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trade_post_analysis_signal ON trade_post_analysis(signal_id)"
+        )
 
     async def log_connection_event(
         self, event: str, account: int = 0, server: str = "", details: str = ""
@@ -850,12 +901,37 @@ class Database:
         return dict(zip(cols, row))
 
     async def log_ai_activity(
-        self, action: str, symbol: str, ticket: int, detail: str, profit: float = 0.0
+        self,
+        action: str,
+        symbol: str,
+        ticket: int,
+        detail: str,
+        profit: float = 0.0,
+        *,
+        signal_id: Optional[int] = None,
+        profit_pct: Optional[float] = None,
+        decision_reason: str = "",
+        gemini_summary: str = "",
+        meta_model_summary: str = "",
     ):
         ts = time.time()
         await self._db.execute(
-            "INSERT INTO ai_activity (timestamp, action, symbol, ticket, detail, profit) VALUES (?, ?, ?, ?, ?, ?)",
-            (ts, action, symbol, ticket, detail, profit),
+            """INSERT INTO ai_activity
+               (timestamp, action, symbol, signal_id, ticket, detail, profit, profit_pct, decision_reason, gemini_summary, meta_model_summary)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ts,
+                action,
+                symbol,
+                signal_id,
+                ticket,
+                detail,
+                profit,
+                float(profit_pct or 0.0),
+                decision_reason or "",
+                gemini_summary or "",
+                meta_model_summary or "",
+            ),
         )
         await self._db.commit()
         await self._emit_cloud_log(
@@ -864,9 +940,14 @@ class Database:
                 "timestamp": ts,
                 "action": action,
                 "symbol": symbol,
+                "signal_id": signal_id,
                 "ticket": ticket,
                 "detail": detail,
                 "profit": profit,
+                "profit_pct": float(profit_pct or 0.0),
+                "decision_reason": decision_reason or "",
+                "gemini_summary": gemini_summary or "",
+                "meta_model_summary": meta_model_summary or "",
             },
         )
 
@@ -877,6 +958,75 @@ class Database:
         rows = await cursor.fetchall()
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in rows]
+
+    async def get_order_with_context_by_ticket(self, ticket: int) -> Optional[dict]:
+        cursor = await self._db.execute(
+            """SELECT o.*, s.agent_name, s.confidence, s.reason as signal_reason,
+                      r.approved, r.reason as risk_reason
+               FROM orders o
+               LEFT JOIN signals s ON o.signal_id = s.id
+               LEFT JOIN risk_decisions r
+                    ON r.id = (
+                        SELECT r2.id
+                        FROM risk_decisions r2
+                        WHERE r2.signal_id = s.id
+                        ORDER BY r2.timestamp DESC, r2.id DESC
+                        LIMIT 1
+                    )
+               WHERE o.ticket = ?
+               ORDER BY o.timestamp DESC
+               LIMIT 1""",
+            (ticket,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
+    async def get_trade_candidates_by_signal_ids(self, signal_ids: list[int]) -> dict[int, dict]:
+        ids = [int(sid) for sid in signal_ids if isinstance(sid, int)]
+        if not ids:
+            return {}
+        placeholders = ",".join(["?"] * len(ids))
+        cursor = await self._db.execute(
+            f"""SELECT *
+                FROM trade_candidates
+                WHERE signal_id IN ({placeholders})
+                ORDER BY timestamp_utc DESC""",
+            tuple(ids),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        mapped: dict[int, dict] = {}
+        for row in rows:
+            item = dict(zip(cols, row))
+            sid = item.get("signal_id")
+            if isinstance(sid, int) and sid not in mapped:
+                mapped[sid] = item
+        return mapped
+
+    async def get_evaluation_journal_by_signal_ids(self, signal_ids: list[int]) -> dict[int, dict]:
+        ids = [int(sid) for sid in signal_ids if isinstance(sid, int)]
+        if not ids:
+            return {}
+        placeholders = ",".join(["?"] * len(ids))
+        cursor = await self._db.execute(
+            f"""SELECT signal_id, timestamp, gemini_assessment, execution_decision, raw_technical_signal, executable_signal
+                FROM evaluation_journal
+                WHERE signal_id IN ({placeholders})
+                ORDER BY timestamp DESC""",
+            tuple(ids),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        mapped: dict[int, dict] = {}
+        for row in rows:
+            item = dict(zip(cols, row))
+            sid = item.get("signal_id")
+            if isinstance(sid, int) and sid not in mapped:
+                mapped[sid] = item
+        return mapped
 
     async def log_evaluation_journal(
         self,
@@ -1255,11 +1405,57 @@ class Database:
         if ticket is not None:
             await self.update_position_management_plan_status(ticket, "closed")
         await self._db.commit()
+        await self._emit_cloud_log(
+            "trade_outcome",
+            {
+                "ticket": ticket,
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "action": action,
+                "confidence": float(confidence or 0.0),
+                "profit": float(profit or 0.0),
+                "exit_reason": exit_reason,
+                "holding_minutes": float(holding_minutes or 0.0),
+                "symbol_category": symbol_category,
+                "strategy": strategy,
+                "planned_hold_minutes": int(planned_hold_minutes or 0),
+                "outcome_json": outcome_json or {},
+            },
+        )
+        if self._trade_outcome_callback is not None:
+            payload = {
+                "ticket": ticket,
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "action": action,
+                "profit": float(profit or 0.0),
+                "exit_reason": exit_reason,
+                "holding_minutes": float(holding_minutes or 0.0),
+                "symbol_category": symbol_category,
+                "strategy": strategy,
+            }
+            try:
+                maybe = self._trade_outcome_callback(payload)
+                if inspect.isawaitable(maybe):
+                    await maybe
+            except Exception:
+                logger.exception("Trade outcome callback failed")
 
     async def get_trade_outcome_by_ticket(self, ticket: int) -> Optional[dict]:
         cursor = await self._db.execute(
             "SELECT * FROM trade_outcomes WHERE ticket = ? ORDER BY closed_at DESC LIMIT 1",
             (ticket,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
+    async def get_trade_outcome_by_signal_id(self, signal_id: int) -> Optional[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM trade_outcomes WHERE signal_id = ? ORDER BY closed_at DESC LIMIT 1",
+            (signal_id,),
         )
         row = await cursor.fetchone()
         if row is None:
@@ -1289,6 +1485,106 @@ class Database:
         cursor = await self._db.execute("SELECT COUNT(*) FROM trade_outcomes")
         row = await cursor.fetchone()
         return int(row[0] or 0)
+
+    async def save_trade_post_analysis(
+        self,
+        *,
+        ticket: Optional[int],
+        signal_id: Optional[int],
+        symbol: str,
+        analysis: dict,
+    ) -> int:
+        now = time.time()
+        cursor = await self._db.execute(
+            """INSERT OR REPLACE INTO trade_post_analysis
+               (ticket, signal_id, symbol, analysis_json, created_at, updated_at)
+               VALUES (
+                 ?, ?, ?, ?,
+                 COALESCE(
+                   (SELECT created_at FROM trade_post_analysis WHERE ticket IS ? AND signal_id IS ?),
+                   ?
+                 ),
+                 ?
+               )""",
+            (
+                ticket,
+                signal_id,
+                symbol,
+                json.dumps(analysis or {}),
+                ticket,
+                signal_id,
+                now,
+                now,
+            ),
+        )
+        await self._db.commit()
+        return int(cursor.lastrowid or 0)
+
+    async def get_trade_post_analysis(
+        self,
+        *,
+        ticket: Optional[int] = None,
+        signal_id: Optional[int] = None,
+    ) -> Optional[dict]:
+        if ticket is None and signal_id is None:
+            return None
+        query = """SELECT *
+                   FROM trade_post_analysis
+                   WHERE 1=1"""
+        params: list = []
+        if ticket is not None:
+            query += " AND ticket = ?"
+            params.append(ticket)
+        if signal_id is not None:
+            query += " AND signal_id = ?"
+            params.append(signal_id)
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        cursor = await self._db.execute(query, tuple(params))
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        item = dict(zip(cols, row))
+        raw = item.get("analysis_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                item["analysis_json"] = json.loads(raw)
+            except Exception:
+                item["analysis_json"] = {}
+        else:
+            item["analysis_json"] = {}
+        return item
+
+    async def get_trade_post_analysis_by_signal_ids(self, signal_ids: list[int]) -> dict[int, dict]:
+        ids = [int(sid) for sid in signal_ids if isinstance(sid, int)]
+        if not ids:
+            return {}
+        placeholders = ",".join(["?"] * len(ids))
+        cursor = await self._db.execute(
+            f"""SELECT *
+                FROM trade_post_analysis
+                WHERE signal_id IN ({placeholders})
+                ORDER BY updated_at DESC""",
+            tuple(ids),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        mapped: dict[int, dict] = {}
+        for row in rows:
+            item = dict(zip(cols, row))
+            sid = item.get("signal_id")
+            if not isinstance(sid, int) or sid in mapped:
+                continue
+            raw = item.get("analysis_json")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    item["analysis_json"] = json.loads(raw)
+                except Exception:
+                    item["analysis_json"] = {}
+            else:
+                item["analysis_json"] = {}
+            mapped[sid] = item
+        return mapped
 
     async def log_event_fetch_run(
         self,

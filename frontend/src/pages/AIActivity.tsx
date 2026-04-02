@@ -17,6 +17,10 @@ export default function AIActivityPage({ status }: Props) {
     quality_score?: number;
     detail: string;
     success: boolean;
+    signal_id?: number | null;
+    decision_reason?: string;
+    gemini_summary?: string;
+    meta_model_summary?: string;
   }>>([]);
   const [aiActivity, setAiActivity] = useState<AIActivity[]>([]);
   const [loading, setLoading] = useState(false);
@@ -32,7 +36,10 @@ export default function AIActivityPage({ status }: Props) {
         api.getAIActivity(120),
       ]);
       setAutoTradeLogs(auto.recent_trades || []);
-      setAiActivity(brain.live_activity || []);
+      const merged = [...(brain.live_activity || []), ...(brain.db_activity || [])]
+        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+        .slice(0, 140);
+      setAiActivity(merged);
     } catch (e: any) {
       setError(e.message || 'Failed to load AI activity.');
     } finally {
@@ -100,6 +107,25 @@ export default function AIActivityPage({ status }: Props) {
                 <div style={{ marginTop: 4, color: log.success ? 'var(--accent-green)' : 'var(--accent-red)', fontSize: 12, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
                   {log.detail}
                 </div>
+                {(log.decision_reason || log.gemini_summary || log.meta_model_summary) && (
+                  <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
+                    {log.decision_reason && (
+                      <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                        Decision: {log.decision_reason}
+                      </div>
+                    )}
+                    {log.gemini_summary && (
+                      <div style={{ fontSize: 11, color: 'var(--accent-blue)', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                        Gemini: {log.gemini_summary}
+                      </div>
+                    )}
+                    {log.meta_model_summary && (
+                      <div style={{ fontSize: 11, color: 'var(--text-secondary)', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                        Meta model: {log.meta_model_summary}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -132,6 +158,30 @@ export default function AIActivityPage({ status }: Props) {
                 <div style={{ marginTop: 4, color: 'var(--text-secondary)', fontSize: 12, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
                   {activity.detail || '-'}
                 </div>
+                {(activity.decision_reason || activity.gemini_summary || activity.meta_model_summary || activity.profit_pct != null) && (
+                  <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
+                    {activity.decision_reason && (
+                      <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                        Decision: {activity.decision_reason}
+                      </div>
+                    )}
+                    {activity.gemini_summary && (
+                      <div style={{ fontSize: 11, color: 'var(--accent-blue)', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                        Gemini: {activity.gemini_summary}
+                      </div>
+                    )}
+                    {activity.meta_model_summary && (
+                      <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                        Meta model: {activity.meta_model_summary}
+                      </div>
+                    )}
+                    {activity.profit_pct != null && (
+                      <div style={{ fontSize: 11, color: (activity.profit_pct || 0) >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                        P/L %: {activity.profit_pct >= 0 ? '+' : ''}{activity.profit_pct.toFixed(2)}%
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </div>
