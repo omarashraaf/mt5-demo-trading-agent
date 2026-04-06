@@ -64,12 +64,12 @@ class GeminiEventClassifier:
         api_key: str | None = None,
         timeout_seconds: float = 12.0,
         max_retries: int = 1,
-        model_name: str = "gemini-2.5-flash",
+        model_name: str | None = None,
     ):
         self.api_key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
-        self.model_name = model_name
+        self.model_name = (model_name or os.getenv("GEMINI_MODEL", "gemma-3-1b-it")).strip() or "gemma-3-1b-it"
         self._client = None
         self._unavailable_reason = ""
         self._init_client()

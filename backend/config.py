@@ -74,6 +74,7 @@ class AppConfig(BaseModel):
     LOG_LEVEL: str = "INFO"
     API_HOST: str = "127.0.0.1"
     API_PORT: int = Field(default=8000, ge=1, le=65535)
+    GEMINI_MODEL: str = "gemma-3-1b-it"
     GEMINI_TIMEOUT_SECONDS: float = Field(default=12.0, gt=1.0, le=60.0)
     GEMINI_MAX_RETRIES: int = Field(default=1, ge=0, le=3)
     SAVE_CREDENTIALS_BY_DEFAULT: bool = False
@@ -215,6 +216,7 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
         "LOG_LEVEL": source.get("LOG_LEVEL", "INFO"),
         "API_HOST": source.get("API_HOST", "127.0.0.1"),
         "API_PORT": int(source.get("API_PORT", "8000")),
+        "GEMINI_MODEL": source.get("GEMINI_MODEL", "gemma-3-1b-it").strip() or "gemma-3-1b-it",
         "GEMINI_TIMEOUT_SECONDS": float(source.get("GEMINI_TIMEOUT_SECONDS", "12")),
         "GEMINI_MAX_RETRIES": int(source.get("GEMINI_MAX_RETRIES", "1")),
         "SAVE_CREDENTIALS_BY_DEFAULT": _read_bool(source.get("SAVE_CREDENTIALS_BY_DEFAULT"), False),

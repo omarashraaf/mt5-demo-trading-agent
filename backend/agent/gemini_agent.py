@@ -89,6 +89,7 @@ class GeminiAgent(TradingAgent):
 
     def __init__(self):
         self._client = None
+        self.model_name: str = (os.getenv("GEMINI_MODEL", "gemma-3-1b-it") or "gemma-3-1b-it").strip()
         self._last_call_time: float = 0.0
         self._unavailable_reason: str = ""
         self._runtime_last_error: str = ""
@@ -121,6 +122,10 @@ class GeminiAgent(TradingAgent):
             self._unavailable_reason = str(exc)
             logger.error("Failed to initialize Gemini: %s", exc)
             self._client = None
+
+    def _supports_google_search(self) -> bool:
+        # Current Gemma API models generally don't support Google Search tool grounding.
+        return not self.model_name.lower().startswith("gemma-")
 
     @property
     def name(self) -> str:
@@ -206,14 +211,16 @@ class GeminiAgent(TradingAgent):
             self._last_call_time = time.time()
 
             contents = self._build_contents(input_data, technical_signal)
-            config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                temperature=0.1,
-                response_mime_type="application/json",
-            )
+            config_kwargs = {
+                "system_instruction": SYSTEM_INSTRUCTION,
+                "temperature": 0.1,
+                "response_mime_type": "application/json",
+            }
+            if self._supports_google_search():
+                config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+            config = types.GenerateContentConfig(**config_kwargs)
             response = self._client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=self.model_name,
                 contents=contents,
                 config=config,
             )
@@ -293,7 +300,7 @@ class GeminiAgent(TradingAgent):
                 response_mime_type="application/json",
             )
             response = self._client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=self.model_name,
                 contents=self._build_normalized_news_contents(context, technical_signal, normalized_news),
                 config=config,
             )

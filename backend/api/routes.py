@@ -95,6 +95,7 @@ asset_mapping_service = AssetMappingService(universe_service=universe_service)
 gemini_event_classifier = GeminiEventClassifier(
     timeout_seconds=config.GEMINI_TIMEOUT_SECONDS,
     max_retries=config.GEMINI_MAX_RETRIES,
+    model_name=config.GEMINI_MODEL,
 )
 event_ingestion_service = EventIngestionService(
     finnhub_adapter=finnhub_adapter,

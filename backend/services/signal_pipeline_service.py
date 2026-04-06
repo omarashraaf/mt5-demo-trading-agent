@@ -92,6 +92,7 @@ class SignalPipelineService:
         self.gemini_strategy_advisor_service = gemini_strategy_advisor_service or GeminiStrategyAdvisorService(
             timeout_seconds=getattr(gemini_adapter, "timeout_seconds", 12.0),
             max_retries=getattr(gemini_adapter, "max_retries", 1),
+            model_name=config.GEMINI_MODEL,
         )
         self.trade_decision_service = trade_decision_service or TradeDecisionService(
             trade_quality_service=self.trade_quality_service,
