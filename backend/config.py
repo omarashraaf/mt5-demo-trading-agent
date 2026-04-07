@@ -47,14 +47,20 @@ def _read_json_map(value: str | Mapping[str, str] | None) -> dict[str, str]:
 def _resolve_db_path(value: str) -> str:
     """Resolve DB path with backward-compatible fallback.
 
-    If DB_PATH is relative and the file is missing in current cwd, try one-level
-    parent (legacy layout where DB sat at repo root while backend cwd is /backend).
+    For relative DB paths, prefer backend-module-relative resolution first so
+    runtime behavior is stable regardless of process working directory.
+    If no module-relative DB exists, keep backward-compatible cwd/parent fallback.
     """
     cleaned = (value or "trading_agent.db").strip().strip('"').strip("'")
     if not cleaned:
         cleaned = "trading_agent.db"
     if os.path.isabs(cleaned):
         return cleaned
+
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    module_candidate = os.path.abspath(os.path.join(module_dir, cleaned))
+    if os.path.exists(module_candidate):
+        return module_candidate
 
     primary = os.path.abspath(cleaned)
     if os.path.exists(primary):
@@ -142,6 +148,8 @@ class AppConfig(BaseModel):
     CLOUD_BRAIN_DECISION_ENABLED: bool = False
     CLOUD_BRAIN_DECISION_URL: str = ""
     CLOUD_BRAIN_DECISION_TIMEOUT_SECONDS: float = Field(default=6.0, gt=1.0, le=30.0)
+    CLOUD_SECRETS_ENABLED: bool = True
+    CLOUD_SECRETS_TABLE: str = "app_secrets"
 
     @field_validator("LOG_LEVEL")
     @classmethod
@@ -274,6 +282,8 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
         "CLOUD_BRAIN_DECISION_ENABLED": _read_bool(source.get("CLOUD_BRAIN_DECISION_ENABLED"), False),
         "CLOUD_BRAIN_DECISION_URL": source.get("CLOUD_BRAIN_DECISION_URL", "").strip(),
         "CLOUD_BRAIN_DECISION_TIMEOUT_SECONDS": float(source.get("CLOUD_BRAIN_DECISION_TIMEOUT_SECONDS", "6")),
+        "CLOUD_SECRETS_ENABLED": _read_bool(source.get("CLOUD_SECRETS_ENABLED"), True),
+        "CLOUD_SECRETS_TABLE": source.get("CLOUD_SECRETS_TABLE", "app_secrets").strip() or "app_secrets",
     }
     return AppConfig(**data)
 

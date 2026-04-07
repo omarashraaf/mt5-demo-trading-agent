@@ -12,6 +12,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from config import config
+from api.routes import cloud_secret_service, apply_runtime_gemini_credentials, hydrate_gemini_credentials_from_cloud
 from services.supabase_admin_service import SupabaseAdminService
 from storage.db import Database
 
@@ -25,6 +26,9 @@ supabase_admin = SupabaseAdminService(
     service_role_key=config.SUPABASE_SERVICE_ROLE_KEY,
 )
 ADMIN_SESSION_TTL_SECONDS = 60 * 60 * 12
+_admin_users_cache: list[dict] = []
+_admin_users_cache_at: float = 0.0
+_admin_users_cache_lock = asyncio.Lock()
 
 
 def set_database(database: Database):
@@ -69,6 +73,11 @@ class UpdateAccessRequest(BaseModel):
 class AdminLoginRequest(BaseModel):
     username: str
     password: str
+
+
+class GeminiCloudConfigRequest(BaseModel):
+    api_key: str
+    model: Optional[str] = None
 
 
 def _admin_signing_secret() -> str:
@@ -199,6 +208,47 @@ async def _log_activity(
         status_code=status_code,
         details=details or {},
     )
+
+
+async def _fetch_admin_users(*, limit: int = 1000, max_cache_age_seconds: float = 8.0) -> list[dict]:
+    """Return Supabase users with short cache + bounded latency.
+
+    Admin panel refresh should stay responsive even when Supabase admin API
+    is temporarily slow.
+    """
+    global _admin_users_cache
+    global _admin_users_cache_at
+
+    now = time.time()
+    if _admin_users_cache and (now - _admin_users_cache_at) <= max_cache_age_seconds:
+        return list(_admin_users_cache)
+
+    async with _admin_users_cache_lock:
+        now = time.time()
+        if _admin_users_cache and (now - _admin_users_cache_at) <= max_cache_age_seconds:
+            return list(_admin_users_cache)
+        try:
+            payload = await asyncio.wait_for(
+                asyncio.to_thread(
+                    supabase_admin.list_users,
+                    page=1,
+                    per_page=max(1, min(limit, 1000)),
+                ),
+                timeout=8.0,
+            )
+            users = payload.get("users", []) if isinstance(payload, dict) else []
+            _admin_users_cache = list(users)
+            _admin_users_cache_at = time.time()
+            return list(_admin_users_cache)
+        except Exception:
+            if _admin_users_cache:
+                return list(_admin_users_cache)
+            raise
+
+
+def _invalidate_admin_users_cache():
+    global _admin_users_cache_at
+    _admin_users_cache_at = 0.0
 
 
 @router.get("/auth/me")
@@ -333,7 +383,14 @@ async def auth_bootstrap_admin():
 async def admin_list_users(request: Request, authorization: Optional[str] = Header(default=None), page: int = 1, per_page: int = 200):
     user = await _require_admin(authorization)
     try:
-        payload = supabase_admin.list_users(page=max(1, page), per_page=max(1, min(per_page, 1000)))
+        payload = await asyncio.wait_for(
+            asyncio.to_thread(
+                supabase_admin.list_users,
+                page=max(1, page),
+                per_page=max(1, min(per_page, 1000)),
+            ),
+            timeout=8.0,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     users = payload.get("users", []) if isinstance(payload, dict) else []
@@ -350,10 +407,9 @@ async def admin_list_users(request: Request, authorization: Optional[str] = Head
 async def admin_customers(request: Request, authorization: Optional[str] = Header(default=None), limit: int = 500):
     user = await _require_admin(authorization)
     try:
-        payload = supabase_admin.list_users(page=1, per_page=max(1, min(limit, 1000)))
+        users = await _fetch_admin_users(limit=limit)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Could not load customers: {exc}") from exc
-    users = payload.get("users", []) if isinstance(payload, dict) else []
     items = []
     for entry in users:
         role = _get_role(entry)
@@ -400,7 +456,8 @@ async def admin_create_user(req: CreateAdminUserRequest, request: Request, autho
     if len(req.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
     try:
-        created = supabase_admin.create_user(
+        created = await asyncio.to_thread(
+            supabase_admin.create_user,
             email=email,
             password=req.password,
             role=role,
@@ -418,6 +475,7 @@ async def admin_create_user(req: CreateAdminUserRequest, request: Request, autho
             )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_admin_users_cache()
     await _log_activity(
         user=user,
         action="admin_create_user",
@@ -434,9 +492,14 @@ async def admin_update_role(req: UpdateRoleRequest, request: Request, authorizat
     if role not in {"admin", "user"}:
         raise HTTPException(status_code=400, detail="Role must be 'admin' or 'user'.")
     try:
-        updated = supabase_admin.update_user_role(user_id=req.user_id.strip(), role=role)
+        updated = await asyncio.to_thread(
+            supabase_admin.update_user_role,
+            user_id=req.user_id.strip(),
+            role=role,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_admin_users_cache()
     await _log_activity(
         user=user,
         action="admin_update_role",
@@ -457,10 +520,9 @@ async def admin_access_requests(
     if status and status not in {"pending", "approved", "rejected"}:
         raise HTTPException(status_code=400, detail="Invalid status filter.")
     try:
-        payload = supabase_admin.list_users(page=1, per_page=max(1, min(limit, 1000)))
+        users = await _fetch_admin_users(limit=limit)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Could not load access requests: {exc}") from exc
-    users = payload.get("users", []) if isinstance(payload, dict) else []
     rows = []
     for entry in users:
         role = _get_role(entry)
@@ -509,10 +571,9 @@ async def admin_update_access_request(
     target_user_id = req.user_id.strip()
     # Keep status in Supabase metadata as the source of truth for cloud admin.
     try:
-        payload = supabase_admin.list_users(page=1, per_page=1000)
+        users = await _fetch_admin_users(limit=1000)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Could not load target user: {exc}") from exc
-    users = payload.get("users", []) if isinstance(payload, dict) else []
     target = next((u for u in users if str(u.get("id") or "") == target_user_id), None)
     if target is None:
         raise HTTPException(status_code=404, detail="User not found.")
@@ -521,9 +582,14 @@ async def admin_update_access_request(
     user_meta["access_updated_at"] = int(time.time())
     user_meta["access_notes"] = req.notes.strip()
     try:
-        supabase_admin.update_user_metadata(user_id=target_user_id, user_metadata=user_meta)
+        await asyncio.to_thread(
+            supabase_admin.update_user_metadata,
+            user_id=target_user_id,
+            user_metadata=user_meta,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not update access status: {exc}") from exc
+    _invalidate_admin_users_cache()
     await _log_activity(
         user=user,
         action="admin_update_access",
@@ -537,10 +603,9 @@ async def admin_update_access_request(
 async def admin_user_detail(user_id: str, request: Request, authorization: Optional[str] = Header(default=None), limit: int = 200):
     user = await _require_admin(authorization)
     try:
-        payload = supabase_admin.list_users(page=1, per_page=1000)
+        users = await _fetch_admin_users(limit=1000)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Could not load user details: {exc}") from exc
-    users = payload.get("users", []) if isinstance(payload, dict) else []
     target = next((u for u in users if str(u.get("id") or "") == user_id.strip()), None)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -606,4 +671,52 @@ async def cloud_status(authorization: Optional[str] = Header(default=None)):
         "user_role": role,
         "hybrid_mode": True,
         "runtime": "local_app + cloud_auth_and_logs",
+    }
+
+
+@router.get("/admin/cloud/gemini")
+async def admin_get_cloud_gemini(authorization: Optional[str] = Header(default=None)):
+    await _require_admin(authorization)
+    if not cloud_secret_service.configured:
+        raise HTTPException(status_code=503, detail="Cloud secret service is not configured.")
+    try:
+        row = await asyncio.to_thread(cloud_secret_service.get_secret, "GEMINI_API_KEY")
+        model_row = await asyncio.to_thread(cloud_secret_service.get_secret, "GEMINI_MODEL")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch cloud Gemini config: {exc}") from exc
+    key = str((row or {}).get("value") or "")
+    masked = f"{key[:4]}...{key[-4:]}" if len(key) >= 8 else ("*" * len(key))
+    return {
+        "configured": bool(key),
+        "api_key_masked": masked,
+        "model": str((model_row or {}).get("value") or ""),
+        "table": config.CLOUD_SECRETS_TABLE,
+    }
+
+
+@router.post("/admin/cloud/gemini")
+async def admin_set_cloud_gemini(req: GeminiCloudConfigRequest, authorization: Optional[str] = Header(default=None)):
+    await _require_admin(authorization)
+    if not cloud_secret_service.configured:
+        raise HTTPException(status_code=503, detail="Cloud secret service is not configured.")
+    api_key = str(req.api_key or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required.")
+    model = str(req.model or "").strip()
+    try:
+        await asyncio.to_thread(cloud_secret_service.upsert_secret, key="GEMINI_API_KEY", value=api_key)
+        if model:
+            await asyncio.to_thread(cloud_secret_service.upsert_secret, key="GEMINI_MODEL", value=model)
+        applied = await hydrate_gemini_credentials_from_cloud()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save cloud Gemini config: {exc}") from exc
+    if not applied.get("loaded"):
+        applied = apply_runtime_gemini_credentials(api_key=api_key, model_name=(model or None), source="admin_fallback")
+    return {
+        "saved": True,
+        "source": applied.get("source"),
+        "model": applied.get("model"),
+        "gemini_available": bool(applied.get("gemini_available")),
+        "event_classifier_available": bool(applied.get("event_classifier_available")),
+        "strategy_advisor_available": bool(applied.get("strategy_advisor_available")),
     }

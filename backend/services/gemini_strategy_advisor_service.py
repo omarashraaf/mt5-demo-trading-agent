@@ -68,11 +68,15 @@ class GeminiStrategyAdvisorService:
         self.timeout_seconds = float(timeout_seconds)
         self.max_retries = int(max_retries)
         self.model_name = (model_name or os.getenv("GEMINI_MODEL", "gemma-3-1b-it")).strip() or "gemma-3-1b-it"
+        if "31b" in self.model_name.lower() and self.timeout_seconds < 20.0:
+            self.timeout_seconds = 20.0
         self._client = None
         self._unavailable_reason = ""
         self._last_error = ""
         self._quota_cooldown_until = 0.0
         self._quota_min_cooldown_seconds = 900.0
+        self._cache_ttl_seconds = 120.0
+        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._init_client()
 
     @property
@@ -99,6 +103,15 @@ class GeminiStrategyAdvisorService:
             return self._fallback("No actionable direction to advise.", used=False)
         if not self.available:
             return self._fallback(self.unavailable_reason, used=False)
+        use_cache = context.evaluation_mode in {"auto", "scan"}
+        primary_cache_key, secondary_cache_key = self._cache_keys(
+            context=context,
+            technical_signal=technical_signal,
+            event_context=event_context or {},
+        )
+        cached = self._cache_get(primary_cache_key) or self._cache_get(secondary_cache_key)
+        if use_cache and cached is not None:
+            return {**cached, "cached": True}
         if time.time() < self._quota_cooldown_until:
             return self._fallback(
                 "Gemini is paused due to quota cooldown; deterministic strategy is active.",
@@ -122,7 +135,23 @@ class GeminiStrategyAdvisorService:
                     timeout=self.timeout_seconds,
                 )
                 self._last_error = ""
+                self._cache_set(primary_cache_key, result)
+                self._cache_set(secondary_cache_key, result)
                 return result
+            except asyncio.TimeoutError:
+                last_error = RuntimeError(
+                    f"Gemini strategy advisor timed out after {self.timeout_seconds:.1f}s "
+                    f"(model={self.model_name})."
+                )
+                if cached is not None:
+                    return {
+                        **cached,
+                        "cached": True,
+                        "summary_reason": (
+                            f"{cached.get('summary_reason', '')} "
+                            "Reused recent Gemini advisory after timeout."
+                        ).strip(),
+                    }
             except Exception as exc:  # pragma: no cover - defensive runtime guard
                 last_error = exc
                 text = str(exc)
@@ -150,7 +179,11 @@ class GeminiStrategyAdvisorService:
                         degraded=False,
                         error="quota_cooldown",
                     )
-                logger.warning("Gemini strategy advisor failed for %s: %s", context.symbol, exc)
+                logger.warning(
+                    "Gemini strategy advisor failed for %s: %r",
+                    context.symbol,
+                    exc,
+                )
 
         self._last_error = str(last_error) if last_error else "Gemini strategy advisor failed."
         return self._fallback(
@@ -212,7 +245,33 @@ class GeminiStrategyAdvisorService:
             contents=json.dumps(payload, ensure_ascii=True),
             config=config,
         )
-        return self._parse_response(response.text or "")
+        response_text = self._extract_response_text(response)
+        return self._parse_response(response_text)
+
+    def _extract_response_text(self, response: Any) -> str:
+        try:
+            text = (getattr(response, "text", "") or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        pieces: list[str] = []
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) or []
+            for part in parts:
+                txt = getattr(part, "text", None)
+                if txt:
+                    pieces.append(str(txt))
+        merged = "\n".join(piece.strip() for piece in pieces if piece and str(piece).strip()).strip()
+        if merged:
+            return merged
+
+        prompt_feedback = getattr(response, "prompt_feedback", None)
+        block_reason = getattr(prompt_feedback, "block_reason", None)
+        raise RuntimeError(f"Gemini returned empty response (block_reason={block_reason or 'none'}).")
 
     def _parse_response(self, text: str) -> dict[str, Any]:
         cleaned = (text or "").strip()
@@ -271,6 +330,38 @@ class GeminiStrategyAdvisorService:
             "error": error,
             "raw_payload": {},
         }
+
+    def _cache_keys(
+        self,
+        *,
+        context: MarketContext,
+        technical_signal: TechnicalSignal,
+        event_context: dict[str, Any],
+    ) -> tuple[str, str]:
+        mode = str((context.user_policy or {}).get("mode", "balanced")).lower()
+        symbol = str(context.symbol or "").upper()
+        action = str(technical_signal.action or "HOLD").upper()
+        confidence = round(float(technical_signal.confidence or 0.0), 2)
+        bias = str(event_context.get("bias", "neutral")).lower()
+        risk = str(event_context.get("event_risk", "low")).lower()
+        detailed = f"{symbol}|{action}|{mode}|{confidence:.2f}|{bias}|{risk}"
+        coarse = f"{symbol}|{action}|{mode}"
+        return detailed, coarse
+
+    def _cache_get(self, key: str) -> dict[str, Any] | None:
+        item = self._cache.get(key)
+        if not item:
+            return None
+        expires_at, payload = item
+        if time.time() >= expires_at:
+            self._cache.pop(key, None)
+            return None
+        return dict(payload)
+
+    def _cache_set(self, key: str, payload: dict[str, Any]) -> None:
+        if not key:
+            return
+        self._cache[key] = (time.time() + self._cache_ttl_seconds, dict(payload))
 
     def _init_client(self):
         if genai is None or types is None:

@@ -378,6 +378,17 @@ class SignalPipelineService:
         age_seconds = max(0.0, time.time() - tick_time)
         max_age = self._max_tick_age_seconds(context)
         if age_seconds > max_age:
+            # Broker feeds can pause/lag even while order routing remains executable.
+            # If we have valid bid/ask, avoid false "market closed" blocks for moderate
+            # delays and let deterministic spread/risk gates decide.
+            executable_delay_tolerance_seconds = 4 * 60 * 60  # 4 hours
+            if age_seconds <= executable_delay_tolerance_seconds:
+                return None
+            if category in {"stocks", "indices", "commodities"}:
+                return (
+                    f"No fresh executable tick for {context.symbol} "
+                    f"(last tick {int(age_seconds)}s ago). Market data may be delayed or the symbol is illiquid."
+                )
             return (
                 f"Market appears closed or stale for {context.symbol} "
                 f"(last tick {int(age_seconds)}s ago)."
@@ -410,7 +421,14 @@ class SignalPipelineService:
             "quality": {
                 "score": float(qa.final_trade_quality_score or 0.0),
                 "threshold": float(qa.threshold or 0.0),
-                "projected_margin_after_costs_pct": float(qa.projected_margin_after_costs_pct or 0.0),
+                "projected_margin_after_costs_pct": float(
+                    getattr(
+                        qa,
+                        "projected_margin_after_costs_pct",
+                        getattr(qa, "projected_margin_utilization_pct", 0.0),
+                    )
+                    or 0.0
+                ),
                 "no_trade_zone": bool(qa.no_trade_zone),
                 "no_trade_reasons": list(qa.no_trade_reasons or []),
             },
@@ -510,7 +528,7 @@ class SignalPipelineService:
             strategy="market_unavailable",
             initial_thesis=reason,
             time_stop_rule="No trade opened.",
-            notes=["Trading blocked before signal generation because market appears closed or stale."],
+            notes=["Trading blocked before signal generation because fresh executable market data was unavailable."],
             metadata={"blocked_by": "market_live_guard"},
         )
         signal_decision = SignalDecision(
@@ -554,7 +572,7 @@ class SignalPipelineService:
             return False
         # Protect free-tier Gemini quota: avoid per-symbol Gemini calls in bulk
         # scan/auto loops unless the user explicitly requires confirmation mode.
-        if evaluation_mode in {"scan", "auto"} and gemini_role != "confirmation-required":
+        if evaluation_mode in {"scan", "auto"}:
             return False
         if gemini_role == "confirmation-required":
             return True
@@ -1261,9 +1279,9 @@ class SignalPipelineService:
 
         recent_outcomes = []
         recent_evaluations = []
-        # Manual dashboard scans should stay responsive; skip heavy learning-history
-        # lookups and use direct technical + risk evaluation only.
-        if self.db is not None and evaluation_mode != "manual":
+        # Bulk scan/auto loops should stay responsive; skip heavy learning-history
+        # lookups there and keep those reads for manual/replay analysis paths.
+        if self.db is not None and evaluation_mode in {"manual", "replay"}:
             lookback_minutes = max(self.risk_engine.settings.cooldown_minutes_per_symbol, 1440)
             recent_outcomes = await self.db.get_recent_symbol_outcomes(
                 context.symbol,
@@ -1324,7 +1342,9 @@ class SignalPipelineService:
                 ),
                 anti_churn_blocked=False,
             )
-        if self.cloud_brain_decision_client is not None:
+        # Cloud-brain overlay is advisory and must not block scan/auto loops.
+        # Keep bulk scans and autonomous cycles deterministic and low-latency.
+        if self.cloud_brain_decision_client is not None and evaluation_mode not in {"scan", "auto"}:
             payload = self._build_cloud_decision_payload(
                 context=context,
                 trade_decision=trade_decision,
@@ -1391,12 +1411,12 @@ class SignalPipelineService:
         if blocking_reasons and final_signal.action in {"BUY", "SELL"}:
             final_signal = self._downgrade_signal(final_signal, blocking_reasons)
         if market_guard_reason:
-            # Closed/stale market must never appear as a tradable confidence setup.
+            # Missing/stale executable market data must never appear as a tradable setup.
             final_signal = final_signal.model_copy(
                 update={
                     "action": "HOLD",
                     "confidence": 0.0,
-                    "reason": f"{final_signal.reason} Market closed guard: {market_guard_reason}",
+                    "reason": f"{final_signal.reason} Market data guard: {market_guard_reason}",
                 }
             )
 
@@ -1667,3 +1687,4 @@ class SignalPipelineService:
                 feature_snapshot=build_feature_snapshot(execution_decision),
             )
         return signal_id
+

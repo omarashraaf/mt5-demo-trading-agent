@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react';
-import { Play } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { Play, Plus, HelpCircle } from 'lucide-react';
 import { api } from '../utils/api';
 import { FALLBACK_SYMBOL_LIST, ACTIVE_SYMBOL_MODE_LABEL } from '../utils/symbolUniverse';
-import type { AgentInfo, EvaluateResponse } from '../types';
+import type { AgentInfo, EvaluateResponse, StrategyProfile } from '../types';
 
 interface Props {
   connected: boolean;
@@ -11,6 +11,14 @@ interface Props {
 export default function Strategy({ connected }: Props) {
   const [agents, setAgents] = useState<Record<string, AgentInfo>>({});
   const [activeAgent, setActiveAgent] = useState('');
+  const [strategies, setStrategies] = useState<StrategyProfile[]>([]);
+  const [activeStrategyId, setActiveStrategyId] = useState('');
+  const [strategyName, setStrategyName] = useState('');
+  const [strategyDescription, setStrategyDescription] = useState('');
+  const [strategyLoadingId, setStrategyLoadingId] = useState('');
+  const [strategyInfoOpen, setStrategyInfoOpen] = useState(false);
+  const [strategyInfo, setStrategyInfo] = useState<StrategyProfile | null>(null);
+  const [buildingStrategy, setBuildingStrategy] = useState(false);
   const [availableSymbols, setAvailableSymbols] = useState<string[]>(FALLBACK_SYMBOL_LIST);
   const [symbol, setSymbol] = useState(FALLBACK_SYMBOL_LIST[0]);
   const [timeframe, setTimeframe] = useState('H1');
@@ -20,10 +28,26 @@ export default function Strategy({ connected }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const loadStrategies = useCallback(async () => {
+    try {
+      const response = await api.getStrategies();
+      setStrategies(response.items || []);
+      setActiveStrategyId(response.active_strategy_id || '');
+    } catch {
+      // keep page usable if strategies endpoint is temporarily unavailable
+    }
+  }, []);
+
   useEffect(() => {
     api.getAgents().then(setAgents).catch(() => {});
-    api.getStatus().then((s) => setActiveAgent(s.active_agent)).catch(() => {});
-  }, []);
+    api.getStatus()
+      .then((s) => {
+        setActiveAgent(s.active_agent);
+        setActiveStrategyId(s.active_strategy?.id || '');
+      })
+      .catch(() => {});
+    loadStrategies();
+  }, [loadStrategies]);
 
   useEffect(() => {
     if (!connected) return;
@@ -46,6 +70,52 @@ export default function Strategy({ connected }: Props) {
       setActiveAgent(name);
     } catch (e: any) {
       setError(e.message);
+    }
+  };
+
+  const handleSelectStrategy = async (strategyId: string) => {
+    if (!strategyId || strategyLoadingId) return;
+    setStrategyLoadingId(strategyId);
+    setError('');
+    try {
+      const response = await api.selectStrategy(strategyId);
+      setActiveStrategyId(response.active_strategy_id || strategyId);
+      setActiveAgent(response.active_agent || activeAgent);
+      setStrategies((prev) => prev.map((item) => ({
+        ...item,
+        is_selected: item.id === (response.active_strategy_id || strategyId),
+      })));
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setStrategyLoadingId('');
+    }
+  };
+
+  const handleBuildStrategy = async () => {
+    const name = strategyName.trim();
+    const description = strategyDescription.trim();
+    if (name.length < 3) {
+      setError('Strategy name must be at least 3 characters.');
+      return;
+    }
+    if (description.length < 10) {
+      setError('Please describe your strategy in more detail.');
+      return;
+    }
+    setBuildingStrategy(true);
+    setError('');
+    try {
+      const response = await api.buildStrategy({ name, description });
+      setActiveStrategyId(response.active_strategy_id);
+      setActiveAgent(response.active_agent || activeAgent);
+      setStrategyName('');
+      setStrategyDescription('');
+      await loadStrategies();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBuildingStrategy(false);
     }
   };
 
@@ -75,11 +145,138 @@ export default function Strategy({ connected }: Props) {
   return (
     <div>
       <div className="page-header">
-        <h2>Strategy / Agent</h2>
+        <h2>Strategy</h2>
         <p>Configure and run your trading agent. Current mode: {ACTIVE_SYMBOL_MODE_LABEL}.</p>
       </div>
 
       {error && <div className="error-banner">{error}</div>}
+
+      <div className="card mb-4">
+        <div className="card-header">
+          <h3>Strategy Builder</h3>
+        </div>
+        <div className="grid-2 gap-3">
+          <div className="form-group">
+            <label>Strategy Name</label>
+            <input
+              className="form-input"
+              placeholder="e.g. Gold London Breakout"
+              value={strategyName}
+              onChange={(e) => setStrategyName(e.target.value)}
+            />
+          </div>
+          <div className="form-group">
+            <label>Describe Strategy Logic</label>
+            <textarea
+              className="form-input"
+              placeholder="Example: Focus on Gold and US indices, avoid low momentum sessions, use safer entries."
+              value={strategyDescription}
+              onChange={(e) => setStrategyDescription(e.target.value)}
+              rows={4}
+              style={{ resize: 'vertical' }}
+            />
+          </div>
+        </div>
+        <button className="btn btn-primary" onClick={handleBuildStrategy} disabled={buildingStrategy}>
+          {buildingStrategy ? <span className="loading-spinner" /> : <><Plus size={14} /> Add Strategy</>}
+        </button>
+        <div className="text-muted text-sm mt-2">
+          Built-in strategies are shared with all users. Strategies you build appear only for your account.
+        </div>
+      </div>
+
+      {strategies.length > 0 && (
+        <div className="card mb-4">
+          <div className="card-header">
+            <h3>Available Strategies</h3>
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            {strategies.map((strategy, idx) => {
+              const selected = strategy.id === activeStrategyId || strategy.is_selected;
+              return (
+                <div key={strategy.id} style={{ display: 'inline-flex', alignItems: 'center' }}>
+                  <button
+                    className="btn"
+                    onClick={() => handleSelectStrategy(strategy.id)}
+                    disabled={strategyLoadingId === strategy.id}
+                    title={strategy.description || strategy.name}
+                    style={{
+                      fontSize: 13,
+                      padding: '8px 16px',
+                      borderRadius: 12,
+                      border: selected ? '1px solid var(--accent-blue)' : '1px solid var(--border)',
+                      background: selected ? 'var(--accent-blue)' : 'var(--bg-secondary)',
+                      color: selected ? '#fff' : 'var(--text-primary)',
+                      fontWeight: 600,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 8,
+                    }}
+                  >
+                    <span>{idx === 0 ? `${strategy.name} (Default)` : strategy.name}</span>
+                    <span
+                      role="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        setStrategyInfo(strategy);
+                        setStrategyInfoOpen(true);
+                      }}
+                      title={`About ${strategy.name}`}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        opacity: 0.9,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <HelpCircle size={14} />
+                    </span>
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          <div className="text-muted text-sm mt-3">
+            Active strategy: <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+              {strategies.find((s) => s.id === activeStrategyId)?.name || 'Default Smart'}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {strategyInfoOpen && strategyInfo && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.45)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1200,
+            padding: 20,
+          }}
+          onClick={() => setStrategyInfoOpen(false)}
+        >
+          <div
+            className="card"
+            style={{ width: 'min(560px, 92vw)', padding: 18 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex justify-between items-center" style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 16, fontWeight: 700 }}>{strategyInfo.name}</div>
+              <button className="btn btn-secondary btn-sm" onClick={() => setStrategyInfoOpen(false)}>
+                Close
+              </button>
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6, whiteSpace: 'pre-line' }}>
+              {strategyInfo.brief || strategyInfo.description || 'No strategy brief available.'}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid-2 mb-4">
         <div className="card">

@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { RefreshCw, AlertOctagon, X, TrendingUp, TrendingDown, Minus, Play, HelpCircle, DollarSign, ShieldCheck, Clock, Zap, Power, CheckCircle, XCircle } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { RefreshCw, AlertOctagon, X, TrendingUp, TrendingDown, Minus, Play, HelpCircle, DollarSign, ShieldCheck, Clock, Zap, Power, CheckCircle, XCircle, Plus } from 'lucide-react';
 import { api } from '../utils/api';
-import type { StatusResponse, PositionInfo, Recommendation, OrderResult, TickData } from '../types';
+import type { StatusResponse, PositionInfo, Recommendation, OrderResult, TickData, StrategyProfile } from '../types';
 import ConnectionBar from '../components/ConnectionBar';
 import { getSymbolName, getSymbolEmoji, getSignalStrength, getActionDescription, explainProfitLoss } from '../utils/symbolNames';
 
@@ -317,6 +318,7 @@ function createPendingRecommendation(symbol: AvailableSymbolRow): Recommendation
   const bid = Number(symbol.bid || 0);
   const ask = Number(symbol.ask || 0);
   const entry = bid > 0 && ask > 0 ? (bid + ask) / 2 : Math.max(bid, ask, 0);
+  const hasLiveQuote = bid > 0 && ask > 0;
   return {
     symbol: String(symbol.name || ''),
     category: String(symbol.category || 'Other'),
@@ -326,7 +328,7 @@ function createPendingRecommendation(symbol: AvailableSymbolRow): Recommendation
       stop_loss: null,
       take_profit: null,
       max_holding_minutes: null,
-      reason: 'Waiting for scan.',
+      reason: hasLiveQuote ? 'Waiting for scan.' : 'Waiting for live quote and scan.',
     },
     signal_id: null,
     risk_decision: {
@@ -339,7 +341,9 @@ function createPendingRecommendation(symbol: AvailableSymbolRow): Recommendation
       metrics_snapshot: {},
     },
     entry_price_estimate: entry,
-    explanation: 'Pending scan for this market. Click "Scan All" to evaluate it.',
+    explanation: hasLiveQuote
+      ? 'Pending scan for this market.'
+      : 'Live quote is not available yet for this market. Analysis will start after quote arrives.',
     ready_to_execute: false,
     degraded_reasons: [],
     execution_reason: 'Pending analysis.',
@@ -396,7 +400,6 @@ function TradeCard({ rec, onExecuted, currency, liveTick }: { rec: Recommendatio
   };
 
   const handleExecute = async () => {
-    if (!rec.signal_id) return;
     const amountNum = parseFloat(amount);
     if (!amountNum || amountNum <= 0) return;
     // Convert dollar SL/TP to price levels
@@ -406,7 +409,14 @@ function TradeCard({ rec, onExecuted, currency, liveTick }: { rec: Recommendatio
     const tpPrice = tpAmt > 0 ? dollarToPrice(tpAmt, false) : undefined;
     setLoading(true);
     try {
-      const res = await api.executeRecommendation(rec.signal_id, amountNum, slPrice, tpPrice);
+      let res: OrderResult;
+      if (rec.signal_id) {
+        res = await api.executeRecommendation(rec.signal_id, amountNum, slPrice, tpPrice);
+      } else {
+        // Fallback path: some freshly built recommendations may not yet have a persisted signal_id.
+        // Execute directly against symbol while keeping deterministic backend risk checks in place.
+        res = await api.quickBuy(rec.symbol, amountNum, slPrice, tpPrice, rec.signal.action);
+      }
       setResult(res);
       setShowAmountInput(false);
       void onExecuted();
@@ -863,13 +873,23 @@ function PositionCard({
   const liveNowPrice = liveTick
     ? (isBuy ? liveTick.bid : liveTick.ask)
     : position.price_current;
-  const liveProfit = contractSize && liveNowPrice > 0
-    ? ((isBuy ? (liveNowPrice - position.price_open) : (position.price_open - liveNowPrice)) * position.volume * contractSize)
-    : position.profit;
-  const displayProfit = Number.isFinite(liveProfit) ? liveProfit : position.profit;
+  // Always trust broker-reported floating P/L as the source of truth.
+  const displayProfit = Number.isFinite(position.profit) ? position.profit : 0;
   const profitColor = displayProfit >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
   const profitText = explainProfitLoss(displayProfit, currency);
   const digs = position.price_open < 50 ? 5 : 2;
+
+  const effectiveContractSize = useMemo(() => {
+    const move = Math.abs((Number(position.price_current) || 0) - (Number(position.price_open) || 0));
+    const vol = Math.abs(Number(position.volume) || 0);
+    const pnl = Math.abs(Number(position.profit) || 0);
+    if (move > 0 && vol > 0 && pnl > 0) {
+      const inferred = pnl / (move * vol);
+      if (Number.isFinite(inferred) && inferred > 0) return inferred;
+    }
+    if (contractSize && Number.isFinite(contractSize) && contractSize > 0) return contractSize;
+    return null;
+  }, [position.price_current, position.price_open, position.volume, position.profit, contractSize]);
 
   // Fetch contract size for dollar SL/TP calculation
   useEffect(() => {
@@ -880,9 +900,9 @@ function PositionCard({
 
   // Calculate dollar SL/TP amounts
   const calcDollarDistance = (priceLevel: number) => {
-    if (!contractSize || priceLevel <= 0) return null;
+    if (!effectiveContractSize || priceLevel <= 0) return null;
     const distance = Math.abs(position.price_open - priceLevel);
-    return distance * position.volume * contractSize;
+    return distance * position.volume * effectiveContractSize;
   };
   const amountMatch = position.comment?.match(/TA:\$(\d+(?:\.\d+)?)|TA(\d+(?:\.\d+)?)/i);
   const slMatch = position.comment?.match(/SLA:\$(\d+(?:\.\d+)?)|SLA(\d+(?:\.\d+)?)/i);
@@ -890,12 +910,19 @@ function PositionCard({
   const commentAmount = amountMatch ? (amountMatch[1] || amountMatch[2]) : undefined;
   const commentSlAmount = slMatch ? (slMatch[1] || slMatch[2]) : undefined;
   const commentTpAmount = tpMatch ? (tpMatch[1] || tpMatch[2]) : undefined;
-  const slDollars = commentSlAmount ? parseFloat(commentSlAmount) : (position.stop_loss > 0 ? calcDollarDistance(position.stop_loss) : null);
-  const tpDollars = commentTpAmount ? parseFloat(commentTpAmount) : (position.take_profit > 0 ? calcDollarDistance(position.take_profit) : null);
+  // Use comment-derived SL/TP amounts only when both are present.
+  // Mixing one target from comment and the other from price-distance creates misleading % asymmetry.
+  const hasCommentTargets = Boolean(commentSlAmount && commentTpAmount);
+  const slDollars = hasCommentTargets
+    ? parseFloat(commentSlAmount as string)
+    : (position.stop_loss > 0 ? calcDollarDistance(position.stop_loss) : null);
+  const tpDollars = hasCommentTargets
+    ? parseFloat(commentTpAmount as string)
+    : (position.take_profit > 0 ? calcDollarDistance(position.take_profit) : null);
 
   // Calculate investment amount — use comment if available, otherwise compute from position data
-  const computedInvestment = contractSize
-    ? Math.round(position.volume * position.price_open * contractSize / leverage)
+  const computedInvestment = effectiveContractSize
+    ? Math.round(position.volume * position.price_open * effectiveContractSize / leverage)
     : 0;
   const investedNum = commentAmount ? parseFloat(commentAmount) : computedInvestment;
   const currentValue = investedNum > 0 ? investedNum + displayProfit : 0;
@@ -1382,6 +1409,7 @@ function MarketRow({ rec, currency, onExecuted, isLast, liveTick }: { rec: Recom
 }
 
 export default function SimpleDashboard({ status, onRefresh }: Props) {
+  const navigate = useNavigate();
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [allSymbols, setAllSymbols] = useState<AvailableSymbolRow[]>([]);
   const [selectedMarketSymbols, setSelectedMarketSymbols] = useState<string[]>([]);
@@ -1395,6 +1423,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
   const [positions, setPositions] = useState<PositionInfo[]>([]);
   const [scanning, setScanning] = useState(false);
   const scanningRef = useRef(false);
+  const liveConfidenceRefreshingRef = useRef(false);
   const [lastScan, setLastScan] = useState<number | null>(null);
   const [error, setError] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
@@ -1422,11 +1451,52 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
     credits_pct: status?.gemini_credits_pct ?? ((status?.gemini_available ?? false) ? 100 : 0),
   });
   const geminiLiveRef = useRef(false);
+  const [strategies, setStrategies] = useState<StrategyProfile[]>([]);
+  const [activeStrategyId, setActiveStrategyId] = useState<string>(status?.active_strategy?.id || '');
+  const [strategyLoadingId, setStrategyLoadingId] = useState<string>('');
+  const [strategyInfoOpen, setStrategyInfoOpen] = useState(false);
+  const [strategyInfo, setStrategyInfo] = useState<StrategyProfile | null>(null);
+  const [connectLoading, setConnectLoading] = useState(false);
+  const [connectError, setConnectError] = useState('');
 
   const connected = status?.connected ?? false;
   const account = status?.account;
   const currency = account?.currency || 'USD';
   const geminiErrorSummary = summarizeGeminiError(geminiState.last_error);
+
+  const loadStrategies = useCallback(async () => {
+    if (!connected) return;
+    try {
+      const response = await api.getStrategies();
+      const items = Array.isArray(response.items) ? response.items : [];
+      setStrategies(items);
+      setActiveStrategyId(response.active_strategy_id || items.find((x) => x.is_selected)?.id || '');
+    } catch {
+      // Keep trading UI responsive even if strategy list is temporarily unavailable.
+    }
+  }, [connected]);
+
+  const handleGetStartedConnect = useCallback(async () => {
+    setConnectLoading(true);
+    setConnectError('');
+    try {
+      const result = await api.autoConnect();
+      if (result?.connected) {
+        onRefresh();
+        return;
+      }
+      window.location.hash = '#/connection';
+    } catch (e: any) {
+      const msg = String(e?.message || '');
+      if (msg.toLowerCase().includes('not found') || msg.toLowerCase().includes('no saved')) {
+        window.location.hash = '#/connection';
+      } else {
+        setConnectError(formatUiError(e));
+      }
+    } finally {
+      setConnectLoading(false);
+    }
+  }, [onRefresh]);
 
   useEffect(() => {
     try {
@@ -1476,7 +1546,23 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
         credits_pct: credits ?? prev.credits_pct ?? (available ? 100 : 0),
       };
     });
+    if (status?.active_strategy?.id) {
+      setActiveStrategyId(status.active_strategy.id);
+    }
   }, [status]);
+
+  useEffect(() => {
+    if (!connected) return;
+    loadStrategies();
+  }, [connected, loadStrategies]);
+
+  useEffect(() => {
+    if (!connected) return;
+    const t = setInterval(() => {
+      loadStrategies();
+    }, 15000);
+    return () => clearInterval(t);
+  }, [connected, loadStrategies]);
 
   const refreshPositions = useCallback(async () => {
     if (!connected) return;
@@ -1522,7 +1608,6 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       }
       setAvailableMarketCount(fullUniverse.length || availableTotal || 0);
       setAllSymbols(fullUniverse);
-      setRecommendations([]);
       setAnalyzedCount(0);
       setLastScan(Date.now() / 1000);
 
@@ -1566,10 +1651,13 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
         .map((sym) => symbolByName.get(sym))
         .filter(Boolean) as AvailableSymbolRow[];
       const selectedRows = selectedRowsAll.slice(0, MAX_UI_SYMBOL_ROWS);
-      const liveSymbols = selectedRows.filter((s) => Number(s.bid || 0) > 0 && Number(s.ask || 0) > 0);
+      const quoteReadyRows = selectedRows.filter((s) => Number(s.bid || 0) > 0 && Number(s.ask || 0) > 0);
+      const preferredRows = quoteReadyRows.length >= Math.min(8, selectedRows.length)
+        ? quoteReadyRows
+        : selectedRows;
 
       const byCategory = new Map<string, Array<any>>();
-      for (const item of liveSymbols) {
+      for (const item of preferredRows) {
         const cat = String(item.category || 'Other');
         const bucket = byCategory.get(cat) || [];
         bucket.push(item);
@@ -1605,7 +1693,7 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       }
 
       const scanLimit = status?.platform === 'ibkr' ? MAX_IBKR_SCAN_SYMBOLS : MAX_MT5_SCAN_SYMBOLS;
-      const symbolsForAi = (selected.length > 0 ? selected : selectedRows)
+      const symbolsForAi = (selected.length > 0 ? selected : preferredRows)
         .map((s) => s.name)
         .filter(Boolean)
         .slice(0, scanLimit);
@@ -1625,11 +1713,14 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       const scannedBySymbol = new Map<string, Recommendation>();
       scanned.forEach((rec) => scannedBySymbol.set(String(rec.symbol || '').toUpperCase(), rec));
 
-      const mergedRecommendations = selectedRows.map((row) => {
-        const key = String(row.name || '').toUpperCase();
-        return scannedBySymbol.get(key) || createPendingRecommendation(row);
+      setRecommendations((prev) => {
+        const prevBySymbol = new Map<string, Recommendation>();
+        prev.forEach((item) => prevBySymbol.set(String(item.symbol || '').toUpperCase(), item));
+        return selectedRows.map((row) => {
+          const key = String(row.name || '').toUpperCase();
+          return scannedBySymbol.get(key) || prevBySymbol.get(key) || createPendingRecommendation(row);
+        });
       });
-      setRecommendations(mergedRecommendations);
     } catch (e: any) {
       // Keep full MT5 list visible even when AI scoring degrades.
       const msg = String(e?.message || '');
@@ -1647,6 +1738,35 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
     }
   }, [connected, status?.platform, status?.user_policy?.mode, selectedMarketSymbols, hasManualMarketSelection, saveSelectedMarkets, allSymbols]);
 
+  const refreshLiveConfidence = useCallback(async () => {
+    if (!connected || scanningRef.current || liveConfidenceRefreshingRef.current) return;
+    if (recommendations.length === 0) return;
+    const symbols = recommendations
+      .map((r) => String(r.symbol || '').trim())
+      .filter(Boolean)
+      .slice(0, 16);
+    if (symbols.length === 0) return;
+    liveConfidenceRefreshingRef.current = true;
+    try {
+      const result = await api.smartEvaluate(symbols);
+      const scanned = (result.recommendations || []).filter((r) => !!r?.symbol);
+      if (scanned.length === 0) return;
+      const scannedBySymbol = new Map<string, Recommendation>();
+      scanned.forEach((rec) => scannedBySymbol.set(String(rec.symbol || '').toUpperCase(), rec));
+      setRecommendations((prev) => prev.map((rec) => {
+        const key = String(rec.symbol || '').toUpperCase();
+        const live = scannedBySymbol.get(key);
+        return live ? { ...rec, ...live, category: live.category || rec.category } : rec;
+      }));
+      setAnalyzedCount(scanned.length);
+      if (result.scanned_at) setLastScan(result.scanned_at);
+    } catch {
+      // Keep latest stable confidence values if this refresh pass fails.
+    } finally {
+      liveConfidenceRefreshingRef.current = false;
+    }
+  }, [connected, recommendations]);
+
   useEffect(() => {
     refreshPositions();
     const pollMs = positions.length > 0 ? 500 : 2000;
@@ -1662,6 +1782,13 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       return () => clearInterval(t);
     }
   }, [connected, scanMarkets]);
+
+  useEffect(() => {
+    if (!connected) return;
+    refreshLiveConfidence();
+    const t = setInterval(refreshLiveConfidence, 15000);
+    return () => clearInterval(t);
+  }, [connected, refreshLiveConfidence]);
 
   // Poll auto-trade status
   const refreshAutoTrade = useCallback(async () => {
@@ -1694,6 +1821,28 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
       });
     } catch {}
   }, [connected]);
+
+  const handleSelectStrategy = useCallback(async (strategyId: string) => {
+    if (!strategyId || strategyLoadingId) return;
+    setStrategyLoadingId(strategyId);
+    setError('');
+    try {
+      const response = await api.selectStrategy(strategyId);
+      const nextId = response.active_strategy_id || strategyId;
+      setActiveStrategyId(nextId);
+      setStrategies((prev) => prev.map((item) => ({
+        ...item,
+        is_selected: item.id === nextId,
+      })));
+      await refreshAutoTrade();
+      await scanMarkets();
+      onRefresh();
+    } catch (e: any) {
+      setError(formatUiError(e));
+    } finally {
+      setStrategyLoadingId('');
+    }
+  }, [strategyLoadingId, refreshAutoTrade, scanMarkets, onRefresh]);
 
   useEffect(() => {
     refreshAutoTrade();
@@ -1971,6 +2120,11 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
             This app uses AI to analyze currency and commodity markets, then gives you
             simple buy/sell recommendations. You just click a button to trade.
           </p>
+          {connectError && (
+            <div className="error-banner" style={{ marginBottom: 16, textAlign: 'left', fontSize: 12 }}>
+              {connectError}
+            </div>
+          )}
           <div style={{
             background: 'var(--bg-secondary)',
             borderRadius: 12,
@@ -2001,13 +2155,14 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
               ))}
             </div>
           </div>
-          <a href="#/connection" className="btn btn-primary" style={{
-            textDecoration: 'none',
-            fontSize: 15,
-            padding: '14px 32px',
-          }}>
-            Get Started - Connect Account
-          </a>
+          <button
+            className="btn btn-primary"
+            style={{ fontSize: 15, padding: '14px 32px' }}
+            onClick={handleGetStartedConnect}
+            disabled={connectLoading}
+          >
+            {connectLoading ? <span className="loading-spinner" /> : 'Get Started - Connect Account'}
+          </button>
         </div>
       </div>
     );
@@ -2076,121 +2231,149 @@ export default function SimpleDashboard({ status, onRefresh }: Props) {
         </div>
       )}
 
-      {portfolioSnapshot && (
-        <div className="card mt-4" style={{ padding: '16px 20px' }}>
-          <div className="flex justify-between items-start" style={{ marginBottom: 12 }}>
-            <div>
-              <div style={{ fontSize: 15, fontWeight: 700 }}>Portfolio Guard</div>
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                Margin, exposure, and Gemini advisory health for the current book.
-              </div>
+      <div className="card mt-4" style={{ padding: '10px 14px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Gemini</div>
+            <div style={{ fontWeight: 700, fontSize: 13, color: geminiState.degraded ? 'var(--accent-yellow)' : geminiState.available ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+              {geminiState.state === 'cooldown'
+                ? 'Cooldown'
+                : geminiState.degraded
+                  ? 'Degraded'
+                  : geminiState.available
+                    ? 'Online'
+                    : 'Offline'}
             </div>
-            <div style={{ textAlign: 'right' }}>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Gemini</div>
-              <div style={{ fontWeight: 700, color: geminiState.degraded ? 'var(--accent-yellow)' : geminiState.available ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-                {geminiState.state === 'cooldown'
-                  ? 'Cooldown'
-                  : geminiState.degraded
-                    ? 'Degraded'
-                    : geminiState.available
-                      ? 'Online'
-                      : 'Offline'}
-              </div>
-              <div style={{ marginTop: 6, width: 220, marginLeft: 'auto' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)' }}>
-                  <span>Gemini credits</span>
-                  <span>{Math.max(0, Math.min(100, Number(geminiState.credits_pct || 0))).toFixed(0)}%</span>
-                </div>
-                <div style={{ marginTop: 4, height: 8, borderRadius: 999, background: 'var(--bg-primary)', overflow: 'hidden' }}>
-                  <div
+          </div>
+          <div style={{ minWidth: 220, flex: 1, maxWidth: 360 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)' }}>
+              <span>Gemini credits</span>
+              <span>{Math.max(0, Math.min(100, Number(geminiState.credits_pct || 0))).toFixed(0)}%</span>
+            </div>
+            <div style={{ marginTop: 4, height: 6, borderRadius: 999, background: 'var(--bg-primary)', overflow: 'hidden' }}>
+              <div
+                style={{
+                  width: `${Math.max(0, Math.min(100, Number(geminiState.credits_pct || 0))).toFixed(0)}%`,
+                  height: '100%',
+                  background: (geminiState.credits_pct || 0) >= 60
+                    ? 'var(--accent-green)'
+                    : (geminiState.credits_pct || 0) >= 25
+                      ? 'var(--accent-yellow)'
+                      : 'var(--accent-red)',
+                  transition: 'width 220ms ease',
+                }}
+              />
+            </div>
+          </div>
+        </div>
+        {(Number(geminiState.cooldown_seconds || 0) > 0 || !!geminiErrorSummary) && (
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
+            {Number(geminiState.cooldown_seconds || 0) > 0 ? `Cooldown: ${formatCooldown(geminiState.cooldown_seconds)}. ` : ''}
+            {geminiErrorSummary || ''}
+          </div>
+        )}
+
+        {strategies.length > 0 && (
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Strategy</div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            {strategies.map((strategy, idx) => {
+              const selected = strategy.id === activeStrategyId || strategy.is_selected;
+              const disabled = strategyLoadingId === strategy.id;
+              return (
+                <div key={strategy.id} style={{ display: 'inline-flex', alignItems: 'center' }}>
+                  <button
+                    className="btn"
+                    onClick={() => handleSelectStrategy(strategy.id)}
+                    disabled={disabled}
+                    title={strategy.description || strategy.name}
                     style={{
-                      width: `${Math.max(0, Math.min(100, Number(geminiState.credits_pct || 0))).toFixed(0)}%`,
-                      height: '100%',
-                      background: (geminiState.credits_pct || 0) >= 60
-                        ? 'var(--accent-green)'
-                        : (geminiState.credits_pct || 0) >= 25
-                          ? 'var(--accent-yellow)'
-                          : 'var(--accent-red)',
-                      transition: 'width 220ms ease',
-                    }}
-                  />
-                </div>
-                {Number(geminiState.cooldown_seconds || 0) > 0 && (
-                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
-                    Cooldown remaining: {formatCooldown(geminiState.cooldown_seconds)}
-                  </div>
-                )}
-              </div>
-              {geminiErrorSummary && (
-                <div style={{ fontSize: 10, color: 'var(--text-muted)', maxWidth: 260, whiteSpace: 'normal' }}>
-                  {geminiErrorSummary}
-                </div>
-              )}
-              {geminiState.last_error && (
-                <details style={{ marginTop: 4, maxWidth: 260 }}>
-                  <summary style={{ fontSize: 10, color: 'var(--text-muted)', cursor: 'pointer' }}>Details</summary>
-                  <div
-                    style={{
-                      fontSize: 10,
-                      color: 'var(--text-muted)',
-                      marginTop: 4,
-                      whiteSpace: 'normal',
-                      wordBreak: 'break-word',
-                      overflowWrap: 'anywhere',
+                      fontSize: 13,
+                      padding: '8px 16px',
+                      borderRadius: 12,
+                      border: selected ? '1px solid var(--accent-blue)' : '1px solid var(--border)',
+                      background: selected ? 'var(--accent-blue)' : 'var(--bg-secondary)',
+                      color: selected ? '#fff' : 'var(--text-primary)',
+                      fontWeight: 600,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 8,
                     }}
                   >
-                    {geminiState.last_error}
-                  </div>
-                </details>
-              )}
+                    <span>{idx === 0 ? `${strategy.name} (Default)` : strategy.name}</span>
+                    <span
+                      role="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        setStrategyInfo(strategy);
+                        setStrategyInfoOpen(true);
+                      }}
+                      title={`About ${strategy.name}`}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        opacity: 0.9,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <HelpCircle size={14} />
+                    </span>
+                  </button>
+                </div>
+              );
+            })}
+              <button
+                className="btn"
+                onClick={() => navigate('/strategy')}
+                style={{
+                  fontSize: 13,
+                  padding: '8px 16px',
+                  borderRadius: 12,
+                  border: '1px solid var(--border)',
+                  background: 'var(--bg-secondary)',
+                  color: 'var(--text-primary)',
+                  fontWeight: 600,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+              >
+                <Plus size={14} /> Add Strategy
+              </button>
             </div>
           </div>
+        )}
+      </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 12 }}>
-            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Margin Utilization</div>
-              <div style={{ fontSize: 18, fontWeight: 700, color: (portfolioSnapshot.margin_utilization_pct || 0) > 18 ? 'var(--accent-red)' : 'var(--text-primary)' }}>
-                {formatPct(portfolioSnapshot.margin_utilization_pct)}
-              </div>
+      {strategyInfoOpen && strategyInfo && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.45)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1200,
+            padding: 20,
+          }}
+          onClick={() => setStrategyInfoOpen(false)}
+        >
+          <div
+            className="card"
+            style={{ width: 'min(560px, 92vw)', padding: 18 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex justify-between items-center" style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 16, fontWeight: 700 }}>{strategyInfo.name}</div>
+              <button className="btn btn-secondary btn-sm" onClick={() => setStrategyInfoOpen(false)}>
+                Close
+              </button>
             </div>
-            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Free Margin</div>
-              <div style={{ fontSize: 18, fontWeight: 700, color: (portfolioSnapshot.free_margin_pct || 0) < 60 ? 'var(--accent-red)' : 'var(--text-primary)' }}>
-                {formatPct(portfolioSnapshot.free_margin_pct)}
-              </div>
-            </div>
-            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>USD Beta</div>
-              <div style={{ fontSize: 18, fontWeight: 700 }}>{formatPct(portfolioSnapshot.usd_beta_exposure_pct)}</div>
-            </div>
-            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Stock Exposure</div>
-              <div style={{ fontSize: 18, fontWeight: 700 }}>{formatPct(portfolioSnapshot.stocks_equity_exposure_pct)}</div>
-            </div>
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
-              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>Exposure By Category</div>
-              {Object.keys(portfolioSnapshot.exposure_by_category || {}).length === 0 ? (
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No active exposure.</div>
-              ) : Object.entries(portfolioSnapshot.exposure_by_category).map(([key, value]) => (
-                <div key={key} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
-                  <span>{key}</span>
-                  <span style={{ fontWeight: 600 }}>{formatPct(value)}</span>
-                </div>
-              ))}
-            </div>
-            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '10px 12px' }}>
-              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>Exposure By Symbol</div>
-              {Object.keys(portfolioSnapshot.exposure_by_symbol || {}).length === 0 ? (
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No active exposure.</div>
-              ) : Object.entries(portfolioSnapshot.exposure_by_symbol).slice(0, 6).map(([key, value]) => (
-                <div key={key} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
-                  <span>{key}</span>
-                  <span style={{ fontWeight: 600 }}>{formatPct(value)}</span>
-                </div>
-              ))}
+            <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6, whiteSpace: 'pre-line' }}>
+              {strategyInfo.brief || strategyInfo.description || 'No strategy brief available.'}
             </div>
           </div>
         </div>

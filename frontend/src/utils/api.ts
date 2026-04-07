@@ -47,10 +47,19 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     ...options,
     headers: mergedHeaders,
   };
+  const adminPath = path.startsWith('/admin/');
 
-  const candidates = LOCAL_PORT_FALLBACK_URL
-    ? [preferredBaseUrl, preferredBaseUrl === BASE_URL ? LOCAL_PORT_FALLBACK_URL : BASE_URL]
-    : [preferredBaseUrl];
+  const candidates = adminPath
+    ? (
+      LOCAL_PORT_FALLBACK_URL
+        ? [BASE_URL, LOCAL_PORT_FALLBACK_URL]
+        : [BASE_URL]
+    )
+    : (
+      LOCAL_PORT_FALLBACK_URL
+        ? [preferredBaseUrl, preferredBaseUrl === BASE_URL ? LOCAL_PORT_FALLBACK_URL : BASE_URL]
+        : [preferredBaseUrl]
+    );
 
   let res: Response | null = null;
   let lastError: unknown = null;
@@ -64,26 +73,31 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const liveTickPath = path.includes('/market/ticks');
     // Never retry trade execution requests on the client side.
     // A second attempt can feel like lag and may risk duplicate intents.
-    const maxAttemptsForBase = (tradeExecutionPath || liveTickPath || isMutation) ? 1 : (i === 0 ? 2 : 1);
+    const connectPath = (
+      path.includes('/connect')
+      || path.includes('/credentials/auto-connect')
+    );
+    const autoConnectPath = path.includes('/credentials/auto-connect');
+    const maxAttemptsForBase = (adminPath || tradeExecutionPath || liveTickPath || isMutation || connectPath) ? 1 : (i === 0 ? 2 : 1);
     for (let attemptIdx = 0; attemptIdx < maxAttemptsForBase; attemptIdx += 1) {
       try {
         const scanLikePath = path.includes('/agent/smart-evaluate') || path.includes('/auto-trade/activity');
         const availableSymbolsPath = path.includes('/market/available-symbols');
-        const connectPath = (
-          path.includes('/connect')
-          || path.includes('/credentials/auto-connect')
-        );
         const statusPath = path.includes('/status') || path.includes('/auto-trade/status');
         const timeoutMs = liveTickPath
           ? (i === 0 ? 1200 : 1800)
+          : adminPath
+          ? (i === 0 ? 9000 : 12000)
           : scanLikePath
           ? (i === 0 ? 45000 : 55000)
           : availableSymbolsPath
             ? (i === 0 ? 70000 : 80000)
           : tradeExecutionPath
             ? (i === 0 ? 25000 : 30000)
+            : autoConnectPath
+              ? (i === 0 ? 22000 : 28000)
             : connectPath
-              ? (i === 0 ? 15000 : 22000)
+              ? (i === 0 ? 90000 : 120000)
             : statusPath
               ? (i === 0 ? 15000 : 22000)
               : isMutation
@@ -95,7 +109,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
         break;
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') {
-          lastError = new Error('Connection timed out. Please verify backend is running and IBKR TWS/Gateway API is reachable.');
+          if (connectPath) {
+            lastError = new Error('Connection timed out. Please verify backend is running and MT5 terminal (or IBKR TWS/Gateway) is reachable.');
+          } else {
+            lastError = new Error('Request timed out. Please verify backend is running and reachable.');
+          }
         } else if (err instanceof Error && err.message.toLowerCase().includes('signal is aborted')) {
           lastError = new Error('Request was interrupted. Please retry connection and keep this page open until the response returns.');
         } else if (err instanceof Error && err.message.toLowerCase().includes('failed to fetch')) {
@@ -299,6 +317,28 @@ export const api = {
 
   setAgent: (agentName: string) =>
     request('/agent/set', { method: 'POST', body: JSON.stringify({ agent_name: agentName }) }),
+
+  getStrategies: () =>
+    request<import('@/types').StrategiesResponse>('/strategies'),
+
+  buildStrategy: (data: { name: string; description: string }) =>
+    request<{
+      ok: boolean;
+      active_strategy_id: string;
+      strategy: import('@/types').StrategyProfile;
+      active_agent: string;
+      user_policy: import('@/types').UserPolicySettings;
+    }>('/strategies/build', { method: 'POST', body: JSON.stringify(data) }),
+
+  selectStrategy: (strategyId: string) =>
+    request<{
+      ok: boolean;
+      active_strategy_id: string;
+      active_strategy: import('@/types').StrategyProfile;
+      active_agent: string;
+      user_policy: import('@/types').UserPolicySettings;
+      scan_interval: number;
+    }>('/strategies/select', { method: 'POST', body: JSON.stringify({ strategy_id: strategyId }) }),
 
   // Trading
   executeTrade: (data: {

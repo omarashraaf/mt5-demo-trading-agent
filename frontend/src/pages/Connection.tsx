@@ -20,6 +20,7 @@ type SavedIbkrAccount = {
 };
 
 const SAVED_IBKR_KEY = 'trading_saved_ibkr_accounts_v1';
+const SAVED_MT5_CACHE_KEY = 'trading_saved_mt5_accounts_v1';
 
 export default function Connection({ status, onRefresh }: Props) {
   const navigate = useNavigate();
@@ -41,6 +42,8 @@ export default function Connection({ status, onRefresh }: Props) {
   const [savedCreds, setSavedCreds] = useState<SavedCredentials[]>([]);
   const [savedCredsError, setSavedCredsError] = useState('');
   const [savedIbkrAccounts, setSavedIbkrAccounts] = useState<SavedIbkrAccount[]>([]);
+  const [savedCredsLoaded, setSavedCredsLoaded] = useState(false);
+  const [savedCredsRetryCount, setSavedCredsRetryCount] = useState(0);
 
   const connected = Boolean(status?.connected && status?.account);
   const connectedPlatform = (status?.platform as 'mt5' | 'ibkr') || 'mt5';
@@ -56,17 +59,55 @@ export default function Connection({ status, onRefresh }: Props) {
   const refreshSavedCredentials = useCallback(async () => {
     try {
       const creds = await api.getCredentials();
-      setSavedCreds(creds || []);
+      const normalized = creds || [];
+      setSavedCreds(normalized);
+      localStorage.setItem(SAVED_MT5_CACHE_KEY, JSON.stringify(normalized));
       setSavedCredsError('');
+      setSavedCredsLoaded(true);
+      setSavedCredsRetryCount(0);
     } catch (e: any) {
-      setSavedCreds([]);
+      setSavedCredsLoaded(true);
+      // Keep cached entries on transient backend start delays.
       setSavedCredsError(e?.message || 'Could not load saved MT5 accounts.');
     }
   }, []);
 
   useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SAVED_MT5_CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as SavedCredentials[];
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setSavedCreds(parsed);
+        }
+      }
+    } catch {
+      // ignore malformed local cache
+    }
     void refreshSavedCredentials();
   }, [refreshSavedCredentials]);
+
+  useEffect(() => {
+    if (connected) return;
+    if (savedCreds.length > 0) return;
+    if (!savedCredsLoaded) return;
+    if (savedCredsRetryCount >= 3) return;
+    if (!savedCredsError) return;
+
+    const timer = window.setTimeout(() => {
+      setSavedCredsRetryCount((prev) => prev + 1);
+      void refreshSavedCredentials();
+    }, 2500);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    connected,
+    refreshSavedCredentials,
+    savedCreds.length,
+    savedCredsError,
+    savedCredsLoaded,
+    savedCredsRetryCount,
+  ]);
 
   useEffect(() => {
     try {
@@ -562,9 +603,14 @@ export default function Connection({ status, onRefresh }: Props) {
               {savedCredsError}
             </div>
           )}
-          {savedCreds.length === 0 && savedIbkrAccounts.length === 0 && !savedCredsError && (
+          {savedCreds.length === 0 && savedIbkrAccounts.length === 0 && !savedCredsError && savedCredsLoaded && (
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10 }}>
               No saved accounts found yet.
+            </div>
+          )}
+          {!savedCredsLoaded && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10 }}>
+              Loading saved MT5 accounts...
             </div>
           )}
 

@@ -80,6 +80,17 @@ export default function App() {
 
   const connected = Boolean(status?.connected && status?.account);
   const authed = Boolean(user) || !runtimeConfig.requireAuth;
+  let portalRedirectTarget: URL | null = null;
+  try {
+    portalRedirectTarget = new URL(runtimeConfig.localRuntimeUrl);
+  } catch {
+    portalRedirectTarget = null;
+  }
+  const portalRedirectToSelf = Boolean(
+    runtimeConfig.appMode === 'portal'
+    && portalRedirectTarget
+    && portalRedirectTarget.origin === window.location.origin
+  );
 
   if (location.pathname.startsWith('/admin')) {
     return <AdminPortal />;
@@ -119,7 +130,7 @@ export default function App() {
     );
   }
 
-  if (runtimeConfig.appMode === 'portal') {
+  if (runtimeConfig.appMode === 'portal' && !portalRedirectToSelf) {
     return <PortalAutoRedirect isAdmin={role === 'admin'} />;
   }
 

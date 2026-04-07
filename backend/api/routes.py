@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional, Literal
 import logging
@@ -25,6 +25,8 @@ from config import config
 from llm.gemini_event_classifier import GeminiEventClassifier
 from services.credential_store import CredentialVault
 from services.asset_mapping_service import AssetMappingService
+from services.cloud_secret_service import CloudSecretService
+from services.supabase_admin_service import SupabaseAdminService
 from services.event_ingestion_service import EventIngestionService
 from services.event_normalization_service import EventNormalizationService
 from services.execution_service import ExecutionService
@@ -140,6 +142,7 @@ replay_service = ReplayService(signal_pipeline)
 research_cycle_service: Optional[ResearchCycleService] = None
 RUNTIME_STATE_KEY = "runtime_controls_v1"
 CHAT_HISTORY_STATE_KEY = "chat_history_v1"
+ACTIVE_STRATEGY_STATE_KEY_PREFIX = "active_strategy_v1"
 DEFAULT_MARGIN_SL_PCT = 0.08
 DEFAULT_MARGIN_TP_PCT = 0.12
 _cloud_brain_state: dict = {
@@ -148,6 +151,469 @@ _cloud_brain_state: dict = {
     "last_apply_result": {},
     "last_error": None,
 }
+cloud_secret_service = CloudSecretService(
+    enabled=config.CLOUD_SECRETS_ENABLED,
+    supabase_url=config.SUPABASE_URL,
+    service_role_key=config.SUPABASE_SERVICE_ROLE_KEY,
+    table=config.CLOUD_SECRETS_TABLE,
+    timeout_seconds=config.CLOUD_SYNC_TIMEOUT_SECONDS,
+)
+_saved_credentials_cache: list[dict] = []
+supabase_auth = SupabaseAdminService(
+    url=config.SUPABASE_URL,
+    anon_key=config.SUPABASE_ANON_KEY,
+    service_role_key=config.SUPABASE_SERVICE_ROLE_KEY,
+)
+
+
+async def _refresh_saved_credentials_cache(timeout_seconds: float = 3.5) -> list[dict]:
+    """Load saved MT5 credential metadata with a bounded timeout.
+
+    Under heavy scan/evaluation load SQLite can be temporarily saturated.
+    Keep a warm in-memory cache so the connection page can render immediately
+    instead of timing out and showing only local IBKR entries.
+    """
+    global _saved_credentials_cache
+    if db is None:
+        return list(_saved_credentials_cache)
+    creds = await asyncio.wait_for(db.get_saved_credentials(), timeout=max(1.0, float(timeout_seconds)))
+    normalized = list(creds or [])
+    _saved_credentials_cache = normalized
+    return normalized
+
+
+async def _get_saved_credentials_with_fallback(timeout_seconds: float = 3.5) -> list[dict]:
+    try:
+        return await _refresh_saved_credentials_cache(timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        logger.warning("Saved credentials fetch fell back to in-memory cache: %s", exc)
+        return list(_saved_credentials_cache)
+
+
+async def _get_saved_credential_with_fallback(account_id: int, timeout_seconds: float = 3.0) -> Optional[dict]:
+    if db is None:
+        return next(
+            (row for row in _saved_credentials_cache if int(row.get("account") or 0) == int(account_id)),
+            None,
+        )
+    try:
+        row = await asyncio.wait_for(
+            db.get_saved_credential(account_id),
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+        # Keep list cache warm/consistent.
+        await _get_saved_credentials_with_fallback(timeout_seconds=2.5)
+        return row
+    except Exception as exc:
+        logger.warning("Saved credential fetch fell back to in-memory cache for account %s: %s", account_id, exc)
+        return next(
+            (row for row in _saved_credentials_cache if int(row.get("account") or 0) == int(account_id)),
+            None,
+        )
+
+
+async def _warm_saved_credentials_cache():
+    await _get_saved_credentials_with_fallback(timeout_seconds=8.0)
+
+
+def _mask_secret(value: str) -> str:
+    raw = str(value or "")
+    if len(raw) <= 8:
+        return "*" * len(raw)
+    return f"{raw[:4]}...{raw[-4:]}"
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization header.")
+    prefix = "bearer "
+    if not authorization.lower().startswith(prefix):
+        raise HTTPException(status_code=401, detail="Invalid authorization header.")
+    token = authorization[len(prefix):].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    return token
+
+
+def _anonymous_user() -> dict:
+    return {
+        "id": "local-anonymous",
+        "email": "local@device",
+    }
+
+
+async def _resolve_authenticated_user(authorization: Optional[str]) -> dict:
+    if not authorization:
+        return _anonymous_user()
+    if not supabase_auth.configured:
+        return _anonymous_user()
+    token = _extract_bearer_token(authorization)
+    try:
+        user = await asyncio.to_thread(supabase_auth.get_user_from_token, token)
+        return {
+            "id": str(user.get("id") or "local-anonymous"),
+            "email": str(user.get("email") or ""),
+        }
+    except Exception:
+        return _anonymous_user()
+
+
+def _strategy_state_key_for_user(user_id: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9._-]", "_", str(user_id or "local-anonymous"))
+    return f"{ACTIVE_STRATEGY_STATE_KEY_PREFIX}:{normalized}"
+
+
+def _builtin_strategy_profiles() -> list[dict]:
+    return [
+        {
+            "id": "builtin-default-smart",
+            "name": "Default Smart",
+            "description": "Balanced deterministic strategy with Gemini advisory enabled.",
+            "scope": "builtin",
+            "is_default": True,
+            "config": {
+                "agent_name": "SmartAgent",
+                "policy_mode": "balanced",
+                "allowed_symbols": [],
+                "scan_interval_seconds": 30,
+                "gemini_role": "advisory",
+                "min_reward_risk": 1.8,
+                "brief": (
+                    "How this strategy works:\n"
+                    "1) Market scope: Multi-asset balanced watchlist.\n"
+                    "2) Entry logic: Waits for aligned trend + momentum + acceptable spread before signaling BUY/SELL.\n"
+                    "3) Risk logic: Deterministic risk engine enforces stop-loss, reward/risk floor, margin protection, and duplicate/cooldown checks.\n"
+                    "4) AI role: Gemini is advisory only and cannot execute trades directly.\n"
+                    "5) Best use: Default day-to-day mode when you want stable behavior across markets."
+                ),
+            },
+        },
+        {
+            "id": "builtin-safe-capital-guard",
+            "name": "Capital Guard",
+            "description": "Lower-risk profile, strict quality and risk preservation.",
+            "scope": "builtin",
+            "is_default": False,
+            "config": {
+                "agent_name": "SmartAgent",
+                "policy_mode": "safe",
+                "allowed_symbols": [],
+                "scan_interval_seconds": 35,
+                "gemini_role": "confirmation-required",
+                "min_reward_risk": 2.2,
+                "brief": (
+                    "How this strategy works:\n"
+                    "1) Market scope: Broad, but filtered aggressively for cleaner setups.\n"
+                    "2) Entry logic: Requires stronger structure quality and stricter confirmation before taking trades.\n"
+                    "3) Risk logic: Higher minimum reward/risk, tighter capital protection, and conservative policy mode.\n"
+                    "4) AI role: Gemini confirmation-required mode for extra advisory caution.\n"
+                    "5) Best use: Capital-preservation periods, volatile sessions, or when reducing drawdown is priority."
+                ),
+            },
+        },
+        {
+            "id": "builtin-opportunity-seeker",
+            "name": "Opportunity Seeker",
+            "description": "Faster scans with broader opportunity capture while staying demo-safe.",
+            "scope": "builtin",
+            "is_default": False,
+            "config": {
+                "agent_name": "SmartAgent",
+                "policy_mode": "aggressive",
+                "allowed_symbols": [],
+                "scan_interval_seconds": 20,
+                "gemini_role": "advisory",
+                "min_reward_risk": 1.6,
+                "brief": (
+                    "How this strategy works:\n"
+                    "1) Market scope: Wider watchlist with faster signal refresh.\n"
+                    "2) Entry logic: Captures momentum and continuation opportunities earlier.\n"
+                    "3) Risk logic: Still blocked by deterministic risk gates (spread, margin, RR, cooldown, session checks).\n"
+                    "4) AI role: Gemini advisory context only; no direct execution authority.\n"
+                    "5) Best use: Active sessions when you want more opportunities without disabling safety."
+                ),
+            },
+        },
+        {
+            "id": "builtin-egypt-gold-session",
+            "name": "Egypt Gold Session",
+            "description": "XAUUSD-focused intraday profile for London and New York sessions.",
+            "scope": "builtin",
+            "is_default": False,
+            "config": {
+                "agent_name": "SmartAgent",
+                "policy_mode": "balanced",
+                "allowed_symbols": ["XAUUSD", "GOLD"],
+                "scan_interval_seconds": 20,
+                "gemini_role": "advisory",
+                "min_reward_risk": 1.9,
+                "brief": (
+                    "How this strategy works:\n"
+                    "1) Market scope: Gold-first (XAUUSD/GOLD), tuned for London + New York liquidity windows.\n"
+                    "2) Entry logic: Looks for pullback-then-resume patterns with momentum confirmation and spread sanity checks.\n"
+                    "3) Risk logic: Balanced mode with fixed deterministic blocking for bad RR, margin stress, and stale market state.\n"
+                    "4) AI role: Gemini contributes macro/news context only and cannot bypass execution guards.\n"
+                    "5) Best use: Traders in Egypt/Gulf timezones focusing on Gold intraday behavior."
+                ),
+            },
+        },
+        {
+            "id": "builtin-egypt-us-indices",
+            "name": "US Indices Momentum",
+            "description": "US30/US100/US500 momentum profile aligned with US market hours.",
+            "scope": "builtin",
+            "is_default": False,
+            "config": {
+                "agent_name": "SmartAgent",
+                "policy_mode": "balanced",
+                "allowed_symbols": ["US30", "US100", "US500", "SP500"],
+                "scan_interval_seconds": 20,
+                "gemini_role": "advisory",
+                "min_reward_risk": 1.8,
+                "brief": (
+                    "How this strategy works:\n"
+                    "1) Market scope: US30, US100, US500/SP500 for high-interest index moves.\n"
+                    "2) Entry logic: Prioritizes directional momentum when structure and timing align.\n"
+                    "3) Risk logic: Rejects setups with weak RR, wide spread, or margin pressure.\n"
+                    "4) AI role: Gemini advisory sentiment overlay; deterministic risk checks remain final gate.\n"
+                    "5) Best use: US session momentum trading with disciplined signal quality."
+                ),
+            },
+        },
+        {
+            "id": "builtin-egypt-mixed-safe",
+            "name": "Egypt Balanced Mix",
+            "description": "Popular mixed watchlist (Gold, Silver, Oil, indices) with conservative controls.",
+            "scope": "builtin",
+            "is_default": False,
+            "config": {
+                "agent_name": "SmartAgent",
+                "policy_mode": "safe",
+                "allowed_symbols": ["XAUUSD", "XAGUSD", "WTI", "US30", "US100", "GER40", "UK100"],
+                "scan_interval_seconds": 28,
+                "gemini_role": "confirmation-required",
+                "min_reward_risk": 2.1,
+                "brief": (
+                    "How this strategy works:\n"
+                    "1) Market scope: Popular Egypt-focused mix (Gold, Silver, Oil, US/Europe indices).\n"
+                    "2) Entry logic: Trades only clearer setups and avoids lower-quality churn.\n"
+                    "3) Risk logic: Safe mode, stronger RR requirements, conservative exposure posture.\n"
+                    "4) AI role: Gemini confirmation-required advisory with no execution authority.\n"
+                    "5) Best use: Users who want diversified exposure with controlled risk profile."
+                ),
+            },
+        },
+    ]
+
+
+def _default_strategy_id() -> str:
+    return _builtin_strategy_profiles()[0]["id"]
+
+
+def _sanitize_custom_strategy_name(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+    return cleaned[:60]
+
+
+def _build_strategy_config_from_prompt(name: str, description: str) -> dict:
+    text = f"{name} {description}".lower()
+    mode = "balanced"
+    if any(token in text for token in ["safe", "conservative", "low risk", "capital protect"]):
+        mode = "safe"
+    elif any(token in text for token in ["aggressive", "high risk", "scalp", "fast"]):
+        mode = "aggressive"
+
+    gemini_role = "advisory"
+    if any(token in text for token in ["no ai", "without ai", "disable gemini"]):
+        gemini_role = "off"
+    elif any(token in text for token in ["confirm", "strict ai", "confirmation"]):
+        gemini_role = "confirmation-required"
+
+    scan_interval = 30
+    if any(token in text for token in ["fast", "scalp", "quick"]):
+        scan_interval = 20
+    elif any(token in text for token in ["slow", "swing", "position"]):
+        scan_interval = 40
+    scan_interval = max(15, min(60, scan_interval))
+
+    symbols_map = {
+        "gold": "XAUUSD",
+        "xauusd": "XAUUSD",
+        "silver": "XAGUSD",
+        "xagusd": "XAGUSD",
+        "nasdaq": "US100",
+        "us100": "US100",
+        "sp500": "US500",
+        "us500": "US500",
+        "dax": "GER40",
+        "ger40": "GER40",
+        "ftse": "UK100",
+        "uk100": "UK100",
+        "dow": "US30",
+        "us30": "US30",
+        "oil": "WTI",
+        "wti": "WTI",
+        "brent": "BRENT",
+        "eurusd": "EURUSD",
+        "gbpusd": "GBPUSD",
+        "usdjpy": "USDJPY",
+        "btcusd": "BTCUSD",
+        "ethusd": "ETHUSD",
+        "apple": "AAPL",
+        "aapl": "AAPL",
+        "tesla": "TSLA",
+        "tsla": "TSLA",
+        "nvidia": "NVDA",
+        "nvda": "NVDA",
+    }
+    allowed_symbols: list[str] = []
+    for token, symbol in symbols_map.items():
+        if token in text and symbol not in allowed_symbols:
+            allowed_symbols.append(symbol)
+
+    min_rr = 1.8
+    if mode == "safe":
+        min_rr = 2.2
+    elif mode == "aggressive":
+        min_rr = 1.6
+
+    long_brief = (
+        "How this strategy works:\n"
+        f"1) Strategy intent: {name}.\n"
+        f"2) User plan summary: {description}\n"
+        f"3) Policy mode: {mode}.\n"
+        f"4) Market focus: {', '.join(allowed_symbols) if allowed_symbols else 'All enabled markets (no symbol filter specified)'}.\n"
+        f"5) Scan behavior: every {scan_interval}s with deterministic signal + risk pipeline.\n"
+        f"6) AI behavior: Gemini in '{gemini_role}' advisory mode only; it never has direct execution authority.\n"
+        f"7) Risk guardrails: minimum reward/risk {min_rr:.1f}, spread checks, margin checks, cooldown/duplicate protections, and session validity checks.\n"
+        "8) Execution rule: trades execute only when deterministic risk checks approve the signal."
+    )
+
+    return {
+        "agent_name": "SmartAgent",
+        "policy_mode": mode,
+        "allowed_symbols": allowed_symbols,
+        "scan_interval_seconds": scan_interval,
+        "gemini_role": gemini_role,
+        "min_reward_risk": min_rr,
+        "brief": long_brief,
+    }
+
+
+def _strategy_response_item(profile: dict, *, selected_id: str) -> dict:
+    cfg = dict(profile.get("config") or {})
+    brief = str(cfg.get("brief") or profile.get("description") or "").strip()
+    return {
+        "id": str(profile.get("id") or ""),
+        "name": str(profile.get("name") or ""),
+        "description": str(profile.get("description") or ""),
+        "brief": brief,
+        "scope": str(profile.get("scope") or "custom"),
+        "is_default": bool(profile.get("is_default", False)),
+        "is_selected": str(profile.get("id") or "") == str(selected_id or ""),
+        "config": cfg,
+    }
+
+
+def _resolve_strategy_from_profiles(strategy_id: str, profiles: list[dict]) -> Optional[dict]:
+    for profile in profiles:
+        if str(profile.get("id") or "") == str(strategy_id or ""):
+            return profile
+    return None
+
+
+def _apply_strategy_runtime(profile: dict):
+    global active_agent_name
+    strategy_config = dict(profile.get("config") or {})
+
+    agent_name = str(strategy_config.get("agent_name") or "SmartAgent")
+    if agent_name not in agents:
+        agent_name = "SmartAgent"
+    active_agent_name = agent_name
+    auto_trader._auto_agent_name = agent_name
+
+    mode = str(strategy_config.get("policy_mode") or "balanced").lower()
+    if mode not in {"safe", "balanced", "aggressive"}:
+        mode = "balanced"
+    risk_engine.apply_policy_preset(mode)
+
+    policy = risk_engine.user_policy
+    allowed_symbols = strategy_config.get("allowed_symbols")
+    if isinstance(allowed_symbols, list):
+        normalized_symbols = [str(x).strip().upper() for x in allowed_symbols if str(x).strip()]
+        policy = policy.model_copy(update={"allowed_symbols": normalized_symbols})
+
+    gemini_role = str(strategy_config.get("gemini_role") or policy.gemini_role)
+    if gemini_role not in {"off", "advisory", "confirmation-required"}:
+        gemini_role = policy.gemini_role
+    policy = policy.model_copy(update={"gemini_role": gemini_role})
+
+    min_rr = strategy_config.get("min_reward_risk")
+    if min_rr is not None:
+        try:
+            rr = max(1.2, min(4.0, float(min_rr)))
+            policy = policy.model_copy(update={"min_reward_risk": rr})
+        except (TypeError, ValueError):
+            pass
+    risk_engine.update_user_policy(policy)
+
+    interval = strategy_config.get("scan_interval_seconds")
+    if interval is not None:
+        try:
+            risk_engine.auto_trade_scan_interval_seconds = max(15, min(60, int(interval)))
+        except (TypeError, ValueError):
+            pass
+
+
+def apply_runtime_gemini_credentials(*, api_key: Optional[str] = None, model_name: Optional[str] = None, source: str = "local") -> dict:
+    key = (api_key or "").strip()
+    model = (model_name or "").strip()
+    if key:
+        import os
+        os.environ["GEMINI_API_KEY"] = key
+        if hasattr(gemini_agent, "_runtime_last_error"):
+            gemini_agent.clear_runtime_error()
+        if hasattr(gemini_agent, "_quota_block_until"):
+            gemini_agent._quota_block_until = 0.0
+        gemini_agent._init_client()
+        gemini_event_classifier.api_key = key
+        gemini_event_classifier._init_client()
+        strategy_service = signal_pipeline.gemini_strategy_advisor_service
+        strategy_service.api_key = key
+        strategy_service._quota_cooldown_until = 0.0
+        strategy_service._init_client()
+    if model:
+        import os
+        os.environ["GEMINI_MODEL"] = model
+        gemini_agent.model_name = model
+        gemini_event_classifier.model_name = model
+        signal_pipeline.gemini_strategy_advisor_service.model_name = model
+    return {
+        "source": source,
+        "api_key_loaded": bool(key),
+        "api_key_masked": _mask_secret(key) if key else "",
+        "model": model or gemini_agent.model_name,
+        "gemini_available": bool(getattr(gemini_agent, "available", False)),
+        "event_classifier_available": bool(getattr(gemini_event_classifier, "available", False)),
+        "strategy_advisor_available": bool(getattr(signal_pipeline.gemini_strategy_advisor_service, "available", False)),
+    }
+
+
+async def hydrate_gemini_credentials_from_cloud() -> dict:
+    if not cloud_secret_service.configured:
+        return {"source": "local", "configured": False, "loaded": False}
+    try:
+        gemini_key_row = await asyncio.to_thread(cloud_secret_service.get_secret, "GEMINI_API_KEY")
+        gemini_model_row = await asyncio.to_thread(cloud_secret_service.get_secret, "GEMINI_MODEL")
+        key = str((gemini_key_row or {}).get("value") or "").strip()
+        model = str((gemini_model_row or {}).get("value") or "").strip()
+        if not key:
+            return {"source": "cloud", "configured": True, "loaded": False, "reason": "GEMINI_API_KEY not found in cloud secrets."}
+        applied = apply_runtime_gemini_credentials(api_key=key, model_name=(model or None), source="cloud")
+        return {"source": "cloud", "configured": True, "loaded": True, **applied}
+    except Exception as exc:
+        logger.warning("Cloud Gemini credential hydration failed: %s", exc)
+        return {"source": "cloud", "configured": True, "loaded": False, "reason": str(exc)}
 
 
 def _recommended_trade_amount_from_free_margin(
@@ -265,6 +731,7 @@ def set_database(database: Database):
         meta_model_service=signal_pipeline.meta_model_service,
     )
     auto_trader.position_manager.set_trade_closed_callback(_on_position_manager_trade_closed)
+    asyncio.create_task(_warm_saved_credentials_cache())
 
 
 def current_research_cycle_service() -> Optional[ResearchCycleService]:
@@ -352,6 +819,42 @@ async def _persist_runtime_state():
     if db is None:
         return
     await db.save_runtime_state(RUNTIME_STATE_KEY, _runtime_state_payload())
+
+
+async def _list_strategies_for_user(user_id: str) -> list[dict]:
+    builtins = _builtin_strategy_profiles()
+    if db is None:
+        return builtins
+    custom_rows = await db.list_user_strategies(owner_user_id=user_id, limit=100)
+    custom_profiles = [
+        {
+            "id": row.get("id"),
+            "name": row.get("name"),
+            "description": row.get("description", ""),
+            "scope": "custom",
+            "is_default": False,
+            "config": dict(row.get("config_json") or {}),
+        }
+        for row in custom_rows
+    ]
+    return builtins + custom_profiles
+
+
+async def _get_active_strategy_id_for_user(user_id: str) -> str:
+    if db is None:
+        return _default_strategy_id()
+    state = await db.get_runtime_state(_strategy_state_key_for_user(user_id))
+    strategy_id = str((state or {}).get("strategy_id") or "").strip()
+    return strategy_id or _default_strategy_id()
+
+
+async def _set_active_strategy_for_user(user_id: str, strategy_id: str):
+    if db is None:
+        return
+    await db.save_runtime_state(
+        _strategy_state_key_for_user(user_id),
+        {"strategy_id": strategy_id},
+    )
 
 
 def _normalize_chat_history(messages: list[dict]) -> list[dict]:
@@ -1384,7 +1887,10 @@ async def disconnect():
 
 
 @router.get("/status")
-async def status():
+async def status(authorization: Optional[str] = Header(default=None)):
+    user = await _resolve_authenticated_user(authorization)
+    user_id = str(user.get("id") or "local-anonymous")
+    selected_strategy_id = await _get_active_strategy_id_for_user(user_id)
     gemini_status = _current_gemini_status()
     if active_platform == "ibkr" and ibkr_connector.connected:
         account = await _run_ibkr(ibkr_connector.refresh_account)
@@ -1427,6 +1933,10 @@ async def status():
         "live_trading_enabled": config.LIVE_TRADING_ENABLED,
         "panic_stop": risk_engine.panic_stopped,
         "active_agent": active_agent_name,
+        "active_strategy": {
+            "id": selected_strategy_id,
+            "source": "runtime",
+        },
         "credential_storage_available": credential_vault.available,
         "gemini_available": gemini_status.get("available", False),
         "gemini_degraded": gemini_status.get("degraded", False),
@@ -1600,11 +2110,14 @@ async def get_tick(symbol: str):
             "ask": float(snap["ask"]),
             "spread": spread,
             "time": int(time.time()),
+            "source": "ibkr_broker_snapshot",
         }
     tick = market_data.get_tick(_resolve_market_symbol(symbol))
     if tick is None:
         raise HTTPException(status_code=404, detail=f"No tick data for {symbol}")
-    return tick.model_dump()
+    payload = tick.model_dump()
+    payload["source"] = "mt5_broker_tick"
+    return payload
 
 
 @router.get("/market/ticks")
@@ -1615,7 +2128,7 @@ async def get_ticks(symbols: str):
     # Defensive cap to avoid oversized requests from UI.
     requested = raw_symbols[:120]
     if not requested:
-        return {"ticks": {}}
+        return {"ticks": {}, "source": "ibkr_broker_snapshot" if active_platform == "ibkr" else "mt5_broker_tick"}
 
     ticks: dict[str, dict] = {}
     if active_platform == "ibkr":
@@ -1639,7 +2152,10 @@ async def get_ticks(symbols: str):
             if tick is not None:
                 ticks[sym] = tick.model_dump()
 
-    return {"ticks": ticks}
+    return {
+        "ticks": ticks,
+        "source": "ibkr_broker_snapshot" if active_platform == "ibkr" else "mt5_broker_tick",
+    }
 
 
 @router.get("/market/bars/{symbol}")
@@ -1741,6 +2257,7 @@ async def get_available_symbols(
         "categories": categories,
         "category_counts": {k: len(v) for k, v in categories.items()},
         "universe": universe_service.summary_dict(),
+        "source": "ibkr_broker_contracts" if active_platform == "ibkr" else "mt5_broker_symbols",
     }
 
 
@@ -1857,6 +2374,104 @@ class EvaluateRequest(BaseModel):
     agent_name: Optional[str] = None
 
 
+class BuildStrategyRequest(BaseModel):
+    name: str
+    description: str
+
+
+class SelectStrategyRequest(BaseModel):
+    strategy_id: str
+
+
+@router.get("/strategies")
+async def list_strategies(authorization: Optional[str] = Header(default=None)):
+    user = await _resolve_authenticated_user(authorization)
+    user_id = str(user.get("id") or "local-anonymous")
+    profiles = await _list_strategies_for_user(user_id)
+    selected_strategy_id = await _get_active_strategy_id_for_user(user_id)
+    if not _resolve_strategy_from_profiles(selected_strategy_id, profiles):
+        selected_strategy_id = _default_strategy_id()
+    return {
+        "active_strategy_id": selected_strategy_id,
+        "items": [
+            _strategy_response_item(profile, selected_id=selected_strategy_id)
+            for profile in profiles
+        ],
+    }
+
+
+@router.post("/strategies/build")
+async def build_strategy(req: BuildStrategyRequest, authorization: Optional[str] = Header(default=None)):
+    user = await _resolve_authenticated_user(authorization)
+    user_id = str(user.get("id") or "local-anonymous")
+    name = _sanitize_custom_strategy_name(req.name)
+    if len(name) < 3:
+        raise HTTPException(status_code=400, detail="Strategy name must be at least 3 characters.")
+    description = str(req.description or "").strip()
+    if len(description) < 10:
+        raise HTTPException(status_code=400, detail="Please provide a strategy description with more detail.")
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available.")
+
+    safe_name = re.sub(r"[^a-zA-Z0-9]+", "-", name.lower()).strip("-")[:40] or "custom"
+    strategy_id = f"user-{user_id[:8]}-{safe_name}-{int(time.time())}"
+    strategy_config = _build_strategy_config_from_prompt(name, description)
+    await db.upsert_user_strategy(
+        strategy_id=strategy_id,
+        owner_user_id=user_id,
+        name=name,
+        description=description,
+        config=strategy_config,
+    )
+    await _set_active_strategy_for_user(user_id, strategy_id)
+
+    profile = {
+        "id": strategy_id,
+        "name": name,
+        "description": description,
+        "scope": "custom",
+        "is_default": False,
+        "config": strategy_config,
+    }
+    _apply_strategy_runtime(profile)
+    await _persist_runtime_state()
+
+    return {
+        "ok": True,
+        "active_strategy_id": strategy_id,
+        "strategy": _strategy_response_item(profile, selected_id=strategy_id),
+        "active_agent": active_agent_name,
+        "user_policy": risk_engine.user_policy.model_dump(),
+    }
+
+
+@router.post("/strategies/select")
+async def select_strategy(req: SelectStrategyRequest, authorization: Optional[str] = Header(default=None)):
+    user = await _resolve_authenticated_user(authorization)
+    user_id = str(user.get("id") or "local-anonymous")
+    strategy_id = str(req.strategy_id or "").strip()
+    if not strategy_id:
+        raise HTTPException(status_code=400, detail="strategy_id is required.")
+
+    profiles = await _list_strategies_for_user(user_id)
+    selected = _resolve_strategy_from_profiles(strategy_id, profiles)
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Strategy not found.")
+
+    _apply_strategy_runtime(selected)
+    await _set_active_strategy_for_user(user_id, strategy_id)
+    await _persist_runtime_state()
+
+    return {
+        "ok": True,
+        "active_strategy_id": strategy_id,
+        "active_strategy": _strategy_response_item(selected, selected_id=strategy_id),
+        "active_agent": active_agent_name,
+        "user_policy": risk_engine.user_policy.model_dump(),
+        "scan_interval": risk_engine.auto_trade_scan_interval_seconds,
+    }
+
+
 @router.post("/agent/evaluate")
 async def evaluate_signal(req: EvaluateRequest):
     _require_active_platform_connection()
@@ -1932,6 +2547,7 @@ async def set_agent(req: SetAgentRequest):
     if req.agent_name not in agents:
         raise HTTPException(status_code=404, detail=f"Agent '{req.agent_name}' not found")
     active_agent_name = req.agent_name
+    auto_trader._auto_agent_name = req.agent_name
     return {"active_agent": active_agent_name}
 
 
@@ -3317,6 +3933,85 @@ async def get_logs(limit: int = 100, log_type: str = "all"):
     return await db.get_logs(limit, log_type)
 
 
+async def _reconcile_missing_mt5_outcomes(max_rows: int = 180) -> int:
+    """Backfill trade_outcomes for MT5 trades closed while manager/API was not running.
+
+    Trade history depends on a closed outcome row. If a trade was opened through
+    LinkTrade but closed externally (terminal TP/SL/manual) during downtime, this
+    reconciles it from broker realized PnL so it appears in history.
+    """
+    if db is None or active_platform != "mt5" or not connector.connected:
+        return 0
+
+    cursor = await db._db.execute(
+        """SELECT ticket, signal_id, symbol, action, timestamp
+           FROM orders
+           WHERE success = 1
+             AND action IN ('BUY', 'SELL')
+             AND ticket IS NOT NULL
+           ORDER BY timestamp DESC
+           LIMIT ?""",
+        (max(20, int(max_rows)),),
+    )
+    rows = await cursor.fetchall()
+    cols = [d[0] for d in cursor.description]
+    recent_orders = [dict(zip(cols, row)) for row in rows]
+    if not recent_orders:
+        return 0
+
+    open_tickets = {int(p.ticket) for p in execution.get_positions() if getattr(p, "ticket", None) is not None}
+    missing_closed: list[dict] = []
+    for row in recent_orders:
+        ticket = row.get("ticket")
+        if not isinstance(ticket, int):
+            continue
+        if ticket in open_tickets:
+            continue
+        existing = await db.get_trade_outcome_by_ticket(ticket)
+        if existing is None:
+            missing_closed.append(row)
+
+    if not missing_closed:
+        return 0
+
+    ticket_list = [int(item["ticket"]) for item in missing_closed if isinstance(item.get("ticket"), int)]
+    realized_map = execution.get_realized_profit_map(ticket_list, lookback_days=90)
+    now_ts = time.time()
+    backfilled = 0
+    for row in missing_closed:
+        ticket = int(row.get("ticket"))
+        signal_id = row.get("signal_id") if isinstance(row.get("signal_id"), int) else None
+        plan = await db.get_position_management_plan(ticket)
+        signal = await db.get_signal_by_id(signal_id) if signal_id else None
+        ctx = _trade_outcome_context(plan, existing_position=None)
+        symbol = (ctx.get("symbol") or row.get("symbol") or "").upper()
+        action = (ctx.get("action") or row.get("action") or "").upper()
+        if action not in {"BUY", "SELL"}:
+            action = str(row.get("action") or "BUY").upper()
+        opened_at = float(row.get("timestamp") or now_ts)
+        holding_minutes = max(0.0, (now_ts - opened_at) / 60.0)
+        profit = float(realized_map.get(ticket, 0.0) or 0.0)
+        await db.log_trade_outcome(
+            ticket=ticket,
+            signal_id=signal_id,
+            symbol=symbol,
+            action=action,
+            confidence=float(signal.get("confidence", 0.0)) if signal else 0.0,
+            profit=profit,
+            exit_reason="reconciled_external_close",
+            holding_minutes=holding_minutes,
+            symbol_category=str(ctx.get("symbol_category") or ""),
+            strategy=str(ctx.get("strategy") or ""),
+            planned_hold_minutes=ctx.get("planned_hold_minutes") or 0,
+            outcome_json={
+                "detail": "Backfilled from MT5 history because close happened outside active runtime loop.",
+            },
+        )
+        await db.mark_evaluation_outcome(signal_id, "closed")
+        backfilled += 1
+    return backfilled
+
+
 @router.get("/trade-history")
 async def get_trade_history(limit: int = 50):
     _t0 = time.time()
@@ -3345,6 +4040,131 @@ async def get_trade_history(limit: int = 50):
             "source": "ibkr_broker_executions",
         }
 
+    if active_platform == "mt5" and connector.connected:
+        mt5_closed = execution.get_recent_closed_trades(limit=max(limit, 80), lookback_days=180)
+        mt5_open_rows: list[dict] = []
+        try:
+            for pos in execution.get_positions():
+                mt5_open_rows.append(
+                    {
+                        "ticket": int(pos.ticket),
+                        "symbol": str(pos.symbol or "").upper(),
+                        "action": str(pos.type or "BUY").upper(),
+                        "status": "open",
+                        "opened_at": float(pos.time or 0),
+                        "closed_at": None,
+                        "duration_minutes": max(0.0, (time.time() - float(pos.time or 0)) / 60.0) if float(pos.time or 0) > 0 else None,
+                        "volume": float(pos.volume or 0.0),
+                        "entry_price": float(pos.price_open or 0.0) if float(pos.price_open or 0.0) > 0 else None,
+                        "stop_loss": float(pos.stop_loss or 0.0) if float(pos.stop_loss or 0.0) > 0 else None,
+                        "take_profit": float(pos.take_profit or 0.0) if float(pos.take_profit or 0.0) > 0 else None,
+                        "profit_usd": float(pos.profit or 0.0),
+                        "profit_pct": None,
+                        "started_with_usd": None,
+                        "ended_with_usd": None,
+                        "entry_market_value_usd": None,
+                        "sl_amount_usd": None,
+                        "tp_amount_usd": None,
+                        "sl_pct_of_start": None,
+                        "tp_pct_of_start": None,
+                        "started_with_source": "unknown",
+                        "signal_id": None,
+                        "signal_confidence": None,
+                        "signal_reason": None,
+                        "risk_approved": None,
+                        "risk_reason": None,
+                        "decision_reason": "mt5_open_position",
+                        "trade_reasons": [],
+                        "gemini_response": None,
+                        "meta_model": None,
+                        "post_analysis": None,
+                        "exit_reason": None,
+                    }
+                )
+        except Exception as exc:
+            logger.warning("trade-history:failed to load open mt5 positions: %s", exc)
+
+        def _to_float_mt5(v, default: float = 0.0) -> float:
+            try:
+                return float(v)
+            except Exception:
+                return default
+
+        closed = [t for t in mt5_closed if str(t.get("status", "")).lower() == "closed"]
+        open_rows = [t for t in mt5_open_rows if str(t.get("status", "")).lower() == "open"]
+        wins = [t for t in closed if _to_float_mt5(t.get("profit_usd")) > 0]
+        losses = [t for t in closed if _to_float_mt5(t.get("profit_usd")) < 0]
+        breakeven = [t for t in closed if _to_float_mt5(t.get("profit_usd")) == 0]
+        total_profit = sum(_to_float_mt5(t.get("profit_usd")) for t in closed)
+        all_rows = (open_rows + closed)
+        all_rows.sort(key=lambda row: float(row.get("opened_at") or 0.0), reverse=True)
+
+        summary = {
+            "total_trades": len(closed) + len(open_rows),
+            "closed_trades": len(closed),
+            "open_trades": len(open_rows),
+            "winning_trades": len(wins),
+            "losing_trades": len(losses),
+            "breakeven_trades": len(breakeven),
+            "win_rate_pct": (len(wins) / len(closed) * 100.0) if closed else 0.0,
+            "total_profit_usd": total_profit,
+            "avg_profit_per_closed_trade_usd": (total_profit / len(closed)) if closed else 0.0,
+            "total_started_capital_usd": 0.0,
+            "roi_pct": None,
+            "best_trade_usd": max((_to_float_mt5(t.get("profit_usd")) for t in closed), default=0.0),
+            "worst_trade_usd": min((_to_float_mt5(t.get("profit_usd")) for t in closed), default=0.0),
+        }
+
+        return {
+            "summary": summary,
+            "trades": all_rows[:limit],
+            "source": "mt5_broker_deals",
+            "account_login": getattr(connector.account_info, "login", None) if connector.account_info else None,
+            "account_server": getattr(connector.account_info, "server", None) if connector.account_info else None,
+        }
+
+    if active_platform == "mt5" and not connector.connected:
+        return {
+            "summary": {
+                "total_trades": 0,
+                "closed_trades": 0,
+                "open_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "breakeven_trades": 0,
+                "win_rate_pct": 0.0,
+                "total_profit_usd": 0.0,
+                "avg_profit_per_closed_trade_usd": 0.0,
+                "total_started_capital_usd": 0.0,
+                "roi_pct": None,
+                "best_trade_usd": 0.0,
+                "worst_trade_usd": 0.0,
+            },
+            "trades": [],
+            "source": "mt5_broker_deals_unavailable_not_connected",
+        }
+
+    if active_platform == "ibkr" and not ibkr_connector.connected:
+        return {
+            "summary": {
+                "total_trades": 0,
+                "closed_trades": 0,
+                "open_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "breakeven_trades": 0,
+                "win_rate_pct": 0.0,
+                "total_profit_usd": 0.0,
+                "avg_profit_per_closed_trade_usd": 0.0,
+                "total_started_capital_usd": 0.0,
+                "roi_pct": None,
+                "best_trade_usd": 0.0,
+                "worst_trade_usd": 0.0,
+            },
+            "trades": [],
+            "source": "ibkr_broker_executions_unavailable_not_connected",
+        }
+
     if db is None:
         return {
             "summary": {
@@ -3364,6 +4184,13 @@ async def get_trade_history(limit: int = 50):
             },
             "trades": [],
         }
+
+    try:
+        reconciled = await _reconcile_missing_mt5_outcomes(max_rows=max(limit * 4, 160))
+        if reconciled:
+            logger.info("trade-history:reconciled-missing-outcomes count=%s", reconciled)
+    except Exception as exc:
+        logger.warning("trade-history:reconcile-skip due to error: %s", exc)
 
     raw_limit = max(limit * 3, 90)
     cursor = await db._db.execute(
@@ -3644,9 +4471,104 @@ async def get_trade_history(limit: int = 50):
         )
         if len(trades) >= limit:
             break
+
+    # Include closed outcomes that may not have a matching local open-order row
+    # (e.g., externally opened/closed trades or runtime gaps) so history stays complete.
+    if len(trades) < limit and outcomes:
+        existing_keys: set[tuple[int | None, int | None, str]] = set()
+        for t in trades:
+            existing_keys.add(
+                (
+                    int(t.get("ticket")) if isinstance(t.get("ticket"), int) else None,
+                    int(t.get("signal_id")) if isinstance(t.get("signal_id"), int) else None,
+                    str(t.get("symbol") or "").upper(),
+                )
+            )
+
+        for outcome in outcomes:
+            ticket_val = outcome.get("ticket")
+            signal_val = outcome.get("signal_id")
+            symbol_val = str(outcome.get("symbol") or "").upper()
+            key = (
+                int(ticket_val) if isinstance(ticket_val, int) else None,
+                int(signal_val) if isinstance(signal_val, int) else None,
+                symbol_val,
+            )
+            if key in existing_keys:
+                continue
+            closed_at = _to_float(outcome.get("closed_at"), 0.0)
+            holding_minutes = _to_float(outcome.get("holding_minutes"), 0.0)
+            opened_at = max(0.0, closed_at - (holding_minutes * 60.0)) if closed_at > 0 else time.time()
+            profit = _to_float(outcome.get("profit"), 0.0)
+            trades.append(
+                {
+                    "ticket": ticket_val,
+                    "signal_id": signal_val,
+                    "symbol": symbol_val,
+                    "action": str(outcome.get("action") or "").upper() or "BUY",
+                    "status": "closed",
+                    "opened_at": opened_at,
+                    "closed_at": closed_at if closed_at > 0 else None,
+                    "duration_minutes": holding_minutes,
+                    "volume": None,
+                    "entry_price": None,
+                    "stop_loss": None,
+                    "take_profit": None,
+                    "profit_usd": profit,
+                    "profit_pct": None,
+                    "started_with_usd": None,
+                    "ended_with_usd": None,
+                    "entry_market_value_usd": None,
+                    "sl_amount_usd": None,
+                    "tp_amount_usd": None,
+                    "sl_pct_of_start": None,
+                    "tp_pct_of_start": None,
+                    "started_with_source": "unknown",
+                    "agent_name": None,
+                    "signal_confidence": None,
+                    "signal_reason": None,
+                    "risk_approved": None,
+                    "risk_reason": None,
+                    "decision_reason": None,
+                    "trade_reasons": [],
+                    "gemini_response": None,
+                    "meta_model": None,
+                    "post_analysis": None,
+                    "exit_reason": str(outcome.get("exit_reason") or "") or None,
+                }
+            )
+            existing_keys.add(key)
+            if len(trades) >= limit:
+                break
     logger.info("trade-history:rows-built trades=%s elapsed_ms=%s", len(trades), int((time.time() - _t0) * 1000))
 
-    # Realized PnL MT5 reconciliation is intentionally skipped here for responsiveness.
+    # Reconcile realized PnL with MT5 deal history for displayed closed tickets.
+    # This removes close-time race mismatches (e.g., floating P/L captured before fill).
+    if active_platform == "mt5" and connector.connected and trades:
+        try:
+            closed_tickets = [
+                int(t.get("ticket"))
+                for t in trades
+                if t.get("status") == "closed" and isinstance(t.get("ticket"), int)
+            ]
+            if closed_tickets:
+                broker_realized = execution.get_realized_profit_map(closed_tickets, lookback_days=120)
+                for trade in trades:
+                    ticket = trade.get("ticket")
+                    if not isinstance(ticket, int):
+                        continue
+                    if ticket not in broker_realized:
+                        continue
+                    broker_profit = float(broker_realized[ticket] or 0.0)
+                    trade["profit_usd"] = broker_profit
+                    started = trade.get("started_with_usd")
+                    if isinstance(started, (int, float)):
+                        started_value = float(started)
+                        trade["ended_with_usd"] = started_value + broker_profit
+                        if started_value != 0:
+                            trade["profit_pct"] = (broker_profit / started_value) * 100.0
+        except Exception as exc:
+            logger.warning("trade-history:pnl-reconcile-skip due to error: %s", exc)
 
     closed = [t for t in trades if t.get("status") == "closed" and t.get("profit_usd") is not None]
     wins = [t for t in closed if _to_float(t.get("profit_usd")) > 0]
@@ -4003,28 +4925,29 @@ async def save_credentials(req: SaveCredentialsRequest):
     )
     if not status.get("saved"):
         raise HTTPException(status_code=503, detail=status.get("reason", "Failed to save credentials"))
+    await _get_saved_credentials_with_fallback(timeout_seconds=4.0)
     return {"saved": True, "backend": status.get("backend")}
 
 
 @router.get("/credentials")
 async def get_credentials():
     if db is None:
-        return []
-    creds = await db.get_saved_credentials()
-    return creds
+        return list(_saved_credentials_cache)
+    return await _get_saved_credentials_with_fallback(timeout_seconds=4.0)
 
 
 @router.delete("/credentials/{account_id}")
 async def delete_credentials(account_id: int):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
-    existing = await db.get_saved_credential(account_id)
+    existing = await _get_saved_credential_with_fallback(account_id, timeout_seconds=3.0)
     if existing:
         credential_vault.delete_password(
             existing.get("secret_ref", ""),
             existing.get("secret_backend", ""),
         )
     await db.delete_saved_credentials(account_id)
+    await _get_saved_credentials_with_fallback(timeout_seconds=4.0)
     return {"deleted": True}
 
 
@@ -4047,10 +4970,10 @@ async def auto_connect(account_id: Optional[int] = None):
         connector.disconnect()
 
     if account_id is not None:
-        selected = await db.get_saved_credential(account_id)
+        selected = await _get_saved_credential_with_fallback(account_id, timeout_seconds=3.0)
         creds = [selected] if selected else []
     else:
-        creds = await db.get_saved_credentials()
+        creds = await _get_saved_credentials_with_fallback(timeout_seconds=4.0)
 
     if not creds or creds[0] is None:
         return {"connected": False, "reason": "No saved credentials"}
@@ -4062,6 +4985,7 @@ async def auto_connect(account_id: Optional[int] = None):
         active_platform = "mt5"
         await db.log_connection_event("auto_connected", best["account"], best["server"])
         await db.update_credential_last_used(best["account"])
+        await _get_saved_credentials_with_fallback(timeout_seconds=2.5)
         if not connector.is_demo() and (risk_engine.user_policy.demo_only_default or not config.LIVE_TRADING_ENABLED):
             connector.disconnect()
             return {"connected": False, "reason": "Live account rejected - demo only mode"}
@@ -4133,25 +5057,96 @@ async def smart_evaluate(req: SmartEvaluateRequest):
         market_data.get_tradeable_symbols(),
         include_inactive=False,
     )
-    symbol_lookup = {
-        (item.get("name") or ""): item
-        for item in market_universe
-        if item.get("name")
-    }
+    symbol_lookup: dict[str, dict] = {}
+    for item in market_universe:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        canonical = str(item.get("canonical_symbol") or name).strip()
+        for key in {name, name.upper(), canonical, canonical.upper()}:
+            symbol_lookup[key] = item
+
+    def _resolve_requested_symbol(sym: str) -> Optional[str]:
+        raw = str(sym or "").strip()
+        if not raw:
+            return None
+        candidates = [
+            raw,
+            raw.upper(),
+            universe_service.canonical_symbol(raw),
+            universe_service.canonical_symbol(raw).upper(),
+        ]
+        for key in candidates:
+            row = symbol_lookup.get(key)
+            if row and row.get("name"):
+                return str(row["name"])
+        return None
     history_commission_map = execution.get_recent_commission_by_symbol()
 
     if not symbols:
         # Use canonical universe selection to reduce alias duplicates and include the full active set.
         symbols = universe_service.candidate_universe(market_universe)[:MAX_SCAN_SYMBOLS]
+        # Some brokers can return an empty tradeable universe until symbols are explicitly
+        # selected/enabled. Fall back to configured canonical shortlist so the dashboard
+        # still produces confidence/analysis output instead of an empty result set.
+        if not symbols:
+            symbols = universe_service.restrict_symbols(
+                list(config.AUTO_TRADE_FALLBACK_SYMBOLS or [])
+            )[:MAX_SCAN_SYMBOLS]
     else:
-        direct = []
+        direct: list[str] = []
+        seen_direct: set[str] = set()
         for sym in symbols:
-            key = str(sym or "").strip()
-            if key and key in symbol_lookup:
-                direct.append(key)
-        symbols = (direct or universe_service.restrict_symbols(symbols))[:MAX_SCAN_SYMBOLS]
+            resolved = _resolve_requested_symbol(sym)
+            if not resolved:
+                continue
+            normalized = resolved.upper()
+            if normalized in seen_direct:
+                continue
+            seen_direct.add(normalized)
+            direct.append(resolved)
+        symbols = (
+            direct
+            or universe_service.candidate_universe(market_universe)
+            or universe_service.restrict_symbols(symbols)
+        )[:MAX_SCAN_SYMBOLS]
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_EVALS)
+
+    def _scan_timeout_row(sym: str) -> dict:
+        symbol_info = symbol_lookup.get(sym) or symbol_lookup.get(sym.upper()) or {}
+        category = symbol_info.get("category") or "Other"
+        description = symbol_info.get("description") or ""
+        return {
+            "symbol": sym,
+            "signal": {
+                "action": "HOLD",
+                "confidence": 0.0,
+                "stop_loss": 0.0,
+                "take_profit": 0.0,
+                "reason": "Scan timed out for this symbol.",
+                "strategy": "timeout_fallback",
+            },
+            "signal_id": None,
+            "risk_decision": {},
+            "entry_price_estimate": 0.0,
+            "explanation": "Scan timed out for this symbol.",
+            "ready_to_execute": False,
+            "category": category,
+            "description": description,
+            "degraded_reasons": ["scan_timeout"],
+            "trade_quality": {},
+            "portfolio_risk": {},
+            "anti_churn": {},
+            "gemini_confirmation": None,
+            "execution_reason": "Scan timed out for this symbol.",
+            "recommended_amount_usd": 0.0,
+            "recommended_amount_pct_free_margin": 0.0,
+            **_merge_commission_snapshot(
+                _commission_snapshot_from_symbol_info(symbol_info),
+                history_commission_map.get(sym),
+            ),
+        }
 
     async def evaluate_symbol(sym: str) -> dict | None:
         try:
@@ -4167,7 +5162,13 @@ async def smart_evaluate(req: SmartEvaluateRequest):
                     ),
                     timeout=PER_SYMBOL_TIMEOUT_SECONDS,
                 )
-            signal_id = await signal_pipeline.persist_evaluation(execution_decision, "multi")
+            try:
+                signal_id = await asyncio.wait_for(
+                    signal_pipeline.persist_evaluation(execution_decision, "multi"),
+                    timeout=0.8,
+                )
+            except Exception:
+                signal_id = None
             signal = execution_decision.signal_decision.final_signal
             risk_decision = execution_decision.risk_evaluation
             context = execution_decision.signal_decision.market_context
@@ -4183,12 +5184,15 @@ async def smart_evaluate(req: SmartEvaluateRequest):
                 return None
 
             if ready_to_execute and signal.action in {"BUY", "SELL"}:
-                preflight = await execution_service.preflight_for_context_signal(
-                    context=context,
-                    candidate_signal=signal,
-                    volume=max(risk_decision.adjusted_volume, risk_engine.settings.fixed_lot_size),
-                    reference_spread=context.tick.get("spread", 0.0) if context.tick else 0.0,
-                    evaluation_mode="scan",
+                preflight = await asyncio.wait_for(
+                    execution_service.preflight_for_context_signal(
+                        context=context,
+                        candidate_signal=signal,
+                        volume=max(risk_decision.adjusted_volume, risk_engine.settings.fixed_lot_size),
+                        reference_spread=context.tick.get("spread", 0.0) if context.tick else 0.0,
+                        evaluation_mode="scan",
+                    ),
+                    timeout=0.8,
                 )
                 if not preflight.approved:
                     ready_to_execute = False
@@ -4254,6 +5258,7 @@ async def smart_evaluate(req: SmartEvaluateRequest):
             return None
 
     tasks = [asyncio.create_task(evaluate_symbol(sym)) for sym in symbols]
+    task_symbol = {task: sym for task, sym in zip(tasks, symbols)}
     done, pending = await asyncio.wait(tasks, timeout=TOTAL_SCAN_TIMEOUT_SECONDS)
     for task in pending:
         task.cancel()
@@ -4271,6 +5276,10 @@ async def smart_evaluate(req: SmartEvaluateRequest):
         except Exception as exc:
             logger.error("Smart evaluate task failed: %r", exc, exc_info=True)
             evaluations.append(None)
+    for task in pending:
+        sym = task_symbol.get(task, "")
+        if sym:
+            evaluations.append(_scan_timeout_row(sym))
     recommendations = [item for item in evaluations if item is not None]
 
     # Second-pass Gemini enrichment for actionable rows only.
@@ -4889,7 +5898,40 @@ class AttributionReportRequest(BaseModel):
 @router.get("/research/status")
 async def research_status():
     service = _get_research_cycle_service()
-    snapshot = await service.status_snapshot()
+    try:
+        snapshot = await asyncio.wait_for(service.status_snapshot(), timeout=3.5)
+    except asyncio.TimeoutError:
+        logger.warning("research-status: timed out; returning lightweight fallback snapshot")
+        meta_service = getattr(service, "meta_model_service", None)
+        snapshot = {
+            "meta_model_active": bool(getattr(meta_service, "is_active", False)),
+            "meta_model_active_version": str(getattr(meta_service, "active_version_id", "") or ""),
+            "active_approved_model": None,
+            "last_training_run": None,
+            "last_replay_run": None,
+            "last_walk_forward_run": None,
+            "best_candidate_model": None,
+            "recent_attribution_reports": [],
+            "incremental_training": {
+                "last_run_at": float(getattr(service, "_last_incremental_train_at", 0.0) or 0.0),
+                "last_closed_count": int(getattr(service, "_last_incremental_closed_count", 0) or 0),
+            },
+            "meta_model_inactive_reason": "status_timeout",
+        }
+    else:
+        inactive_reason = ""
+        if not snapshot.get("meta_model_active"):
+            approved = snapshot.get("active_approved_model") or {}
+            best_candidate = snapshot.get("best_candidate_model") or {}
+            if not approved:
+                inactive_reason = "no_approved_model"
+            elif not snapshot.get("meta_model_active_version"):
+                inactive_reason = "approved_model_not_loaded"
+            elif best_candidate:
+                inactive_reason = "candidate_pending_or_not_promoted"
+            else:
+                inactive_reason = "inactive"
+        snapshot["meta_model_inactive_reason"] = inactive_reason
     return {
         "enabled": bool(config.ENABLE_RESEARCH_CYCLE),
         "config": {
@@ -5007,8 +6049,11 @@ class AutoTradeSettingsRequest(BaseModel):
 
 
 @router.get("/auto-trade/status")
-async def auto_trade_status():
+async def auto_trade_status(authorization: Optional[str] = Header(default=None)):
     """Get auto-trading status and recent activity."""
+    user = await _resolve_authenticated_user(authorization)
+    user_id = str(user.get("id") or "local-anonymous")
+    selected_strategy_id = await _get_active_strategy_id_for_user(user_id)
     settings = risk_engine.settings
     service_status = task_orchestrator.status_snapshot()
     if active_platform == "ibkr" and ibkr_connector.connected:
@@ -5040,6 +6085,7 @@ async def auto_trade_status():
         "enabled": risk_engine.auto_trade_enabled,
         "min_confidence": settings.auto_trade_min_confidence,
         "scan_interval": risk_engine.auto_trade_scan_interval_seconds,
+        "active_strategy_id": selected_strategy_id,
         "last_scan": auto_trader.last_scan_time,
         "recent_trades": auto_trader.recent_trades,
         "panic_stop": risk_engine.panic_stopped,

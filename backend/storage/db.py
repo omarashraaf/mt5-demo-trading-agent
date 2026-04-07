@@ -371,6 +371,16 @@ CREATE TABLE IF NOT EXISTS user_access (
     notes TEXT DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS user_strategies (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp
     ON signals(symbol, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_timestamp
@@ -393,6 +403,8 @@ CREATE INDEX IF NOT EXISTS idx_user_activity_timestamp
     ON user_activity(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_user_access_status
     ON user_access(status, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_strategies_owner
+    ON user_strategies(owner_user_id, updated_at DESC);
 """
 
 
@@ -1762,6 +1774,76 @@ class Database:
             return json.loads(row[0])
         except Exception:
             return None
+
+    async def upsert_user_strategy(
+        self,
+        *,
+        strategy_id: str,
+        owner_user_id: str,
+        name: str,
+        description: str,
+        config: Optional[dict] = None,
+    ):
+        now = time.time()
+        await self._db.execute(
+            """INSERT INTO user_strategies
+            (id, owner_user_id, name, description, config_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                owner_user_id=excluded.owner_user_id,
+                name=excluded.name,
+                description=excluded.description,
+                config_json=excluded.config_json,
+                updated_at=excluded.updated_at""",
+            (
+                strategy_id,
+                owner_user_id,
+                name,
+                description,
+                json.dumps(config or {}),
+                now,
+                now,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_user_strategy(self, *, owner_user_id: str, strategy_id: str) -> Optional[dict]:
+        cursor = await self._db.execute(
+            """SELECT * FROM user_strategies
+            WHERE owner_user_id = ? AND id = ?
+            LIMIT 1""",
+            (owner_user_id, strategy_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        item = dict(zip(cols, row))
+        try:
+            item["config_json"] = json.loads(item.get("config_json") or "{}")
+        except Exception:
+            item["config_json"] = {}
+        return item
+
+    async def list_user_strategies(self, *, owner_user_id: str, limit: int = 100) -> list[dict]:
+        cursor = await self._db.execute(
+            """SELECT * FROM user_strategies
+            WHERE owner_user_id = ?
+            ORDER BY updated_at DESC
+            LIMIT ?""",
+            (owner_user_id, max(1, min(limit, 500))),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        items: list[dict] = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            try:
+                item["config_json"] = json.loads(item.get("config_json") or "{}")
+            except Exception:
+                item["config_json"] = {}
+            items.append(item)
+        return items
 
     async def log_user_activity(
         self,

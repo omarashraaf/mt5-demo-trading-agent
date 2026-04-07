@@ -59,6 +59,7 @@ class AutoTrader:
         self._trade_log: list[dict] = []  # Recent auto-trade log for UI
         self._state = BackgroundServiceState(name="auto_trader")
         self._gemini_quota_cooldown_until = 0.0
+        self._auto_agent_name = "SmartAgent"
 
         # Position Manager — autonomous management of open positions
         self.position_manager = PositionManager(
@@ -138,14 +139,17 @@ class AutoTrader:
                 # Pre-flight checks
                 if not self.connector.connected:
                     logger.debug("Auto-trader: not connected, skipping")
+                    await asyncio.sleep(1)
                     continue
 
                 if self.risk_engine.panic_stopped:
                     logger.debug("Auto-trader: panic stop active, skipping")
+                    await asyncio.sleep(1)
                     continue
 
                 if not self.risk_engine.auto_trade_enabled:
                     logger.debug("Auto-trader: auto-trade disabled, skipping")
+                    await asyncio.sleep(1)
                 else:
                     await self._scan_and_trade()
                     self._state.mark_cycle()
@@ -233,7 +237,7 @@ class AutoTrader:
 
                 decision = await self.signal_pipeline.evaluate(
                     symbol=sym,
-                    requested_agent_name="GeminiAgent",
+                    requested_agent_name=self._auto_agent_name,
                     requested_timeframe="H1",
                     evaluation_mode="auto",
                     bar_count=100,
@@ -407,7 +411,7 @@ class AutoTrader:
                     reference_spread=decision.signal_decision.market_context.tick.get("spread", 0.0)
                     if decision.signal_decision.market_context.tick
                     else 0.0,
-                    requested_agent_name="GeminiAgent",
+                    requested_agent_name=self._auto_agent_name,
                     requested_timeframe="H1",
                     evaluation_mode="auto",
                     scan_window_id=scan_window_id,

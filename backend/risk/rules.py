@@ -346,7 +346,8 @@ class RiskEngine:
             max_daily_loss_percent=policy.max_daily_drawdown,
             max_concurrent_positions=policy.max_open_trades,
             max_open_positions_total=policy.max_open_trades,
-            max_positions_per_symbol=1,
+            # Keep per-symbol open-position cap aligned with user policy/strategy.
+            max_positions_per_symbol=max(1, int(policy.max_trades_per_symbol)),
             max_trades_per_symbol=policy.max_trades_per_symbol,
             cooldown_minutes_per_symbol=mode_tuning["cooldown"],
             min_confidence_threshold=mode_tuning["min_confidence"],

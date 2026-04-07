@@ -128,7 +128,13 @@ class MarketDataService:
         return True
 
     def get_tick(self, symbol: str) -> Optional[TickData]:
+        self.enable_symbol(symbol)
         tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            # Retry once after explicit symbol selection; some brokers delay first tick.
+            mt5.symbol_select(symbol, True)
+            time.sleep(0.05)
+            tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             logger.error(f"Failed to get tick for {symbol}: {mt5.last_error()}")
             return None
@@ -143,7 +149,12 @@ class MarketDataService:
         )
 
     def _tick_for_symbol(self, symbol: str) -> Optional[TickData]:
+        self.enable_symbol(symbol)
         tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            mt5.symbol_select(symbol, True)
+            time.sleep(0.05)
+            tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return None
         point = self._point_for_symbol(symbol)

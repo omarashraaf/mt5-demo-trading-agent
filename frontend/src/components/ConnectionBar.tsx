@@ -36,6 +36,32 @@ export default function ConnectionBar({ status, onRefresh }: Props) {
     }
   };
 
+  const handleConnectAction = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const result = await api.autoConnect();
+      if (result.connected) {
+        onRefresh();
+        return;
+      }
+      // If no saved account exists, send user to full connection form.
+      if (credentials.length === 0) {
+        window.location.hash = '#/connection';
+        return;
+      }
+      setError(result.reason || 'Could not connect automatically');
+    } catch (e: any) {
+      if (credentials.length === 0) {
+        window.location.hash = '#/connection';
+        return;
+      }
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleDisconnect = async () => {
     setLoading(true);
     try {
@@ -82,9 +108,10 @@ export default function ConnectionBar({ status, onRefresh }: Props) {
               Quick Connect
             </button>
           ) : (
-            <a href="#/connection" className="btn btn-primary" style={{ textDecoration: 'none', fontSize: 13 }}>
-              <Plug size={14} /> Connect Account
-            </a>
+            <button className="btn btn-primary" onClick={handleConnectAction} disabled={loading} style={{ fontSize: 13 }}>
+              {loading ? <span className="loading-spinner" /> : <Plug size={14} />}
+              Connect Account
+            </button>
           )}
         </div>
       </div>

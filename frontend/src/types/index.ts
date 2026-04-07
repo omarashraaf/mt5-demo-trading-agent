@@ -147,6 +147,10 @@ export interface StatusResponse {
   live_trading_enabled: boolean;
   panic_stop: boolean;
   active_agent: string;
+  active_strategy?: {
+    id: string;
+    source?: string;
+  };
   credential_storage_available?: boolean;
   gemini_available?: boolean;
   gemini_degraded?: boolean;
@@ -160,6 +164,22 @@ export interface StatusResponse {
   finnhub?: ProviderHealth;
   portfolio?: PortfolioSnapshot;
   services?: Record<string, unknown>;
+}
+
+export interface StrategyProfile {
+  id: string;
+  name: string;
+  description: string;
+  brief?: string;
+  scope: 'builtin' | 'custom' | string;
+  is_default: boolean;
+  is_selected: boolean;
+  config: Record<string, unknown>;
+}
+
+export interface StrategiesResponse {
+  active_strategy_id: string;
+  items: StrategyProfile[];
 }
 
 export interface TickData {

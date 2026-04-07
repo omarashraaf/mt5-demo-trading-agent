@@ -11,6 +11,7 @@ from api.routes import (
     router,
     set_database,
     restore_runtime_state,
+    hydrate_gemini_credentials_from_cloud,
     connector,
     finnhub_adapter,
     current_research_cycle_service,
@@ -56,6 +57,17 @@ async def lifespan(app: FastAPI):
     set_database(db)
     set_admin_database(db)
     await restore_runtime_state()
+    cloud_gemini_state = await hydrate_gemini_credentials_from_cloud()
+    if cloud_gemini_state.get("loaded"):
+        logger.info(
+            "Gemini credentials loaded from cloud secrets (model=%s).",
+            cloud_gemini_state.get("model"),
+        )
+    else:
+        logger.info(
+            "Gemini cloud secret hydration skipped/fallback: %s",
+            cloud_gemini_state.get("reason", "using local environment"),
+        )
     active_research_service = current_research_cycle_service()
     if active_research_service is not None:
         meta_training_scheduler = MetaTrainingScheduler(
