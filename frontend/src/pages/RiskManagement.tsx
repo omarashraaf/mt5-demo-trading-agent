@@ -19,11 +19,23 @@ const FALLBACK_POLICY: UserPolicySettings = {
   allowed_symbols: [],
   max_risk_per_trade: 0.5,
   max_daily_drawdown: 4,
+  max_weekly_loss: 10,
+  max_drawdown: 16,
   max_open_trades: 5,
   max_trades_per_symbol: 2,
+  max_correlated_exposure: 3,
+  max_lot_size: 0.1,
+  max_leverage_exposure: 2,
+  max_trades_per_day: 8,
   max_margin_utilization: 18,
   min_free_margin: 60,
   min_reward_risk: 1.8,
+  max_spread: 15,
+  min_confidence: 0.6,
+  allowed_asset_classes: ['Forex', 'Indices', 'Commodities', 'Stocks'],
+  news_blackout_behavior: 'block',
+  auto_trading_allowed: false,
+  live_execution_allowed: false,
   allow_counter_trend_trades: false,
   allow_overnight_holding: false,
   gemini_role: 'advisory',
@@ -75,11 +87,11 @@ export default function RiskManagement({ status }: Props) {
     setSaved(false);
     try {
       const updated = await api.updateRiskSettings(policy);
-      setSettingsResponse(updated);
-      setPolicy(updated.user_policy);
+      const verified = await api.getRiskSettings();
+      setSettingsResponse(verified);
+      setPolicy(verified.user_policy);
       api.getAutoTradeStatus().then(setAutoTradeStatus).catch(() => {});
       setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -108,7 +120,6 @@ export default function RiskManagement({ status }: Props) {
       setPolicy(updated.user_policy);
       api.getAutoTradeStatus().then(setAutoTradeStatus).catch(() => {});
       setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
     } catch (e: any) {
       setError(e.message);
       setPolicy({ ...preset });
@@ -118,6 +129,7 @@ export default function RiskManagement({ status }: Props) {
   };
 
   const update = <K extends keyof UserPolicySettings>(field: K, value: UserPolicySettings[K]) => {
+    setSaved(false);
     setPolicy((prev) => ({ ...prev, [field]: value }));
   };
 
@@ -153,7 +165,20 @@ export default function RiskManagement({ status }: Props) {
   const runtimeControls = settingsResponse?.runtime_controls ?? status?.runtime_controls;
   const recentDecisions = autoTradeStatus?.recent_trades?.slice(0, 4) ?? [];
   const universe = settingsResponse?.universe ?? status?.universe;
-  const finnhub = settingsResponse?.event_providers?.finnhub ?? status?.finnhub;
+  const benzinga = settingsResponse?.event_providers?.benzinga ?? status?.benzinga;
+  const liveReadiness = status?.live_trading_readiness;
+  const apiKeysHealth = status?.api_keys_health;
+  const unhealthyApiKeys = (apiKeysHealth?.items || []).filter((item) => (
+    ['inactive', 'offline', 'degraded', 'low_credits', 'warning'].includes(String(item.status || '').toLowerCase())
+  ));
+  const liveReadinessColor = liveReadiness?.status === 'ready'
+    ? 'var(--accent-green)'
+    : liveReadiness?.status === 'warning'
+      ? 'var(--accent-yellow)'
+      : 'var(--accent-red)';
+  const accountModeLabel = !status?.connected
+    ? 'Not connected'
+    : status?.is_demo ? 'Demo/Paper' : 'Live';
 
   return (
     <div>
@@ -243,6 +268,30 @@ export default function RiskManagement({ status }: Props) {
                 />
               </div>
               <div className="form-group">
+                <label>Max Weekly Loss (%)</label>
+                <input
+                  className="form-input"
+                  type="number"
+                  step="0.5"
+                  min="1"
+                  max="30"
+                  value={policy.max_weekly_loss ?? 10}
+                  onChange={(e) => update('max_weekly_loss', parseFloat(e.target.value) || 10)}
+                />
+              </div>
+              <div className="form-group">
+                <label>Max Drawdown (%)</label>
+                <input
+                  className="form-input"
+                  type="number"
+                  step="0.5"
+                  min="1"
+                  max="50"
+                  value={policy.max_drawdown ?? 16}
+                  onChange={(e) => update('max_drawdown', parseFloat(e.target.value) || 16)}
+                />
+              </div>
+              <div className="form-group">
                 <label>Max Open Trades</label>
                 <input
                   className="form-input"
@@ -262,6 +311,29 @@ export default function RiskManagement({ status }: Props) {
                   max="10"
                   value={policy.max_trades_per_symbol}
                   onChange={(e) => update('max_trades_per_symbol', parseInt(e.target.value) || 1)}
+                />
+              </div>
+              <div className="form-group">
+                <label>Max Trades Per Day</label>
+                <input
+                  className="form-input"
+                  type="number"
+                  min="1"
+                  max="100"
+                  value={policy.max_trades_per_day ?? 8}
+                  onChange={(e) => update('max_trades_per_day', parseInt(e.target.value) || 8)}
+                />
+              </div>
+              <div className="form-group">
+                <label>Max Lot Size</label>
+                <input
+                  className="form-input"
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  max="100"
+                  value={policy.max_lot_size ?? 0.1}
+                  onChange={(e) => update('max_lot_size', parseFloat(e.target.value) || 0.1)}
                 />
               </div>
               <div className="form-group">
@@ -286,6 +358,30 @@ export default function RiskManagement({ status }: Props) {
                   max="95"
                   value={policy.min_free_margin}
                   onChange={(e) => update('min_free_margin', parseFloat(e.target.value) || 70)}
+                />
+              </div>
+              <div className="form-group">
+                <label>Max Spread</label>
+                <input
+                  className="form-input"
+                  type="number"
+                  step="0.5"
+                  min="0.5"
+                  max="500"
+                  value={policy.max_spread ?? 15}
+                  onChange={(e) => update('max_spread', parseFloat(e.target.value) || 15)}
+                />
+              </div>
+              <div className="form-group">
+                <label>Min Confidence</label>
+                <input
+                  className="form-input"
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="1"
+                  value={policy.min_confidence ?? 0.6}
+                  onChange={(e) => update('min_confidence', parseFloat(e.target.value) || 0.6)}
                 />
               </div>
             </div>
@@ -350,6 +446,33 @@ export default function RiskManagement({ status }: Props) {
                   style={{ marginRight: 8 }}
                 />
                 Demo-Only By Default
+              </label>
+              <div className="text-sm text-muted" style={{ marginTop: 6, lineHeight: 1.5 }}>
+                Keep this enabled for demo accounts. Turn it off only when you intentionally want a live MT5 account to connect and the backend has live trading enabled.
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={policy.auto_trading_allowed ?? false}
+                  onChange={(e) => update('auto_trading_allowed', e.target.checked)}
+                  style={{ marginRight: 8 }}
+                />
+                Auto-Trading Allowed By This Profile
+              </label>
+            </div>
+
+            <div className="form-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={policy.live_execution_allowed ?? false}
+                  onChange={(e) => update('live_execution_allowed', e.target.checked)}
+                  style={{ marginRight: 8 }}
+                />
+                Live Execution Allowed By This Profile
               </label>
             </div>
           </div>
@@ -435,7 +558,7 @@ export default function RiskManagement({ status }: Props) {
           <button className="btn btn-secondary" onClick={refreshSettings} disabled={loading}>
             Reset to Saved
           </button>
-          {saved && <span className="text-green text-sm">Policy saved</span>}
+          {saved && <span className="text-green text-sm">Policy saved and verified</span>}
           {!saved && !loading && <span className="text-sm text-muted">Preset changes now auto-save when selected.</span>}
         </div>
       </div>
@@ -474,11 +597,19 @@ export default function RiskManagement({ status }: Props) {
             </div>
             <div className="text-sm text-muted">Policy role: {policy.gemini_role}</div>
             <div className="text-sm text-muted">
-              Gemini state: {status?.gemini_degraded ? 'Degraded' : status?.gemini_available ? 'Available' : 'Offline'}
+              Gemini state: {status?.gemini_state === 'cooldown' ? 'Cooldown' : status?.gemini_state === 'ready' ? 'Ready' : status?.gemini_degraded ? 'Degraded' : status?.gemini_available ? 'Available' : 'Offline'}
             </div>
             <div className="text-sm text-muted">
-              Finnhub: {!finnhub?.enabled ? 'Disabled' : finnhub?.available ? 'Available' : finnhub?.degraded ? 'Degraded' : 'Offline'}
+              Benzinga: {!benzinga?.enabled ? 'Disabled' : benzinga?.available ? 'Available' : benzinga?.degraded ? 'Degraded' : 'Offline'}
             </div>
+            <div className="text-sm text-muted">
+              API keys: {apiKeysHealth?.overall_status === 'healthy' ? 'Healthy' : `${unhealthyApiKeys.length || apiKeysHealth?.unhealthy_count || 0} issue(s)`}
+            </div>
+            {unhealthyApiKeys.slice(0, 3).map((item) => (
+              <div key={item.id} className="text-sm text-muted">
+                - {item.name}: {item.status}{item.reason ? ` (${item.reason})` : ''}
+              </div>
+            ))}
           </div>
 
           <div className="card" style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}>
@@ -497,7 +628,36 @@ export default function RiskManagement({ status }: Props) {
             <div className="card-header" style={{ paddingBottom: 8 }}>
               <h3 style={{ fontSize: 15 }}>Live Runtime Gates</h3>
             </div>
+            {liveReadiness && (
+              <div
+                style={{
+                  border: `1px solid ${liveReadinessColor}`,
+                  borderRadius: 8,
+                  padding: '10px 12px',
+                  marginBottom: 12,
+                  background: 'var(--bg-tertiary)',
+                }}
+              >
+                <div style={{ color: liveReadinessColor, fontWeight: 700, marginBottom: 6 }}>
+                  Real-money MT5: {liveReadiness.can_execute_live_orders ? 'Ready' : 'Blocked'}
+                </div>
+                {(liveReadiness.blockers || []).slice(0, 4).map((item, index) => (
+                  <div key={`live-blocker-${index}`} className="text-sm text-muted">
+                    - {item}
+                  </div>
+                ))}
+                {(!liveReadiness.blockers || liveReadiness.blockers.length === 0) && (liveReadiness.warnings || []).slice(0, 3).map((item, index) => (
+                  <div key={`live-warning-${index}`} className="text-sm text-muted">
+                    - {item}
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="text-sm text-muted" style={{ lineHeight: 1.9 }}>
+              <div>- Account mode: {accountModeLabel}.</div>
+              <div>- Live trading config: {status?.live_trading_enabled ? 'Enabled' : 'Disabled'}.</div>
+              <div>- Demo-only policy: {policy.demo_only_default ? 'On - live accounts are rejected' : 'Off - live accounts may connect if backend live trading is enabled'}.</div>
+              <div>- Trade server: {liveReadiness?.checks?.trade_server_connected ? 'Connected' : 'Not verified'}.</div>
               <div>- Spread quality is checked again just before execution.</div>
               <div>- Volatility regime is inferred from ATR and symbol profile.</div>
               <div>- Execution feasibility checks tradeability, margin, and reward:risk at live price.</div>

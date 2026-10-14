@@ -158,6 +158,136 @@ class NewsAndTradeDecisionServiceTests(unittest.TestCase):
         self.assertEqual(decision.final_signal.action, "HOLD")
         self.assertTrue(any("Gemini confirmation" in reason for reason in decision.reasons))
 
+    def test_trade_decision_ignores_non_finite_gemini_confidence_adjustment(self):
+        service = TradeDecisionService()
+        context = self._context()
+        technical_signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=0.82,
+            stop_loss=1.097,
+            take_profit=1.108,
+            reason="Technical breakout setup.",
+            metadata={
+                "h1_trend": "bullish",
+                "h4_trend": "bullish",
+                "momentum_score": 0.15,
+                "entry_score": 0.1,
+                "entry_signal": "buy",
+                "atr_pct": 0.32,
+                "position_in_range": 0.2,
+                "ema_distance_atr": 0.55,
+            },
+        )
+        gemini = GeminiAssessment(
+            used=True,
+            available=True,
+            news_bias="bullish",
+            macro_relevance="medium",
+            event_risk="low",
+            confidence_adjustment=float("nan"),
+            summary_reason="News supports the technical setup.",
+            affected_symbols=["EURUSD"],
+        )
+
+        decision = service.decide(context, technical_signal, gemini, portfolio_fit_score=0.8)
+
+        self.assertEqual(decision.final_signal.confidence, 0.82)
+
+    def test_trade_decision_handles_malformed_base_confidence(self):
+        service = TradeDecisionService()
+        context = self._context()
+        technical_signal = TechnicalSignal.model_construct(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence="bad-confidence",
+            stop_loss=1.097,
+            take_profit=1.106,
+            reason="Technical breakout setup.",
+            metadata={
+                "h1_trend": "bullish",
+                "h4_trend": "bullish",
+                "momentum_score": 0.15,
+                "entry_score": 0.1,
+                "entry_signal": "buy",
+                "atr_pct": 0.32,
+                "position_in_range": 0.2,
+                "ema_distance_atr": 0.55,
+            },
+        )
+        gemini = GeminiAssessment(
+            used=True,
+            available=True,
+            news_bias="bullish",
+            macro_relevance="medium",
+            event_risk="low",
+            confidence_adjustment=0.05,
+            summary_reason="News supports the technical setup.",
+            affected_symbols=["EURUSD"],
+        )
+
+        decision = service.decide(context, technical_signal, gemini, portfolio_fit_score=0.8)
+
+        self.assertEqual(decision.final_signal.confidence, 0.05)
+
+    def test_trade_decision_normalizes_action_before_quality_gate(self):
+        service = TradeDecisionService()
+        context = self._context()
+        technical_signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=0.82,
+            stop_loss=1.097,
+            take_profit=1.108,
+            reason="Technical breakout setup.",
+            metadata={
+                "h1_trend": "bullish",
+                "h4_trend": "bullish",
+                "momentum_score": 0.15,
+                "entry_score": 0.1,
+                "entry_signal": "buy",
+                "atr_pct": 0.32,
+                "position_in_range": 0.2,
+                "ema_distance_atr": 0.55,
+            },
+        )
+        technical_signal.action = " buy "
+
+        decision = service.decide(context, technical_signal, None, portfolio_fit_score=0.8)
+
+        self.assertTrue(decision.trade)
+        self.assertEqual(decision.final_direction, "BUY")
+        self.assertEqual(decision.final_signal.action, "BUY")
+
+    def test_trade_decision_normalizes_sell_action_before_quality_gate(self):
+        service = TradeDecisionService()
+        context = self._context()
+        technical_signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="SELL",
+            confidence=0.82,
+            stop_loss=1.103,
+            take_profit=1.092,
+            reason="Technical breakdown setup.",
+            metadata={
+                "h1_trend": "bearish",
+                "h4_trend": "bearish",
+                "momentum_score": 0.15,
+                "entry_score": 0.1,
+                "entry_signal": "sell",
+                "atr_pct": 0.32,
+                "position_in_range": 0.2,
+                "ema_distance_atr": 0.55,
+            },
+        )
+        technical_signal.action = " sell "
+
+        decision = service.decide(context, technical_signal, None, portfolio_fit_score=0.8)
+
+        self.assertTrue(decision.trade)
+        self.assertEqual(decision.final_direction, "SELL")
+        self.assertEqual(decision.final_signal.action, "SELL")
+
     def _run(self, coro):
         import asyncio
 

@@ -6,6 +6,8 @@ from typing import Optional
 
 from domain.models import AntiChurnAssessment, MarketContext, TechnicalSignal, TradeQualityAssessment
 
+NEAR_ENTRY_RECOVERY_PCT = 0.0015  # 0.15% around entry.
+
 
 class AntiChurnService:
     def __init__(self):
@@ -37,35 +39,72 @@ class AntiChurnService:
         reasons: list[str] = []
         threshold_boost = 0.0
         symbol = context.symbol.upper()
+        direction = str(signal.action or "").upper()
+        hedge_opposite_loser = self._is_opposite_hedge_candidate(
+            positions=context.symbol_open_positions,
+            direction=direction,
+        )
 
-        if scan_window_id:
+        # Do not pyramid into the same direction while that symbol is already losing.
+        # This avoids repeated averaging/add-on entries when market structure is invalidating.
+        if context.symbol_open_positions:
+            losing_same_direction_open = []
+            for pos in context.symbol_open_positions:
+                pos_dir = self._normalize_direction(pos.get("type") or pos.get("action"))
+                pos_profit = self._position_profit(pos)
+                if (
+                    pos_dir == direction
+                    and pos_profit is not None
+                    and pos_profit < 0
+                    and not self._is_position_near_entry_recovery(pos)
+                ):
+                    losing_same_direction_open.append(pos)
+            if losing_same_direction_open:
+                reasons.append(
+                    f"{symbol} already has {direction} position(s) in loss; add-on entry is blocked until recovery near entry or exit."
+                )
+
+        if scan_window_id and not hedge_opposite_loser:
             seen = self._scan_window_entries.setdefault(scan_window_id, set())
             if symbol in seen:
                 reasons.append("Symbol already opened once in the current scan window.")
 
         if recent_outcomes:
-            if len(recent_outcomes) >= max(max_trades_per_symbol, 1):
+            if (not hedge_opposite_loser) and len(recent_outcomes) >= max(max_trades_per_symbol, 1):
                 reasons.append(
                     f"User policy caps {symbol} to {max_trades_per_symbol} trade(s) in the recent trading window."
                 )
-            for outcome in recent_outcomes:
-                minutes_since = self._minutes_since(outcome.get("closed_at") or outcome.get("timestamp"))
-                if minutes_since is not None and minutes_since < cooldown_minutes:
-                    reasons.append(f"Recent {symbol} exit is still inside cooldown ({minutes_since:.0f}m ago).")
-                    break
+            if not hedge_opposite_loser:
+                for outcome in recent_outcomes:
+                    minutes_since = self._minutes_since(outcome.get("closed_at") or outcome.get("timestamp"))
+                    if minutes_since is not None and minutes_since < cooldown_minutes:
+                        reasons.append(f"Recent {symbol} exit is still inside cooldown ({minutes_since:.0f}m ago).")
+                        break
 
             failed_same_side = [
                 outcome for outcome in recent_outcomes[:2]
-                if float(outcome.get("profit", 0.0)) <= 0
-                and outcome.get("action") == signal.action
+                if self._outcome_profit(outcome) <= 0
+                and self._normalize_direction(outcome.get("action")) == direction
             ]
             if len(failed_same_side) >= 1:
                 threshold_boost += 0.05
             if len(failed_same_side) >= 2:
                 threshold_boost += 0.03
 
+            same_side_recent = [
+                outcome for outcome in recent_outcomes[:4]
+                if self._normalize_direction(outcome.get("action")) == direction
+            ]
+            same_side_losses = [outcome for outcome in same_side_recent if self._outcome_profit(outcome) < 0]
+            if len(same_side_recent) >= 3 and len(same_side_losses) >= 3:
+                reasons.append(
+                    f"Recent {symbol} {direction} streak is underperforming ({len(same_side_losses)}/{len(same_side_recent)} losses); re-entry blocked."
+                )
+
             last_outcome = recent_outcomes[0]
             if (
+                (not hedge_opposite_loser)
+                and
                 last_outcome.get("action") in {"BUY", "SELL"}
                 and last_outcome.get("action") != signal.action
                 and self._minutes_since(last_outcome.get("closed_at") or last_outcome.get("timestamp")) is not None
@@ -79,7 +118,7 @@ class AntiChurnService:
                 journal for journal in recent_evaluations
                 if self._counts_as_opened_trade(journal)
             ]
-            if len(opened_only) >= max(max_trades_per_symbol, 1):
+            if (not hedge_opposite_loser) and len(opened_only) >= max(max_trades_per_symbol, 1):
                 reasons.append(
                     f"{symbol} already hit the recent per-symbol trade cap in this policy."
                 )
@@ -106,6 +145,62 @@ class AntiChurnService:
                 "recent_evaluations_checked": len(recent_evaluations or []),
             },
         )
+
+    def _normalize_direction(self, value: object) -> str:
+        raw = str(value or "").strip().upper()
+        if raw in {"BUY", "SELL"}:
+            return raw
+        if raw in {"LONG"}:
+            return "BUY"
+        if raw in {"SHORT"}:
+            return "SELL"
+        return ""
+
+    def _outcome_profit(self, outcome: dict) -> float:
+        for key in ("profit", "profit_usd", "pnl", "net_pnl"):
+            try:
+                val = outcome.get(key)
+                if val is not None:
+                    return float(val)
+            except Exception:
+                continue
+        return 0.0
+
+    def _position_profit(self, position: dict) -> float | None:
+        for key in ("profit", "profit_usd", "pnl", "net_pnl"):
+            try:
+                val = position.get(key)
+                if val is not None:
+                    return float(val)
+            except Exception:
+                continue
+        return None
+
+    def _is_position_near_entry_recovery(self, position: dict) -> bool:
+        try:
+            entry = float(position.get("price_open", 0.0) or 0.0)
+            current = float(
+                position.get("price_current", 0.0)
+                or position.get("current_price", 0.0)
+                or position.get("price", 0.0)
+                or 0.0
+            )
+        except Exception:
+            return False
+        if entry <= 0 or current <= 0:
+            return False
+        distance_pct = abs(current - entry) / entry
+        return distance_pct <= NEAR_ENTRY_RECOVERY_PCT
+
+    def _is_opposite_hedge_candidate(self, *, positions: list[dict] | None, direction: str) -> bool:
+        if direction not in {"BUY", "SELL"} or not positions:
+            return False
+        for pos in positions:
+            pos_dir = self._normalize_direction(pos.get("type") or pos.get("action"))
+            pos_profit = self._position_profit(pos)
+            if pos_dir and pos_dir != direction and pos_profit is not None and pos_profit < 0:
+                return True
+        return False
 
     def _counts_as_opened_trade(self, journal: dict) -> bool:
         status = str(journal.get("outcome_status", "")).lower()
@@ -147,4 +242,10 @@ class AntiChurnService:
     def _minutes_since(self, timestamp: float | None) -> float | None:
         if not timestamp:
             return None
-        return max(0.0, (time.time() - float(timestamp)) / 60.0)
+        try:
+            parsed = float(timestamp)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed <= 0:
+            return None
+        return max(0.0, (time.time() - parsed) / 60.0)

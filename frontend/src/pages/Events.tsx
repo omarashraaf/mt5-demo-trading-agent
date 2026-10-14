@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { RefreshCcw, Newspaper, Link as LinkIcon } from 'lucide-react';
 import { api } from '../utils/api';
-import type { EventAssetMappingRecord, ExternalEventRecord, GeminiEventAssessmentRecord, ProviderHealth } from '../types';
+import type { EventAssetMappingRecord, EventMarketRecommendation, ExternalEventRecord, GeminiEventAssessmentRecord, ProviderHealth } from '../types';
 
 function formatTs(ts?: number): string {
   if (!ts || ts <= 0) return '-';
@@ -17,6 +17,28 @@ function parseJsonField(raw?: string): unknown {
   }
 }
 
+function stripHtml(raw: string): string {
+  return String(raw || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function summarizeEvent(ev: ExternalEventRecord): string {
+  const payload = (ev.raw_payload || {}) as Record<string, unknown>;
+  const base = stripHtml(String(ev.summary || ''));
+  if (base) return base;
+  if (ev.event_type === 'economic_calendar') {
+    const description = stripHtml(String(payload.description || ''));
+    if (description) return description;
+  }
+  return '';
+}
+
 export default function EventsPage() {
   const UI_REFRESH_MS = 5000;
   const INGEST_REFRESH_MS = 30000;
@@ -24,50 +46,39 @@ export default function EventsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [health, setHealth] = useState<ProviderHealth | null>(null);
-  const [activePlatform, setActivePlatform] = useState<'mt5' | 'ibkr'>('mt5');
-  const [activeTab, setActiveTab] = useState<'all' | 'ibkr'>('all');
-  const [ibkrSymbols, setIbkrSymbols] = useState<string[]>([]);
   const [events, setEvents] = useState<ExternalEventRecord[]>([]);
   const [mappings, setMappings] = useState<EventAssetMappingRecord[]>([]);
   const [assessments, setAssessments] = useState<GeminiEventAssessmentRecord[]>([]);
+  const [recommendations, setRecommendations] = useState<EventMarketRecommendation[]>([]);
   const [refreshSummary, setRefreshSummary] = useState<string>('');
   const [liveEnabled, setLiveEnabled] = useState(true);
   const [lastLiveSyncAt, setLastLiveSyncAt] = useState<number | null>(null);
   const [liveBusy, setLiveBusy] = useState(false);
+  const [analysisBusy, setAnalysisBusy] = useState(false);
+  const [eventView, setEventView] = useState<'all' | 'market_news' | 'economic_calendar'>('all');
 
   const load = useCallback(async () => {
     try {
       setError(null);
-      const [status, h, e, m, a] = await Promise.all([
-        api.getStatus(),
-        api.getFinnhubHealth(),
-        api.getLatestEvents(25),
+      const [h, e, m, a, recs] = await Promise.all([
+        api.getBenzingaHealth(),
+        api.getFilteredEvents({ limit: 60, orderBy: 'created', eventType: eventView === 'all' ? undefined : eventView }),
         api.getEventMappings(50),
         api.getGeminiEventAssessments(25),
+        api.getEventRecommendations({ limit: 8, forceRefresh: false, classifyWithGemini: false }).catch(() => ({ recommendations: [], count: 0, provider: null })),
       ]);
-      setActivePlatform((status.platform || 'mt5') as 'mt5' | 'ibkr');
       setHealth(h.provider);
       setEvents(e.events || []);
       setMappings(m.mappings || []);
       setAssessments(a.assessments || []);
-      const universe = ((h as unknown as { universe?: Record<string, unknown> }).universe || {}) as Record<string, unknown>;
-      const fallbackRaw = universe['auto_trade_fallback_symbols'];
-      const enabledRaw = universe['enabled_symbols'];
-      const fallback = Array.isArray(fallbackRaw)
-        ? fallbackRaw
-        : [];
-      const enabled = Array.isArray(enabledRaw) ? enabledRaw : [];
-      const symbols = (enabled.length > 0 ? enabled : fallback)
-        .map((s) => String(s || '').toUpperCase())
-        .filter(Boolean);
-      setIbkrSymbols(symbols);
+      setRecommendations(recs.recommendations || []);
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to load Finnhub data.';
+      const message = err instanceof Error ? err.message : 'Failed to load Benzinga data.';
       setError(message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [eventView]);
 
   useEffect(() => {
     load();
@@ -100,12 +111,6 @@ export default function EventsPage() {
     return () => clearInterval(t);
   }, [liveEnabled, runLiveIngest]);
 
-  useEffect(() => {
-    if (activePlatform !== 'ibkr' && activeTab === 'ibkr') {
-      setActiveTab('all');
-    }
-  }, [activePlatform, activeTab]);
-
   const onRefreshNow = async () => {
     try {
       setRefreshing(true);
@@ -123,26 +128,24 @@ export default function EventsPage() {
     }
   };
 
-  const ibkrSymbolSet = new Set(ibkrSymbols.map((s) => s.toUpperCase()));
-  const ibkrEventIds = new Set(
-    mappings
-      .filter((m) => ibkrSymbolSet.has(String(m.symbol || '').toUpperCase()))
-      .map((m) => m.external_event_id),
-  );
-  const filteredEvents = activeTab === 'ibkr'
-    ? events.filter((ev) => {
-      const direct = (ev.affected_assets || []).some((a) => ibkrSymbolSet.has(String(a || '').toUpperCase()));
-      return direct || ibkrEventIds.has(ev.id);
-    })
-    : events;
-  const filteredMappings = activeTab === 'ibkr'
-    ? mappings.filter((m) => ibkrSymbolSet.has(String(m.symbol || '').toUpperCase()))
-    : mappings;
-  const filteredAssessments = activeTab === 'ibkr'
-    ? assessments.filter((a) => ibkrEventIds.has(a.external_event_id))
-    : assessments;
+  const onAnalyzeMarkets = async () => {
+    try {
+      setAnalysisBusy(true);
+      setError(null);
+      const out = await api.getEventRecommendations({ limit: 8, forceRefresh: true, classifyWithGemini: true });
+      setRecommendations(out.recommendations || []);
+      await load();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Gemini market analysis failed.';
+      setError(message);
+    } finally {
+      setAnalysisBusy(false);
+    }
+  };
 
-  const showIbkrTab = activePlatform === 'ibkr';
+  const filteredEvents = events;
+  const filteredMappings = mappings;
+  const filteredAssessments = assessments;
   const statusLabel = health?.partial_news_only ? 'News Only' : health?.degraded ? 'Degraded' : 'Healthy';
   const statusBadgeClass = health?.partial_news_only
     ? 'badge-blue'
@@ -156,7 +159,7 @@ export default function EventsPage() {
         <div>
           <h2 className="text-white text-lg font-semibold flex items-center gap-2">
             <Newspaper size={18} />
-            Finnhub News Feed
+            Benzinga News Feed
           </h2>
           <p className="text-muted" style={{ marginTop: 4 }}>
             Live external events, mapped assets, and Gemini event assessments.
@@ -174,6 +177,9 @@ export default function EventsPage() {
           <button className="btn btn-secondary" onClick={onRefreshNow} disabled={refreshing}>
             <RefreshCcw size={14} />
             {refreshing ? 'Refreshing...' : 'Refresh Now'}
+          </button>
+          <button className="btn btn-primary" onClick={onAnalyzeMarkets} disabled={analysisBusy}>
+            {analysisBusy ? 'Gemini Analyzing...' : 'Gemini Analyze Markets'}
           </button>
         </div>
       </div>
@@ -211,20 +217,27 @@ export default function EventsPage() {
             <div className="flex justify-between items-center mb-3">
               <h3 className="text-white">Latest Events ({filteredEvents.length})</h3>
               <div className="flex items-center gap-2">
-                <button
-                  className={`btn btn-sm ${activeTab === 'all' ? 'btn-primary' : 'btn-secondary'}`}
-                  onClick={() => setActiveTab('all')}
-                >
+                <button className="btn btn-sm btn-primary">
                   All
                 </button>
-                {showIbkrTab && (
-                  <button
-                    className={`btn btn-sm ${activeTab === 'ibkr' ? 'btn-primary' : 'btn-secondary'}`}
-                    onClick={() => setActiveTab('ibkr')}
-                  >
-                    IBKR
-                  </button>
-                )}
+                <button
+                  className={`btn btn-sm ${eventView === 'market_news' ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={() => setEventView('market_news')}
+                >
+                  News
+                </button>
+                <button
+                  className={`btn btn-sm ${eventView === 'economic_calendar' ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={() => setEventView('economic_calendar')}
+                >
+                  Calendar
+                </button>
+                <button
+                  className={`btn btn-sm ${eventView === 'all' ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={() => setEventView('all')}
+                >
+                  Mixed
+                </button>
               </div>
             </div>
             <div style={{ maxHeight: 560, overflowY: 'auto' }}>
@@ -241,7 +254,28 @@ export default function EventsPage() {
                       <span className="text-muted text-xs">{formatTs(ev.timestamp_utc)}</span>
                     </div>
                     <div className="text-white" style={{ fontSize: 14, fontWeight: 600 }}>{ev.title}</div>
-                    {ev.summary && <div className="text-muted" style={{ fontSize: 12, marginTop: 4 }}>{ev.summary}</div>}
+                    {summarizeEvent(ev) && (
+                      <div className="text-muted" style={{ fontSize: 12, marginTop: 4 }}>
+                        {summarizeEvent(ev).slice(0, 320)}
+                        {summarizeEvent(ev).length > 320 ? '...' : ''}
+                      </div>
+                    )}
+                    {Array.isArray(ev.affected_assets) && ev.affected_assets.length > 0 && (
+                      <div className="text-muted text-xs" style={{ marginTop: 6 }}>
+                        Markets: {ev.affected_assets.slice(0, 8).join(', ')}
+                      </div>
+                    )}
+                    {typeof (ev.raw_payload as Record<string, unknown> | undefined)?.url === 'string' && (
+                      <a
+                        href={String((ev.raw_payload as Record<string, unknown>).url)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-sm"
+                        style={{ display: 'inline-block', marginTop: 6 }}
+                      >
+                        Open source article
+                      </a>
+                    )}
                   </div>
                 ))
               )}
@@ -249,6 +283,26 @@ export default function EventsPage() {
           </div>
 
           <div className="grid gap-4">
+            <div className="card" style={{ background: 'rgba(255,255,255,0.02)' }}>
+              <h3 className="text-white mb-3">Gemini Market Recommendations ({recommendations.length})</h3>
+              <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+                {recommendations.length === 0 ? (
+                  <div className="empty-state">Run Gemini Analyze Markets to rank symbols from Benzinga events.</div>
+                ) : (
+                  recommendations.map((item) => (
+                    <div key={item.symbol} style={{ padding: '8px 0', borderBottom: '1px solid rgba(255,255,255,0.07)' }}>
+                      <div className="flex items-center justify-between">
+                        <strong>{item.symbol}</strong>
+                        <span className="badge badge-green">Watch</span>
+                      </div>
+                      <div className="text-muted text-xs" style={{ marginTop: 4 }}>
+                        {item.news?.[0]?.summary || item.news?.[0]?.title || 'Recent Benzinga event context available.'}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
             <div className="card" style={{ background: 'rgba(255,255,255,0.02)' }}>
               <h3 className="text-white mb-3">Asset Mappings ({filteredMappings.length})</h3>
               <div style={{ maxHeight: 260, overflowY: 'auto' }}>
@@ -304,7 +358,7 @@ export default function EventsPage() {
 
       <div className="text-muted mt-4" style={{ fontSize: 12 }}>
         <LinkIcon size={12} style={{ display: 'inline', marginRight: 6 }} />
-        Source endpoints: <code>/events/finnhub/health</code>, <code>/events/refresh</code>, <code>/events/latest</code>, <code>/events/mappings</code>, <code>/events/gemini-assessments</code>
+        Source endpoints: <code>/events/benzinga/health</code>, <code>/events/refresh</code>, <code>/events/latest</code>, <code>/events/mappings</code>, <code>/events/gemini-assessments</code>
       </div>
     </div>
   );

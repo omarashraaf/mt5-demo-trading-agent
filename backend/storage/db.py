@@ -58,8 +58,47 @@ CREATE TABLE IF NOT EXISTS orders (
     retcode INTEGER,
     retcode_desc TEXT,
     comment TEXT DEFAULT '',
+    idempotency_key TEXT DEFAULT '',
+    account_key TEXT DEFAULT '',
+    execution_context TEXT DEFAULT '',
+    execution_mode TEXT DEFAULT 'live',
     success INTEGER NOT NULL,
     FOREIGN KEY (signal_id) REFERENCES signals(id)
+);
+
+CREATE TABLE IF NOT EXISTS simulated_execution_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    order_id INTEGER,
+    signal_id INTEGER,
+    symbol TEXT NOT NULL,
+    action TEXT NOT NULL,
+    volume REAL NOT NULL,
+    price REAL,
+    stop_loss REAL,
+    take_profit REAL,
+    execution_mode TEXT NOT NULL,
+    idempotency_key TEXT DEFAULT '',
+    account_key TEXT DEFAULT '',
+    execution_context TEXT DEFAULT '',
+    result_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS execution_preflight_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    symbol TEXT NOT NULL,
+    action TEXT NOT NULL,
+    requested_volume REAL,
+    stop_loss REAL,
+    take_profit REAL,
+    execution_mode TEXT DEFAULT '',
+    idempotency_key TEXT DEFAULT '',
+    account_key TEXT DEFAULT '',
+    execution_context TEXT DEFAULT '',
+    approved INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS position_changes (
@@ -368,6 +407,7 @@ CREATE TABLE IF NOT EXISTS user_access (
     requested_at REAL NOT NULL,
     approved_at REAL,
     approved_by_user_id TEXT DEFAULT '',
+    permissions_json TEXT DEFAULT '{}',
     notes TEXT DEFAULT ''
 );
 
@@ -387,6 +427,12 @@ CREATE INDEX IF NOT EXISTS idx_orders_timestamp
     ON orders(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_signal_id
     ON orders(signal_id);
+CREATE INDEX IF NOT EXISTS idx_execution_preflight_symbol_ts
+    ON execution_preflight_snapshots(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_preflight_idempotency
+    ON execution_preflight_snapshots(idempotency_key, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_simulated_execution_results_ts
+    ON simulated_execution_results(timestamp DESC, symbol);
 CREATE INDEX IF NOT EXISTS idx_risk_decisions_signal_ts
     ON risk_decisions(signal_id, timestamp DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_eval_journal_symbol_timestamp
@@ -395,6 +441,9 @@ CREATE INDEX IF NOT EXISTS idx_trade_outcomes_symbol_closed_at
     ON trade_outcomes(symbol, closed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ai_activity_symbol_timestamp
     ON ai_activity(symbol, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ai_activity_timestamp
+    ON ai_activity(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_trade_candidates_symbol_timestamp
     ON trade_candidates(symbol, timestamp_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_feature_snapshots_candidate_created
@@ -421,22 +470,26 @@ class Database:
     def set_trade_outcome_callback(self, callback: Optional[Callable[[dict], Awaitable[None] | None]]):
         self._trade_outcome_callback = callback
 
-    async def _emit_cloud_log(self, event_type: str, payload: dict):
+    async def _emit_cloud_log(self, event_type: str, payload: dict) -> bool:
         if self._cloud_log_sink is None:
-            return
+            return False
         try:
             await self._cloud_log_sink(event_type, payload)
+            return True
         except Exception:
-            pass
+            return False
 
     async def initialize(self):
-        self._db = await aiosqlite.connect(self.path)
+        # Give SQLite longer to wait on WAL writer locks during concurrent
+        # background scans and position-manager persistence bursts.
+        self._db = await aiosqlite.connect(self.path, timeout=15.0)
         # SQLite durability/concurrency settings to reduce lock contention in
         # concurrent scanner + auto-trader write bursts.
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
-        await self._db.execute("PRAGMA busy_timeout=5000")
+        await self._db.execute("PRAGMA temp_store=MEMORY")
+        await self._db.execute("PRAGMA busy_timeout=15000")
         await self._db.executescript(SCHEMA)
         await self._migrate_schema()
         await self._db.commit()
@@ -458,6 +511,90 @@ class Database:
             await self._db.execute(
                 "ALTER TABLE saved_credentials ADD COLUMN secret_backend TEXT DEFAULT ''"
             )
+        if "password" in columns:
+            await self._db.execute(
+                "UPDATE saved_credentials SET password = '' WHERE COALESCE(password, '') <> ''"
+            )
+        cursor = await self._db.execute("PRAGMA table_info(orders)")
+        rows = await cursor.fetchall()
+        order_columns = {row[1] for row in rows}
+        if "idempotency_key" not in order_columns:
+            await self._db.execute(
+                "ALTER TABLE orders ADD COLUMN idempotency_key TEXT DEFAULT ''"
+            )
+        if "account_key" not in order_columns:
+            await self._db.execute(
+                "ALTER TABLE orders ADD COLUMN account_key TEXT DEFAULT ''"
+            )
+        if "execution_context" not in order_columns:
+            await self._db.execute(
+                "ALTER TABLE orders ADD COLUMN execution_context TEXT DEFAULT ''"
+            )
+        if "execution_mode" not in order_columns:
+            await self._db.execute(
+                "ALTER TABLE orders ADD COLUMN execution_mode TEXT DEFAULT 'live'"
+            )
+        cursor = await self._db.execute("PRAGMA table_info(user_access)")
+        rows = await cursor.fetchall()
+        user_access_columns = {row[1] for row in rows}
+        if "permissions_json" not in user_access_columns:
+            await self._db.execute(
+                "ALTER TABLE user_access ADD COLUMN permissions_json TEXT DEFAULT '{}'"
+            )
+        await self._db.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency
+            ON orders(idempotency_key, account_key, execution_context)
+            WHERE idempotency_key <> ''"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS simulated_execution_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                order_id INTEGER,
+                signal_id INTEGER,
+                symbol TEXT NOT NULL,
+                action TEXT NOT NULL,
+                volume REAL NOT NULL,
+                price REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                execution_mode TEXT NOT NULL,
+                idempotency_key TEXT DEFAULT '',
+                account_key TEXT DEFAULT '',
+                execution_context TEXT DEFAULT '',
+                result_json TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_simulated_execution_results_ts
+            ON simulated_execution_results(timestamp DESC, symbol)"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS execution_preflight_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                symbol TEXT NOT NULL,
+                action TEXT NOT NULL,
+                requested_volume REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                execution_mode TEXT DEFAULT '',
+                idempotency_key TEXT DEFAULT '',
+                account_key TEXT DEFAULT '',
+                execution_context TEXT DEFAULT '',
+                approved INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_execution_preflight_symbol_ts
+            ON execution_preflight_snapshots(symbol, timestamp DESC)"""
+        )
+        await self._db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_execution_preflight_idempotency
+            ON execution_preflight_snapshots(idempotency_key, timestamp DESC)"""
+        )
         cursor = await self._db.execute("PRAGMA table_info(evaluation_journal)")
         rows = await cursor.fetchall()
         if rows:
@@ -635,8 +772,18 @@ class Database:
         retcode_desc: str,
         success: bool,
         comment: str = "",
+        idempotency_key: str = "",
+        account_key: str = "",
+        execution_context: str = "",
+        execution_mode: str = "live",
     ):
         ts = time.time()
+        idempotency_key = str(idempotency_key or "").strip()
+        account_key = str(account_key or "").strip()
+        execution_context = str(execution_context or "").strip()
+        execution_mode = str(execution_mode or "live").strip().lower()
+        if execution_mode not in {"paper", "shadow", "live"}:
+            execution_mode = "live"
         payload = (
             ts,
             signal_id,
@@ -650,16 +797,34 @@ class Database:
             retcode,
             retcode_desc,
             comment or "",
+            idempotency_key,
+            account_key,
+            execution_context,
+            execution_mode,
             int(success),
         )
+        inserted_order_id: int | None = None
         try:
-            await self._db.execute(
+            cursor = await self._db.execute(
                 """INSERT INTO orders
-                (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, comment, success)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, comment, idempotency_key, account_key, execution_context, execution_mode, success)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 payload,
             )
+            inserted_order_id = int(cursor.lastrowid or 0) or None
         except sqlite3.IntegrityError as exc:
+            exc_text = str(exc)
+            if idempotency_key and (
+                "idx_orders_idempotency" in exc_text
+                or "orders.idempotency_key" in exc_text
+            ):
+                logger.info(
+                    "Duplicate order idempotency key ignored: key=%s account=%s context=%s",
+                    idempotency_key[:12],
+                    account_key,
+                    execution_context,
+                )
+                return
             # Keep trading flow alive if a stale/missing signal FK appears under
             # concurrent scanner activity; fall back to nullable signal_id.
             logger.warning(
@@ -668,10 +833,10 @@ class Database:
                 symbol,
                 exc,
             )
-            await self._db.execute(
+            cursor = await self._db.execute(
                 """INSERT INTO orders
-                (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, comment, success)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, retcode, retcode_desc, comment, idempotency_key, account_key, execution_context, execution_mode, success)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ts,
                     None,
@@ -685,7 +850,43 @@ class Database:
                     retcode,
                     retcode_desc,
                     comment or "",
+                    idempotency_key,
+                    account_key,
+                    execution_context,
+                    execution_mode,
                     int(success),
+                ),
+            )
+            inserted_order_id = int(cursor.lastrowid or 0) or None
+        if execution_mode in {"paper", "shadow"}:
+            await self._db.execute(
+                """INSERT INTO simulated_execution_results
+                (timestamp, order_id, signal_id, symbol, action, volume, price, stop_loss, take_profit,
+                 execution_mode, idempotency_key, account_key, execution_context, result_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    ts,
+                    inserted_order_id,
+                    signal_id,
+                    symbol,
+                    action,
+                    volume,
+                    price,
+                    stop_loss,
+                    take_profit,
+                    execution_mode,
+                    idempotency_key,
+                    account_key,
+                    execution_context,
+                    json.dumps(
+                        {
+                            "retcode": retcode,
+                            "retcode_desc": retcode_desc,
+                            "success": bool(success),
+                            "comment": comment or "",
+                        },
+                        ensure_ascii=True,
+                    ),
                 ),
             )
         await self._db.commit()
@@ -701,9 +902,101 @@ class Database:
                 "ticket": ticket,
                 "retcode": retcode,
                 "retcode_desc": retcode_desc,
+                "idempotency_key": idempotency_key,
+                "account_key": account_key,
+                "execution_context": execution_context,
+                "execution_mode": execution_mode,
                 "success": bool(success),
             },
         )
+
+    async def get_orders_by_idempotency_key(
+        self,
+        *,
+        idempotency_key: str,
+        account_key: str = "",
+        execution_context: str = "",
+    ) -> list[dict]:
+        key = str(idempotency_key or "").strip()
+        if not key:
+            return []
+        cursor = await self._db.execute(
+            """SELECT * FROM orders
+               WHERE idempotency_key = ?
+                 AND account_key = ?
+                 AND execution_context = ?
+               ORDER BY id ASC""",
+            (key, str(account_key or "").strip(), str(execution_context or "").strip()),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def get_recent_successful_orders(self, *, limit: int = 300) -> list[dict]:
+        cursor = await self._db.execute(
+            """SELECT * FROM orders
+               WHERE success = 1
+                 AND ticket IS NOT NULL
+                 AND ticket > 0
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            (max(1, int(limit)),),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def get_recent_simulated_execution_results(self, *, limit: int = 100) -> list[dict]:
+        cursor = await self._db.execute(
+            """SELECT * FROM simulated_execution_results
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            (max(1, int(limit)),),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def log_execution_preflight_snapshot(
+        self,
+        *,
+        symbol: str,
+        action: str,
+        requested_volume: float,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+        execution_mode: str,
+        idempotency_key: str,
+        account_key: str,
+        execution_context: str,
+        approved: bool,
+        reason: str,
+        snapshot: dict,
+    ):
+        ts = time.time()
+        await self._db.execute(
+            """INSERT INTO execution_preflight_snapshots
+               (timestamp, symbol, action, requested_volume, stop_loss, take_profit,
+                execution_mode, idempotency_key, account_key, execution_context,
+                approved, reason, snapshot_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ts,
+                symbol,
+                action,
+                requested_volume,
+                stop_loss,
+                take_profit,
+                execution_mode,
+                idempotency_key,
+                account_key,
+                execution_context,
+                int(bool(approved)),
+                reason,
+                json.dumps(snapshot, ensure_ascii=True, default=str),
+            ),
+        )
+        await self._db.commit()
 
     async def log_position_change(
         self, ticket: int, event: str, symbol: str = "", details: str = ""
@@ -800,6 +1093,17 @@ class Database:
             for row in rows:
                 entry = dict(zip(cols, row))
                 entry["log_type"] = "error"
+                results.append(entry)
+
+        if log_type in ("all", "ai_activity"):
+            cursor = await self._db.execute(
+                "SELECT * FROM ai_activity ORDER BY timestamp DESC LIMIT ?", (limit,)
+            )
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            for row in rows:
+                entry = dict(zip(cols, row))
+                entry["log_type"] = "ai_activity"
                 results.append(entry)
 
         results.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
@@ -965,7 +1269,7 @@ class Database:
 
     async def get_ai_activity(self, limit: int = 50) -> list[dict]:
         cursor = await self._db.execute(
-            "SELECT * FROM ai_activity ORDER BY timestamp DESC LIMIT ?", (limit,)
+            "SELECT * FROM ai_activity ORDER BY id DESC LIMIT ?", (limit,)
         )
         rows = await cursor.fetchall()
         cols = [d[0] for d in cursor.description]
@@ -989,6 +1293,21 @@ class Database:
                ORDER BY o.timestamp DESC
                LIMIT 1""",
             (ticket,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
+    async def get_latest_order_by_signal_id(self, signal_id: int) -> Optional[dict]:
+        cursor = await self._db.execute(
+            """SELECT *
+               FROM orders
+               WHERE signal_id = ?
+               ORDER BY timestamp DESC, id DESC
+               LIMIT 1""",
+            (int(signal_id),),
         )
         row = await cursor.fetchone()
         if row is None:
@@ -1092,6 +1411,28 @@ class Database:
             ),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "evaluation_journal",
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "evaluation_mode": evaluation_mode,
+                "requested_agent_name": requested_agent_name,
+                "primary_agent_name": primary_agent_name,
+                "final_agent_name": final_agent_name,
+                "raw_technical_signal": raw_technical_signal,
+                "executable_signal": executable_signal,
+                "market_context_summary": market_context_summary,
+                "gemini_assessment": gemini_assessment,
+                "trade_quality": trade_quality,
+                "portfolio_risk": portfolio_risk,
+                "anti_churn": anti_churn,
+                "risk_evaluation": risk_evaluation,
+                "execution_decision": execution_decision,
+                "position_management_plan": position_management_plan,
+                "signal_id": signal_id,
+            },
+        )
         return cursor.lastrowid
 
     async def log_trade_candidate(
@@ -1170,6 +1511,40 @@ class Database:
             ),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "trade_candidate",
+            {
+                "candidate_id": candidate_id,
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "asset_class": asset_class,
+                "strategy_mode": strategy_mode,
+                "session": session,
+                "day_of_week": int(day_of_week),
+                "technical_direction": technical_direction,
+                "smart_agent_summary": smart_agent_summary,
+                "gemini_summary": gemini_summary,
+                "quality_score": float(quality_score or 0.0),
+                "confidence_score": float(confidence_score or 0.0),
+                "trend_h1": trend_h1,
+                "trend_h4": trend_h4,
+                "stop_loss": float(stop_loss or 0.0),
+                "take_profit": float(take_profit or 0.0),
+                "reward_risk": float(reward_risk or 0.0),
+                "spread_at_eval": float(spread_at_eval or 0.0),
+                "atr_regime": atr_regime,
+                "support_resistance_context": support_resistance_context,
+                "event_id": event_id,
+                "event_type": event_type,
+                "event_importance": event_importance,
+                "contradiction_flag": bool(contradiction_flag),
+                "risk_decision": risk_decision,
+                "rejection_reasons": list(rejection_reasons or []),
+                "executed": bool(executed),
+                "gemini_changed_decision": bool(gemini_changed_decision),
+                "meta_model_changed_decision": bool(meta_model_changed_decision),
+            },
+        )
         return int(cursor.lastrowid)
 
     async def log_feature_snapshot(
@@ -1193,6 +1568,15 @@ class Database:
             ),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "feature_snapshot",
+            {
+                "candidate_id": candidate_id,
+                "signal_id": signal_id,
+                "schema_version": schema_version,
+                "features": features or {},
+            },
+        )
         return int(cursor.lastrowid)
 
     async def mark_trade_candidate_execution(
@@ -1346,6 +1730,21 @@ class Database:
             result["plan_json"] = json.loads(result["plan_json"])
         return result
 
+    async def get_order_open_record(self, ticket: int) -> Optional[dict]:
+        cursor = await self._db.execute(
+            """SELECT id, timestamp, signal_id, symbol, action, volume, price, stop_loss, take_profit, ticket, success, comment
+               FROM orders
+               WHERE ticket = ? AND success = 1
+               ORDER BY timestamp ASC
+               LIMIT 1""",
+            (ticket,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
     async def update_position_management_plan_status(self, ticket: int, status: str):
         await self._db.execute(
             "UPDATE position_management_plans SET status = ?, updated_at = ? WHERE ticket = ?",
@@ -1368,6 +1767,7 @@ class Database:
         planned_hold_minutes: Optional[int] = None,
         outcome_json: Optional[dict] = None,
         ):
+        outcome_signal_id = await self._existing_signal_id(signal_id)
         await self._db.execute(
             """INSERT INTO trade_outcomes
             (timestamp, closed_at, ticket, signal_id, symbol, action, confidence, profit, exit_reason,
@@ -1377,7 +1777,7 @@ class Database:
                 time.time(),
                 time.time(),
                 ticket,
-                signal_id,
+                outcome_signal_id,
                 symbol,
                 action,
                 confidence,
@@ -1453,6 +1853,13 @@ class Database:
             except Exception:
                 logger.exception("Trade outcome callback failed")
 
+    async def _existing_signal_id(self, signal_id: Optional[int]) -> Optional[int]:
+        if signal_id is None:
+            return None
+        cursor = await self._db.execute("SELECT id FROM signals WHERE id = ? LIMIT 1", (signal_id,))
+        row = await cursor.fetchone()
+        return int(signal_id) if row is not None else None
+
     async def get_trade_outcome_by_ticket(self, ticket: int) -> Optional[dict]:
         cursor = await self._db.execute(
             "SELECT * FROM trade_outcomes WHERE ticket = ? ORDER BY closed_at DESC LIMIT 1",
@@ -1493,8 +1900,49 @@ class Database:
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in rows]
 
+    async def get_recent_app_trade_outcomes(self, limit: int = 50) -> list[dict]:
+        cursor = await self._db.execute(
+            """SELECT t.*
+               FROM trade_outcomes t
+               JOIN trade_candidates c
+                    ON c.executed = 1
+                   AND c.execution_ticket IS NOT NULL
+                   AND (
+                       (t.signal_id IS NOT NULL AND c.signal_id = t.signal_id)
+                       OR (t.ticket IS NOT NULL AND c.execution_ticket = t.ticket)
+                   )
+               WHERE c.signal_id IS NOT NULL
+                 AND COALESCE(t.ticket, c.execution_ticket) IS NOT NULL
+                 AND LOWER(COALESCE(t.exit_reason, '')) != 'broker_closed'
+               GROUP BY t.id
+               ORDER BY t.closed_at DESC
+               LIMIT ?""",
+            (max(1, min(int(limit or 50), 500)),),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+
     async def count_trade_outcomes(self) -> int:
         cursor = await self._db.execute("SELECT COUNT(*) FROM trade_outcomes")
+        row = await cursor.fetchone()
+        return int(row[0] or 0)
+
+    async def count_clean_app_trade_outcomes(self) -> int:
+        cursor = await self._db.execute(
+            """SELECT COUNT(DISTINCT t.id)
+               FROM trade_outcomes t
+               JOIN trade_candidates c
+                    ON c.executed = 1
+                   AND c.execution_ticket IS NOT NULL
+                   AND (
+                       (t.signal_id IS NOT NULL AND c.signal_id = t.signal_id)
+                       OR (t.ticket IS NOT NULL AND c.execution_ticket = t.ticket)
+                   )
+               WHERE c.signal_id IS NOT NULL
+                 AND COALESCE(t.ticket, c.execution_ticket) IS NOT NULL
+                 AND LOWER(COALESCE(t.exit_reason, '')) != 'broker_closed'"""
+        )
         row = await cursor.fetchone()
         return int(row[0] or 0)
 
@@ -1598,6 +2046,188 @@ class Database:
             mapped[sid] = item
         return mapped
 
+    async def get_trade_post_analysis_by_tickets(self, tickets: list[int]) -> dict[int, dict]:
+        ids = [int(ticket) for ticket in tickets if isinstance(ticket, int)]
+        if not ids:
+            return {}
+        placeholders = ",".join(["?"] * len(ids))
+        cursor = await self._db.execute(
+            f"""SELECT *
+                FROM trade_post_analysis
+                WHERE ticket IN ({placeholders})
+                ORDER BY updated_at DESC""",
+            tuple(ids),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        mapped: dict[int, dict] = {}
+        for row in rows:
+            item = dict(zip(cols, row))
+            ticket = item.get("ticket")
+            if not isinstance(ticket, int) or ticket in mapped:
+                continue
+            raw = item.get("analysis_json")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    item["analysis_json"] = json.loads(raw)
+                except Exception:
+                    item["analysis_json"] = {}
+            else:
+                item["analysis_json"] = {}
+            mapped[ticket] = item
+        return mapped
+
+    async def get_trade_audit_context_by_tickets(self, tickets: list[int]) -> dict[int, dict]:
+        ids = [int(ticket) for ticket in tickets if isinstance(ticket, int)]
+        if not ids:
+            return {}
+
+        placeholders = ",".join(["?"] * len(ids))
+        mapped: dict[int, dict] = {
+            ticket: {
+                "order": None,
+                "management_plan": None,
+                "position_changes": [],
+                "ai_activity": [],
+                "outcome": None,
+                "post_analysis": None,
+            }
+            for ticket in ids
+        }
+
+        cursor = await self._db.execute(
+            f"""SELECT o.*, s.agent_name, s.confidence, s.reason as signal_reason,
+                       r.approved, r.reason as risk_reason
+                FROM orders o
+                LEFT JOIN signals s ON o.signal_id = s.id
+                LEFT JOIN risk_decisions r
+                     ON r.id = (
+                         SELECT r2.id
+                         FROM risk_decisions r2
+                         WHERE r2.signal_id = s.id
+                         ORDER BY r2.timestamp DESC, r2.id DESC
+                         LIMIT 1
+                     )
+                WHERE o.ticket IN ({placeholders}) AND o.success = 1
+                ORDER BY o.timestamp DESC""",
+            tuple(ids),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        signal_ids: set[int] = set()
+        for row in rows:
+            item = dict(zip(cols, row))
+            ticket = item.get("ticket")
+            if not isinstance(ticket, int):
+                continue
+            if mapped.setdefault(ticket, {}).get("order") is None:
+                mapped[ticket]["order"] = item
+                signal_id = item.get("signal_id")
+                if isinstance(signal_id, int):
+                    signal_ids.add(signal_id)
+
+        cursor = await self._db.execute(
+            f"SELECT * FROM position_management_plans WHERE ticket IN ({placeholders})",
+            tuple(ids),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        for row in rows:
+            item = dict(zip(cols, row))
+            ticket = item.get("ticket")
+            if not isinstance(ticket, int):
+                continue
+            raw = item.get("plan_json")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    item["plan_json"] = json.loads(raw)
+                except Exception:
+                    item["plan_json"] = {}
+            mapped.setdefault(ticket, {})["management_plan"] = item
+            signal_id = item.get("signal_id")
+            if isinstance(signal_id, int):
+                signal_ids.add(signal_id)
+
+        cursor = await self._db.execute(
+            f"""SELECT * FROM position_changes
+                WHERE ticket IN ({placeholders})
+                ORDER BY timestamp ASC, id ASC""",
+            tuple(ids),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        for row in rows:
+            item = dict(zip(cols, row))
+            ticket = item.get("ticket")
+            if isinstance(ticket, int):
+                mapped.setdefault(ticket, {}).setdefault("position_changes", []).append(item)
+
+        cursor = await self._db.execute(
+            f"""SELECT * FROM ai_activity
+                WHERE ticket IN ({placeholders})
+                ORDER BY timestamp ASC, id ASC""",
+            tuple(ids),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        for row in rows:
+            item = dict(zip(cols, row))
+            ticket = item.get("ticket")
+            if isinstance(ticket, int):
+                mapped.setdefault(ticket, {}).setdefault("ai_activity", []).append(item)
+                signal_id = item.get("signal_id")
+                if isinstance(signal_id, int):
+                    signal_ids.add(signal_id)
+
+        cursor = await self._db.execute(
+            f"""SELECT * FROM trade_outcomes
+                WHERE ticket IN ({placeholders})
+                ORDER BY closed_at DESC, id DESC""",
+            tuple(ids),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        for row in rows:
+            item = dict(zip(cols, row))
+            ticket = item.get("ticket")
+            if not isinstance(ticket, int):
+                continue
+            if mapped.setdefault(ticket, {}).get("outcome") is None:
+                raw = item.get("outcome_json")
+                if isinstance(raw, str) and raw.strip():
+                    try:
+                        item["outcome_json"] = json.loads(raw)
+                    except Exception:
+                        item["outcome_json"] = {}
+                mapped[ticket]["outcome"] = item
+                signal_id = item.get("signal_id")
+                if isinstance(signal_id, int):
+                    signal_ids.add(signal_id)
+
+        post_analysis = await self.get_trade_post_analysis_by_tickets(ids)
+        for ticket, item in post_analysis.items():
+            mapped.setdefault(ticket, {})["post_analysis"] = item
+
+        if signal_ids:
+            journals = await self.get_evaluation_journal_by_signal_ids(list(signal_ids))
+            candidates = await self.get_trade_candidates_by_signal_ids(list(signal_ids))
+            for context in mapped.values():
+                order = context.get("order") or {}
+                plan = context.get("management_plan") or {}
+                outcome = context.get("outcome") or {}
+                signal_id = (
+                    order.get("signal_id")
+                    if isinstance(order.get("signal_id"), int)
+                    else plan.get("signal_id")
+                    if isinstance(plan.get("signal_id"), int)
+                    else outcome.get("signal_id")
+                )
+                if isinstance(signal_id, int):
+                    context["journal"] = journals.get(signal_id)
+                    context["candidate"] = candidates.get(signal_id)
+
+        return mapped
+
     async def log_event_fetch_run(
         self,
         *,
@@ -1655,18 +2285,30 @@ class Database:
             (payload["dedupe_key"],),
         )
         row = await cursor.fetchone()
+        await self._emit_cloud_log("external_event", payload)
         return int(row[0])
 
     async def get_latest_external_events(
         self,
         limit: int = 50,
         usable_only: bool = True,
+        event_type: str | None = None,
+        order_by: str = "timestamp",
     ) -> list[dict]:
         query = "SELECT * FROM external_events"
         params: list = []
+        filters: list[str] = []
         if usable_only:
-            query += " WHERE usable = 1"
-        query += " ORDER BY timestamp_utc DESC LIMIT ?"
+            filters.append("usable = 1")
+        if event_type:
+            filters.append("event_type = ?")
+            params.append(str(event_type).strip())
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+        if str(order_by).strip().lower() == "created":
+            query += " ORDER BY created_at DESC, timestamp_utc DESC LIMIT ?"
+        else:
+            query += " ORDER BY timestamp_utc DESC, created_at DESC LIMIT ?"
         params.append(limit)
         cursor = await self._db.execute(query, tuple(params))
         rows = await cursor.fetchall()
@@ -1730,6 +2372,14 @@ class Database:
             ),
         )
         await self._db.commit()
+        await self._emit_cloud_log(
+            "gemini_event_assessment",
+            {
+                "external_event_id": external_event_id,
+                "assessment": assessment,
+                "changed_mapping": bool(changed_mapping),
+            },
+        )
         return cursor.lastrowid
 
     async def get_latest_gemini_event_assessments(
@@ -1752,6 +2402,204 @@ class Database:
         for item in items:
             item["assessment_json"] = json.loads(item["assessment_json"])
         return items
+
+    async def _fetch_rows_for_archive(
+        self,
+        *,
+        table: str,
+        id_column: str,
+        time_column: str,
+        cutoff_ts: float,
+        batch_size: int,
+    ) -> list[dict]:
+        cursor = await self._db.execute(
+            f"""SELECT *
+                FROM {table}
+                WHERE {time_column} < ?
+                ORDER BY {time_column} ASC, {id_column} ASC
+                LIMIT ?""",
+            (cutoff_ts, int(batch_size)),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def _archive_and_delete_rows(
+        self,
+        *,
+        table: str,
+        id_column: str,
+        time_column: str,
+        cutoff_ts: float,
+        batch_size: int,
+    ) -> int:
+        rows = await self._fetch_rows_for_archive(
+            table=table,
+            id_column=id_column,
+            time_column=time_column,
+            cutoff_ts=cutoff_ts,
+            batch_size=batch_size,
+        )
+        if not rows:
+            return 0
+        archived = await self._emit_cloud_log(
+            f"archive_{table}_batch",
+            {
+                "table": table,
+                "archived_at": time.time(),
+                "row_count": len(rows),
+                "rows": rows,
+            },
+        )
+        if not archived:
+            return 0
+        ids = [row[id_column] for row in rows if row.get(id_column) is not None]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        await self._db.execute(
+            f"DELETE FROM {table} WHERE {id_column} IN ({placeholders})",
+            tuple(ids),
+        )
+        await self._db.commit()
+        return len(ids)
+
+    async def _archive_and_delete_event_bundle(self, *, cutoff_ts: float, batch_size: int) -> int:
+        rows = await self._fetch_rows_for_archive(
+            table="external_events",
+            id_column="id",
+            time_column="created_at",
+            cutoff_ts=cutoff_ts,
+            batch_size=batch_size,
+        )
+        if not rows:
+            return 0
+        event_ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+        if not event_ids:
+            return 0
+        placeholders = ",".join("?" for _ in event_ids)
+
+        map_cursor = await self._db.execute(
+            f"SELECT * FROM event_to_asset_map WHERE external_event_id IN ({placeholders})",
+            tuple(event_ids),
+        )
+        map_rows = await map_cursor.fetchall()
+        map_cols = [d[0] for d in map_cursor.description]
+        mappings = [dict(zip(map_cols, row)) for row in map_rows]
+
+        assessment_cursor = await self._db.execute(
+            f"SELECT * FROM gemini_event_assessments WHERE external_event_id IN ({placeholders})",
+            tuple(event_ids),
+        )
+        assessment_rows = await assessment_cursor.fetchall()
+        assessment_cols = [d[0] for d in assessment_cursor.description]
+        assessments = [dict(zip(assessment_cols, row)) for row in assessment_rows]
+
+        archived = await self._emit_cloud_log(
+            "archive_external_event_bundle_batch",
+            {
+                "table": "external_events",
+                "archived_at": time.time(),
+                "row_count": len(rows),
+                "events": rows,
+                "asset_mappings": mappings,
+                "gemini_event_assessments": assessments,
+            },
+        )
+        if not archived:
+            return 0
+
+        await self._db.execute(
+            f"DELETE FROM gemini_event_assessments WHERE external_event_id IN ({placeholders})",
+            tuple(event_ids),
+        )
+        await self._db.execute(
+            f"DELETE FROM event_to_asset_map WHERE external_event_id IN ({placeholders})",
+            tuple(event_ids),
+        )
+        await self._db.execute(
+            f"DELETE FROM external_events WHERE id IN ({placeholders})",
+            tuple(event_ids),
+        )
+        await self._db.commit()
+        return len(event_ids)
+
+    async def archive_and_prune_local_history(
+        self,
+        *,
+        retention_days: dict[str, int],
+        batch_sizes: Optional[dict[str, int]] = None,
+        max_batches_per_run: int = 12,
+    ) -> dict:
+        batch_sizes = batch_sizes or {}
+        now = time.time()
+        archived_rows = 0
+        processed_batches = 0
+        by_table: dict[str, int] = {}
+        plans = [
+            ("feature_snapshots", "id", "created_at"),
+            ("trade_candidates", "id", "created_at"),
+            ("evaluation_journal", "id", "timestamp"),
+            ("ai_activity", "id", "timestamp"),
+            ("connection_events", "id", "timestamp"),
+            ("errors", "id", "timestamp"),
+            ("event_fetch_runs", "id", "started_at"),
+        ]
+
+        for table, id_column, time_column in plans:
+            retention = int(retention_days.get(table, 0) or 0)
+            if retention <= 0:
+                continue
+            cutoff_ts = now - (retention * 86400)
+            while processed_batches < max_batches_per_run:
+                archived = await self._archive_and_delete_rows(
+                    table=table,
+                    id_column=id_column,
+                    time_column=time_column,
+                    cutoff_ts=cutoff_ts,
+                    batch_size=int(batch_sizes.get(table, 50) or 50),
+                )
+                if archived <= 0:
+                    break
+                by_table[table] = by_table.get(table, 0) + archived
+                archived_rows += archived
+                processed_batches += 1
+
+        retention = int(retention_days.get("external_events", 0) or 0)
+        if retention > 0 and processed_batches < max_batches_per_run:
+            archived = await self._archive_and_delete_event_bundle(
+                cutoff_ts=now - (retention * 86400),
+                batch_size=int(batch_sizes.get("external_events", 25) or 25),
+            )
+            if archived > 0:
+                by_table["external_events"] = by_table.get("external_events", 0) + archived
+                archived_rows += archived
+                processed_batches += 1
+
+        if archived_rows > 0:
+            await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await self._db.commit()
+
+        return {
+            "archived_rows": archived_rows,
+            "processed_batches": processed_batches,
+            "by_table": by_table,
+        }
+
+    async def compact_storage(self) -> dict:
+        cursor = await self._db.execute("PRAGMA page_count")
+        before_pages = int((await cursor.fetchone())[0] or 0)
+        cursor = await self._db.execute("PRAGMA page_size")
+        page_size = int((await cursor.fetchone())[0] or 4096)
+        await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        await self._db.execute("VACUUM")
+        await self._db.commit()
+        cursor = await self._db.execute("PRAGMA page_count")
+        after_pages = int((await cursor.fetchone())[0] or 0)
+        return {
+            "before_mb": round(before_pages * page_size / 1024 / 1024, 2),
+            "after_mb": round(after_pages * page_size / 1024 / 1024, 2),
+        }
 
     async def save_runtime_state(self, key: str, value: dict):
         await self._db.execute(
@@ -1845,6 +2693,34 @@ class Database:
             items.append(item)
         return items
 
+    async def list_recent_user_strategies_any(self, *, limit: int = 100) -> list[dict]:
+        cursor = await self._db.execute(
+            """SELECT * FROM user_strategies
+            ORDER BY updated_at DESC
+            LIMIT ?""",
+            (max(1, min(limit, 500)),),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        items: list[dict] = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            try:
+                item["config_json"] = json.loads(item.get("config_json") or "{}")
+            except Exception:
+                item["config_json"] = {}
+            items.append(item)
+        return items
+
+    async def delete_user_strategy(self, *, owner_user_id: str, strategy_id: str) -> int:
+        cursor = await self._db.execute(
+            """DELETE FROM user_strategies
+            WHERE owner_user_id = ? AND id = ?""",
+            (owner_user_id, strategy_id),
+        )
+        await self._db.commit()
+        return int(cursor.rowcount or 0)
+
     async def log_user_activity(
         self,
         *,
@@ -1900,18 +2776,24 @@ class Database:
         status: str = "pending",
         approved_by_user_id: str = "",
         notes: str = "",
+        permissions: Optional[dict] = None,
     ):
         now = time.time()
         approved_at = now if status == "approved" else None
+        permissions_json = json.dumps(permissions or {}, ensure_ascii=True)
         await self._db.execute(
             """INSERT INTO user_access
-            (user_id, email, status, requested_at, approved_at, approved_by_user_id, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (user_id, email, status, requested_at, approved_at, approved_by_user_id, permissions_json, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 email=excluded.email,
                 status=excluded.status,
                 approved_at=excluded.approved_at,
                 approved_by_user_id=excluded.approved_by_user_id,
+                permissions_json=CASE
+                    WHEN excluded.permissions_json <> '{}' THEN excluded.permissions_json
+                    ELSE user_access.permissions_json
+                END,
                 notes=excluded.notes""",
             (
                 user_id,
@@ -1920,6 +2802,7 @@ class Database:
                 now,
                 approved_at,
                 approved_by_user_id,
+                permissions_json,
                 notes,
             ),
         )
@@ -1951,7 +2834,12 @@ class Database:
         if row is None:
             return None
         cols = [d[0] for d in cursor.description]
-        return dict(zip(cols, row))
+        item = dict(zip(cols, row))
+        try:
+            item["permissions_json"] = json.loads(item.get("permissions_json") or "{}")
+        except Exception:
+            item["permissions_json"] = {}
+        return item
 
     async def list_user_access_requests(self, *, status: Optional[str] = None, limit: int = 500) -> list[dict]:
         query = "SELECT * FROM user_access"
@@ -1964,7 +2852,15 @@ class Database:
         cursor = await self._db.execute(query, tuple(params))
         rows = await cursor.fetchall()
         cols = [d[0] for d in cursor.description]
-        return [dict(zip(cols, row)) for row in rows]
+        items = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            try:
+                item["permissions_json"] = json.loads(item.get("permissions_json") or "{}")
+            except Exception:
+                item["permissions_json"] = {}
+            items.append(item)
+        return items
 
     async def log_model_run(
         self,

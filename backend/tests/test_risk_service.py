@@ -139,3 +139,189 @@ class RiskServiceTests(unittest.TestCase):
         )
         self.assertTrue(result.approved)
 
+    def test_auto_trade_blocks_missing_live_entry_price(self):
+        context = self.context.model_copy(update={"tick": {"bid": 3000.0, "ask": 0.0, "spread": 15.0}})
+        signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=0.82,
+            stop_loss=2990.0,
+            take_profit=3025.0,
+        )
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.86,
+            threshold=0.76,
+            no_trade_zone=False,
+        )
+
+        result = self.service.assess(
+            context=context,
+            signal=signal,
+            trade_quality=quality,
+            evaluation_mode="auto",
+            recent_outcomes=[],
+            recent_evaluations=[],
+        )
+
+        self.assertFalse(result.approved)
+        self.assertTrue(any("live entry price" in reason for reason in result.reasons))
+
+    def test_auto_trade_blocks_non_finite_live_entry_price(self):
+        context = self.context.model_copy(update={"tick": {"bid": 3000.0, "ask": float("inf"), "spread": 15.0}})
+        signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=0.82,
+            stop_loss=2990.0,
+            take_profit=3025.0,
+        )
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.86,
+            threshold=0.76,
+            no_trade_zone=False,
+        )
+
+        result = self.service.assess(
+            context=context,
+            signal=signal,
+            trade_quality=quality,
+            evaluation_mode="auto",
+            recent_outcomes=[],
+            recent_evaluations=[],
+        )
+
+        self.assertFalse(result.approved)
+        self.assertTrue(any("live entry price" in reason for reason in result.reasons))
+
+    def test_auto_trade_blocks_missing_protective_targets(self):
+        signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=0.82,
+            stop_loss=2990.0,
+            take_profit=None,
+        )
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.86,
+            threshold=0.76,
+            no_trade_zone=False,
+        )
+
+        result = self.service.assess(
+            context=self.context,
+            signal=signal,
+            trade_quality=quality,
+            evaluation_mode="auto",
+            recent_outcomes=[],
+            recent_evaluations=[],
+        )
+
+        self.assertFalse(result.approved)
+        self.assertTrue(any("stop-loss and take-profit" in reason for reason in result.reasons))
+
+    def test_auto_trade_blocks_non_finite_protective_targets(self):
+        signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=0.82,
+            stop_loss=2990.0,
+            take_profit=float("inf"),
+        )
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.86,
+            threshold=0.76,
+            no_trade_zone=False,
+        )
+
+        result = self.service.assess(
+            context=self.context,
+            signal=signal,
+            trade_quality=quality,
+            evaluation_mode="auto",
+            recent_outcomes=[],
+            recent_evaluations=[],
+        )
+
+        self.assertFalse(result.approved)
+        self.assertTrue(any("stop-loss and take-profit" in reason for reason in result.reasons))
+
+    def test_auto_trade_blocks_malformed_protective_targets(self):
+        signal = TechnicalSignal.model_construct(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=0.82,
+            stop_loss="bad-stop",
+            take_profit=3025.0,
+        )
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.86,
+            threshold=0.76,
+            no_trade_zone=False,
+        )
+
+        result = self.service.assess(
+            context=self.context,
+            signal=signal,
+            trade_quality=quality,
+            evaluation_mode="auto",
+            recent_outcomes=[],
+            recent_evaluations=[],
+        )
+
+        self.assertFalse(result.approved)
+        self.assertTrue(any("stop-loss and take-profit" in reason for reason in result.reasons))
+
+    def test_auto_trade_blocks_non_finite_confidence(self):
+        signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="BUY",
+            confidence=float("nan"),
+            stop_loss=2990.0,
+            take_profit=3025.0,
+        )
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.86,
+            threshold=0.76,
+            no_trade_zone=False,
+        )
+
+        result = self.service.assess(
+            context=self.context,
+            signal=signal,
+            trade_quality=quality,
+            evaluation_mode="auto",
+            recent_outcomes=[],
+            recent_evaluations=[],
+            entry_price=3000.5,
+        )
+
+        self.assertFalse(result.approved)
+        self.assertTrue(any("confidence" in reason.lower() for reason in result.reasons))
+
+    def test_hold_signal_does_not_add_trade_specific_portfolio_reasons(self):
+        signal = TechnicalSignal(
+            agent_name="SmartAgent",
+            action="HOLD",
+            confidence=0.2,
+            reason="No executable setup.",
+        )
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.0,
+            threshold=1.0,
+            no_trade_zone=True,
+        )
+
+        result = self.service.assess(
+            context=self.context,
+            signal=signal,
+            trade_quality=quality,
+            evaluation_mode="auto",
+            recent_outcomes=[],
+            recent_evaluations=[],
+        )
+
+        joined = " ".join(result.reasons)
+        self.assertFalse(result.approved)
+        self.assertNotIn("proposed trade volume", joined)
+        self.assertNotIn("live entry price", joined)
+        self.assertTrue(any("HOLD" in reason for reason in result.reasons))

@@ -62,3 +62,84 @@ class AntiChurnServiceTests(unittest.TestCase):
             any("per-symbol trade cap" in reason.lower() for reason in assessment.reasons)
         )
 
+    def test_same_side_loss_streak_reads_net_pnl(self):
+        service = AntiChurnService()
+        context = MarketContext(symbol="XAUUSD", evaluation_mode="auto")
+        signal = TechnicalSignal(agent_name="SmartAgent", action="SELL", confidence=0.7)
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.78,
+            threshold=0.76,
+            no_trade_zone=False,
+        )
+        recent_outcomes = [
+            {"symbol": "XAUUSD", "action": "SELL", "net_pnl": -12.5, "closed_at": 1.0},
+            {"symbol": "XAUUSD", "action": "SELL", "net_pnl": -8.0, "closed_at": 2.0},
+            {"symbol": "XAUUSD", "action": "SELL", "net_pnl": -3.0, "closed_at": 3.0},
+        ]
+
+        assessment = service.assess(
+            context=context,
+            signal=signal,
+            trade_quality=quality,
+            cooldown_minutes=0,
+            max_trades_per_symbol=10,
+            recent_outcomes=recent_outcomes,
+            recent_evaluations=[],
+        )
+
+        self.assertTrue(assessment.blocked)
+        self.assertTrue(any("streak is underperforming" in reason for reason in assessment.reasons))
+
+    def test_same_side_loss_streak_ignores_non_finite_pnl(self):
+        service = AntiChurnService()
+        context = MarketContext(symbol="XAUUSD", evaluation_mode="auto")
+        signal = TechnicalSignal(agent_name="SmartAgent", action="SELL", confidence=0.7)
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.78,
+            threshold=0.76,
+            no_trade_zone=False,
+        )
+        recent_outcomes = [
+            {"symbol": "XAUUSD", "action": "SELL", "profit": float("nan"), "closed_at": 1.0},
+            {"symbol": "XAUUSD", "action": "SELL", "profit": -8.0, "closed_at": 2.0},
+            {"symbol": "XAUUSD", "action": "SELL", "profit": -3.0, "closed_at": 3.0},
+        ]
+
+        assessment = service.assess(
+            context=context,
+            signal=signal,
+            trade_quality=quality,
+            cooldown_minutes=0,
+            max_trades_per_symbol=10,
+            recent_outcomes=recent_outcomes,
+            recent_evaluations=[],
+        )
+
+        self.assertFalse(assessment.blocked)
+        self.assertFalse(any("streak is underperforming" in reason for reason in assessment.reasons))
+
+    def test_malformed_cooldown_timestamp_is_ignored(self):
+        service = AntiChurnService()
+        context = MarketContext(symbol="XAUUSD", evaluation_mode="auto")
+        signal = TechnicalSignal(agent_name="SmartAgent", action="BUY", confidence=0.7)
+        quality = TradeQualityAssessment(
+            final_trade_quality_score=0.78,
+            threshold=0.76,
+            no_trade_zone=False,
+        )
+        recent_outcomes = [
+            {"symbol": "XAUUSD", "action": "BUY", "profit": 10.0, "closed_at": "bad-timestamp"},
+        ]
+
+        assessment = service.assess(
+            context=context,
+            signal=signal,
+            trade_quality=quality,
+            cooldown_minutes=120,
+            max_trades_per_symbol=10,
+            recent_outcomes=recent_outcomes,
+            recent_evaluations=[],
+        )
+
+        self.assertFalse(assessment.blocked)
+        self.assertFalse(any("cooldown" in reason.lower() for reason in assessment.reasons))

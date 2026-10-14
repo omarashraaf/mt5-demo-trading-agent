@@ -39,6 +39,17 @@ def estimate_costs_from_candidate(candidate: dict, outcome: dict) -> float:
     return max(0.0, spread_cost + max(0.0, slippage))
 
 
+def _outcome_profit(outcome: dict) -> float:
+    for key in ("profit", "profit_usd", "pnl", "net_pnl"):
+        if outcome.get(key) is not None:
+            return _to_float(outcome.get(key), 0.0)
+    return 0.0
+
+
+def _has_outcome_profit(outcome: dict) -> bool:
+    return any(outcome.get(key) is not None for key in ("profit", "profit_usd", "pnl", "net_pnl"))
+
+
 def _expected_return_for_horizon(net_pnl: float, holding_minutes: float, horizon_minutes: int) -> float:
     if holding_minutes <= 0:
         return net_pnl
@@ -72,9 +83,10 @@ def build_labels(
         }
 
     effective_outcome = outcome or {}
-    raw_profit = _to_float(
-        candidate.get("net_pnl", effective_outcome.get("profit", 0.0)),
-        0.0,
+    raw_profit = (
+        _outcome_profit(effective_outcome)
+        if _has_outcome_profit(effective_outcome)
+        else _to_float(candidate.get("net_pnl", 0.0), 0.0)
     )
     total_cost = estimate_costs_from_candidate(candidate, effective_outcome)
     net_pnl = raw_profit - total_cost

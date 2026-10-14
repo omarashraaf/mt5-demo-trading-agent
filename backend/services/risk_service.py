@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 from domain.models import (
@@ -53,6 +54,15 @@ class RiskService:
         entry_price: float | None = None,
     ) -> RiskApprovalDecision:
         live_entry_price = entry_price if entry_price is not None else self._entry_price(context, signal.action)
+        live_entry_reason = self._live_entry_block_reason(
+            signal=signal,
+            evaluation_mode=evaluation_mode,
+            entry_price=live_entry_price,
+        )
+        protective_targets_reason = self._protective_targets_block_reason(
+            signal=signal,
+            evaluation_mode=evaluation_mode,
+        )
 
         context_positions = list(context.all_open_positions or [])
         live_positions = (
@@ -62,7 +72,7 @@ class RiskService:
         )
 
         risk_decision = self.risk_engine.evaluate(
-            signal=signal.to_trade_signal(),
+            signal=self._risk_engine_trade_signal(signal),
             symbol=context.symbol,
             spread=context.tick.get("spread", 999.0) if context.tick else 999.0,
             equity=context.account_equity,
@@ -71,17 +81,20 @@ class RiskService:
             entry_price=live_entry_price,
         )
         risk_evaluation = RiskEvaluation.from_risk_decision(risk_decision, evaluation_mode)
-        if hasattr(self.portfolio_risk_service, "fit_volume_to_margin_limits"):
+        executable_signal = str(signal.action or "").upper() in {"BUY", "SELL"}
+        if executable_signal and hasattr(self.portfolio_risk_service, "fit_volume_to_margin_limits"):
             fitted_volume, fit_reason = self.portfolio_risk_service.fit_volume_to_margin_limits(
                 context=context,
                 proposed_volume=risk_evaluation.adjusted_volume,
                 entry_price=live_entry_price,
                 settings=self.risk_engine.settings,
             )
-        else:
+        elif executable_signal:
             # Backward compatibility: older/mocked portfolio services may not expose
             # margin-fit scaling yet, so keep the proposed volume unchanged.
             fitted_volume, fit_reason = risk_evaluation.adjusted_volume, None
+        else:
+            fitted_volume, fit_reason = 0.0, None
         if fit_reason and fitted_volume > 0:
             risk_evaluation.warnings.append(fit_reason)
         if fit_reason and fitted_volume <= 0:
@@ -108,9 +121,14 @@ class RiskService:
             recent_evaluations=recent_evaluations,
             scan_window_id=scan_window_id,
         )
+        force_execute_any_conditions = bool((context.user_policy or {}).get("force_execute_any_conditions", False))
 
         reasons: list[str] = []
-        auto_confidence_reason = self._auto_confidence_gate(
+        if live_entry_reason:
+            reasons.append(live_entry_reason)
+        if protective_targets_reason:
+            reasons.append(protective_targets_reason)
+        auto_confidence_reason = None if force_execute_any_conditions else self._auto_confidence_gate(
             signal=signal,
             trade_quality=trade_quality,
             evaluation_mode=evaluation_mode,
@@ -121,7 +139,7 @@ class RiskService:
             reasons.append(risk_evaluation.reason)
         if not portfolio_risk.allow_execute:
             reasons.extend(portfolio_risk.blocking_reasons)
-        if anti_churn.blocked:
+        if anti_churn.blocked and not force_execute_any_conditions:
             reasons.extend(anti_churn.reasons)
 
         risk_evaluation.approved = risk_evaluation.approved and not reasons
@@ -144,6 +162,39 @@ class RiskService:
             anti_churn_assessment=anti_churn,
         )
 
+    def _live_entry_block_reason(
+        self,
+        *,
+        signal: TechnicalSignal,
+        evaluation_mode: str,
+        entry_price: float,
+    ) -> str | None:
+        if evaluation_mode != "auto" or signal.action not in {"BUY", "SELL"}:
+            return None
+        parsed_entry = self._safe_float(entry_price, default=0.0)
+        if math.isfinite(parsed_entry) and parsed_entry > 0:
+            return None
+        return "Auto-trade blocked because no valid live entry price is available."
+
+    def _protective_targets_block_reason(
+        self,
+        *,
+        signal: TechnicalSignal,
+        evaluation_mode: str,
+    ) -> str | None:
+        if evaluation_mode != "auto" or signal.action not in {"BUY", "SELL"}:
+            return None
+        stop_loss = self._safe_float(signal.stop_loss, default=0.0)
+        take_profit = self._safe_float(signal.take_profit, default=0.0)
+        if (
+            math.isfinite(stop_loss)
+            and math.isfinite(take_profit)
+            and stop_loss > 0.0
+            and take_profit > 0.0
+        ):
+            return None
+        return "Auto-trade blocked because stop-loss and take-profit are required."
+
     def _auto_confidence_gate(
         self,
         *,
@@ -155,8 +206,15 @@ class RiskService:
             return None
 
         settings = self.risk_engine.settings
-        base_required = float(settings.auto_trade_min_confidence)
-        floor_required = float(settings.min_confidence_threshold)
+        base_required = self._safe_float(settings.auto_trade_min_confidence, default=0.72)
+        floor_required = self._safe_float(settings.min_confidence_threshold, default=0.7)
+        if not math.isfinite(base_required) or base_required <= 0:
+            base_required = 0.72
+        if not math.isfinite(floor_required) or floor_required <= 0:
+            floor_required = 0.7
+        signal_confidence = self._safe_float(signal.confidence, default=float("nan"))
+        if not math.isfinite(signal_confidence):
+            return "Auto-trade confidence is invalid for this setup."
 
         # Let exceptional trade quality earn a modest confidence discount,
         # but never below the mode's base technical floor.
@@ -164,9 +222,9 @@ class RiskService:
         if trade_quality.final_trade_quality_score >= max(trade_quality.threshold + 0.08, 0.82):
             required = max(floor_required, base_required - 0.03)
 
-        if signal.confidence < required:
+        if signal_confidence < required:
             return (
-                f"Auto-trade confidence {signal.confidence:.0%} is below the required "
+                f"Auto-trade confidence {signal_confidence:.0%} is below the required "
                 f"{required:.0%} for this setup."
             )
         return None
@@ -174,8 +232,37 @@ class RiskService:
     def _entry_price(self, context: MarketContext, action: str) -> float:
         if not context.tick:
             return 0.0
-        if action == "BUY":
-            return float(context.tick.get("ask", 0.0))
-        if action == "SELL":
-            return float(context.tick.get("bid", 0.0))
-        return 0.0
+        try:
+            if action == "BUY":
+                price = float(context.tick.get("ask", 0.0))
+            elif action == "SELL":
+                price = float(context.tick.get("bid", 0.0))
+            else:
+                return 0.0
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(price):
+            return 0.0
+        return price
+
+    def _risk_engine_trade_signal(self, signal: TechnicalSignal):
+        safe_signal = signal.model_copy(
+            update={
+                "confidence": self._safe_float(signal.confidence, default=0.0),
+                "stop_loss": self._optional_positive_float(signal.stop_loss),
+                "take_profit": self._optional_positive_float(signal.take_profit),
+            },
+            deep=True,
+        )
+        return safe_signal.to_trade_signal()
+
+    def _optional_positive_float(self, value):
+        parsed = self._safe_float(value, default=float("nan"))
+        return parsed if math.isfinite(parsed) and parsed > 0.0 else None
+
+    def _safe_float(self, value, default: float = float("nan")) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return parsed if math.isfinite(parsed) else default

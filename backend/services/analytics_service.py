@@ -120,7 +120,7 @@ class AnalyticsService:
         return "180+ min"
 
     def _summarize_rows(self, rows: list[dict]) -> dict:
-        profits = [float(row.get("profit", 0.0)) for row in rows]
+        profits = [self._outcome_profit(row) for row in rows]
         wins = [profit for profit in profits if profit > 0]
         losses = [abs(profit) for profit in profits if profit < 0]
         avg_return = sum(profits) / len(profits) if profits else 0.0
@@ -134,3 +134,9 @@ class AnalyticsService:
             "avg_return": round(avg_return, 4),
             "profit_factor": round(profit_factor, 3),
         }
+
+    def _outcome_profit(self, row: dict) -> float:
+        for key in ("profit", "profit_usd", "pnl", "net_pnl"):
+            if row.get(key) is not None:
+                return float(row.get(key) or 0.0)
+        return 0.0

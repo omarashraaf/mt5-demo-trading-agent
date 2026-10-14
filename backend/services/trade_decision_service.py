@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from domain.models import (
     GeminiAssessment,
     MarketContext,
@@ -10,10 +12,10 @@ from services.trade_quality_service import TradeQualityService
 
 
 class TradeDecisionService:
-    """Combines deterministic technical ideas with bounded Gemini news analysis.
+    """Scores the authored signal and applies the deterministic quality gate.
 
-    Gemini can confirm, weaken, or flag contradictions. It cannot create an
-    opposite-side executable trade on its own.
+    When Gemini already authored the signal, this service avoids reapplying the
+    same Gemini news adjustment and focuses on quality gating instead.
     """
 
     def __init__(self, trade_quality_service: TradeQualityService | None = None):
@@ -30,8 +32,18 @@ class TradeDecisionService:
     ) -> TradeDecisionAssessment:
         user_policy = context.user_policy or {}
         gemini_role = str(user_policy.get("gemini_role", "advisory")).lower()
+        force_execute_any_conditions = bool(user_policy.get("force_execute_any_conditions", False))
         effective_assessment = None if gemini_role == "off" else gemini_assessment
-        adjusted_signal = self._apply_news_advisory(technical_signal, effective_assessment)
+        normalized_signal = technical_signal.model_copy(deep=True)
+        action = str(normalized_signal.action or "").strip().upper()
+        if action in {"BUY", "SELL", "HOLD"}:
+            normalized_signal.action = action
+        gemini_primary_used = bool(((normalized_signal.metadata or {}).get("gemini_trade_brain") or {}).get("used"))
+        adjusted_signal = (
+            normalized_signal.model_copy(deep=True)
+            if gemini_primary_used
+            else self._apply_news_advisory(normalized_signal, effective_assessment)
+        )
         quality = self.trade_quality_service.assess(
             context=context,
             signal=adjusted_signal,
@@ -41,8 +53,8 @@ class TradeDecisionService:
         )
 
         reasons: list[str] = []
-        if technical_signal.reason:
-            reasons.append(technical_signal.reason)
+        if normalized_signal.reason:
+            reasons.append(normalized_signal.reason)
         if effective_assessment and effective_assessment.summary_reason:
             reasons.append(effective_assessment.summary_reason)
 
@@ -81,7 +93,7 @@ class TradeDecisionService:
                     reasons=list(dict.fromkeys(reasons)),
                 )
 
-        if quality.no_trade_zone:
+        if quality.no_trade_zone and not force_execute_any_conditions:
             final_signal = adjusted_signal.model_copy(deep=True)
             final_signal.action = "HOLD"
             final_signal.reason = f"{adjusted_signal.reason} Blocked: {' '.join(quality.no_trade_reasons)}"
@@ -93,6 +105,8 @@ class TradeDecisionService:
                 trade_quality_assessment=quality,
                 reasons=list(dict.fromkeys(reasons)),
             )
+        if quality.no_trade_zone and force_execute_any_conditions:
+            reasons.append("Force execution mode enabled: bypassing no-trade quality gate.")
 
         return TradeDecisionAssessment(
             trade=True,
@@ -111,18 +125,19 @@ class TradeDecisionService:
             return technical_signal.model_copy(deep=True)
 
         final_signal = technical_signal.model_copy(deep=True)
+        base_confidence = self._safe_float(final_signal.confidence, default=0.0)
+        confidence_adjustment = self._safe_float(gemini_assessment.confidence_adjustment, default=0.0)
         final_signal.confidence = round(
-            max(0.0, min(0.95, final_signal.confidence + gemini_assessment.confidence_adjustment)),
+            max(0.0, min(0.95, base_confidence + confidence_adjustment)),
             2,
         )
 
         metadata = dict(final_signal.metadata)
         metadata["gemini_assessment"] = gemini_assessment.model_dump()
-        metadata["technical_confidence"] = round(technical_signal.confidence, 3)
+        metadata["technical_confidence"] = round(base_confidence, 3)
         final_signal.metadata = metadata
 
-        # Gemini is advisory only. It may weaken confidence or warn, but it does
-        # not create a reverse-direction trade.
+        # In non-Gemini-authored paths, Gemini remains a bounded overlay here.
         if gemini_assessment.degraded:
             final_signal.reason = (
                 f"{final_signal.reason} Gemini news analysis degraded; using technical logic only."
@@ -135,3 +150,10 @@ class TradeDecisionService:
             )
 
         return final_signal
+
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return parsed if math.isfinite(parsed) else default

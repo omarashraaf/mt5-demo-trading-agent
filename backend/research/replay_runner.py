@@ -6,9 +6,24 @@ import time
 import uuid
 from pathlib import Path
 
-import pandas as pd
-
 from research.trade_dataset_builder import TradeDatasetBuilder
+
+_pd = None
+_pd_checked = False
+
+
+def _load_pandas():
+    global _pd, _pd_checked
+    if _pd_checked:
+        return _pd
+    _pd_checked = True
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        _pd = None
+        return None
+    _pd = pd
+    return _pd
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -131,6 +146,9 @@ class ReplayRunner:
         include_unexecuted: bool = True,
         limit: int = 200000,
     ) -> dict:
+        pd = _load_pandas()
+        if pd is None:
+            raise RuntimeError("pandas is required for replay analysis but is unavailable in this runtime.")
         run_id = f"replay-{uuid.uuid4().hex[:12]}"
         config = {
             "version_id": version_id,

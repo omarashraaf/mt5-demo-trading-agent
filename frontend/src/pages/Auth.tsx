@@ -1,11 +1,10 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/context/AuthContext';
-import { supabase } from '@/lib/supabase';
 
 export default function AuthPage() {
   const navigate = useNavigate();
-  const { signIn, signUp, signOut, supabaseEnabled, refreshProfile } = useAuth();
+  const { signIn, signUp, signOut, supabaseEnabled } = useAuth();
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -20,16 +19,11 @@ export default function AuthPage() {
     setBusy(true);
     try {
       if (mode === 'login') {
-        await signIn(email.trim(), password);
-        await refreshProfile();
-        const { data } = await supabase!.auth.getUser();
-        const normalizedStatus = String(data.user?.user_metadata?.access_status || 'pending').toLowerCase();
-        const normalizedRole = String(data.user?.app_metadata?.role || '').toLowerCase();
-        const isApproved = normalizedRole === 'admin' || normalizedStatus === 'approved';
-        if (!isApproved) {
+        const result = await signIn(email.trim(), password);
+        if (!result.approved) {
           await signOut();
           throw new Error(
-            normalizedStatus === 'rejected'
+            result.accessStatus === 'rejected'
               ? 'Your account request was rejected by admin.'
               : 'Your account is pending admin approval.',
           );

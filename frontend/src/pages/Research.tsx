@@ -3,24 +3,51 @@ import { RefreshCw, Cpu, Play, FlaskConical, ShieldCheck, LineChart } from 'luci
 import { api } from '../utils/api';
 import type { ResearchModelVersion, ResearchReportRecord, ResearchStatusResponse } from '../types';
 
+type PerformanceBucket = {
+  bucket?: string;
+  trades?: number;
+  wins?: number;
+  losses?: number;
+  net_pnl?: number;
+  avg_pnl?: number;
+  win_rate?: number;
+};
+
+function performanceRows(report: Record<string, unknown> | null, key: string): PerformanceBucket[] {
+  const value = report?.[key];
+  if (!value || typeof value !== 'object') return [];
+  return Object.values(value as Record<string, PerformanceBucket>)
+    .filter((row) => row && typeof row === 'object')
+    .slice(0, 6);
+}
+
+function formatPnl(value?: number) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+  const sign = value > 0 ? '+' : '';
+  return `${sign}${value.toFixed(2)}`;
+}
+
 export default function ResearchPage() {
   const [status, setStatus] = useState<ResearchStatusResponse | null>(null);
   const [models, setModels] = useState<ResearchModelVersion[]>([]);
   const [reports, setReports] = useState<ResearchReportRecord[]>([]);
+  const [performance, setPerformance] = useState<Record<string, unknown> | null>(null);
   const [busy, setBusy] = useState<string>('');
   const [message, setMessage] = useState<string>('');
   const [error, setError] = useState<string>('');
 
   const refresh = useCallback(async () => {
     try {
-      const [s, m, r] = await Promise.all([
+      const [s, m, r, p] = await Promise.all([
         api.getResearchStatus(),
         api.listResearchModels(50),
         api.listAttributionReports(10),
+        api.getPerformanceAttribution(2000),
       ]);
       setStatus(s);
       setModels(m.models || []);
       setReports(r.reports || []);
+      setPerformance(p);
       setError('');
     } catch (e: any) {
       setError(e.message || 'Failed to load research status');
@@ -38,6 +65,31 @@ export default function ResearchPage() {
     [models, status],
   );
 
+  const rankedCandidate = useMemo(() => {
+    const candidates = models.filter((m) => m.approval_status === 'candidate');
+    if (status?.best_candidate_model) return status.best_candidate_model;
+    return candidates.sort((a, b) => {
+      const aMetrics = a.evaluation_metrics_json || {};
+      const bMetrics = b.evaluation_metrics_json || {};
+      const aRank = [
+        Number(aMetrics.f1 || 0),
+        Number(aMetrics.precision || 0),
+        Number(aMetrics.recall || 0),
+        Number(aMetrics.dataset_row_count || aMetrics.sample_count || 0),
+      ];
+      const bRank = [
+        Number(bMetrics.f1 || 0),
+        Number(bMetrics.precision || 0),
+        Number(bMetrics.recall || 0),
+        Number(bMetrics.dataset_row_count || bMetrics.sample_count || 0),
+      ];
+      for (let i = 0; i < aRank.length; i += 1) {
+        if (bRank[i] !== aRank[i]) return bRank[i] - aRank[i];
+      }
+      return 0;
+    })[0] || null;
+  }, [models, status?.best_candidate_model]);
+
   async function runAction(actionKey: string, action: () => Promise<any>) {
     setBusy(actionKey);
     setMessage('');
@@ -53,9 +105,19 @@ export default function ResearchPage() {
     }
   }
 
-  const candidate = status?.best_candidate_model || models.find((m) => m.approval_status === 'candidate') || null;
+  const candidate = rankedCandidate;
   const candidateAccuracy = Number((candidate?.evaluation_metrics_json || {}).accuracy || 0);
+  const modelQuality = status?.model_quality;
+  const modelQualityIssue = modelQuality?.blockers?.[0] || modelQuality?.warnings?.[0] || '';
   const topIndicators = ((candidate?.evaluation_metrics_json || {}).feature_importance as Array<{ feature: string; importance: number }> | undefined) || [];
+  const reportSections = [
+    ['By Symbol', 'by_symbol'],
+    ['By Strategy', 'by_strategy'],
+    ['By Confidence', 'by_confidence_bucket'],
+    ['By Session', 'by_session'],
+    ['By Risk Profile', 'by_risk_profile'],
+    ['News/Gemini Impact', 'news_gemini_impact'],
+  ] as const;
 
   return (
     <div>
@@ -76,12 +138,22 @@ export default function ResearchPage() {
 
       <div className="grid-3 gap-3 mb-4">
         <div className="card">
-          <div className="text-muted" style={{ fontSize: 11 }}>Meta-Model Active</div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: status?.meta_model_active ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-            {status?.meta_model_active ? 'ON' : 'OFF'}
+          <div className="text-muted" style={{ fontSize: 11 }}>AI Brain Quality</div>
+          <div
+            style={{
+              fontSize: 18,
+              fontWeight: 700,
+              color: modelQuality?.status === 'ready'
+                ? 'var(--accent-green)'
+                : modelQuality?.status === 'warning'
+                  ? 'var(--accent-orange)'
+                  : 'var(--accent-red)',
+            }}
+          >
+            {typeof modelQuality?.score === 'number' ? `${modelQuality.score.toFixed(1)}/10` : '-'}
           </div>
           <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-            {status?.meta_model_active_version || 'No approved model loaded'}
+            {modelQualityIssue || status?.meta_model_active_version || 'No approved model loaded'}
           </div>
         </div>
 
@@ -97,7 +169,7 @@ export default function ResearchPage() {
           <div className="text-muted" style={{ fontSize: 11 }}>Last Training Run</div>
           <div style={{ fontSize: 16, fontWeight: 700 }}>{status?.last_training_run?.status || '-'}</div>
           <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-            {status?.last_training_run?.run_id || 'No runs yet'}
+            Clean closed: {status?.incremental_training?.clean_app_closed_count ?? 0}
           </div>
         </div>
       </div>
@@ -106,9 +178,9 @@ export default function ResearchPage() {
         <button
           className="btn btn-secondary"
           disabled={!!busy || !status?.enabled}
-          onClick={() => runAction('dataset', () => api.rebuildResearchDataset({ output_name: 'trade_dataset', include_unexecuted: true }))}
+          onClick={() => runAction('dataset', () => api.rebuildResearchDataset({ output_name: 'trade_dataset', include_unexecuted: false }))}
         >
-          <FlaskConical size={14} /> Rebuild Dataset
+          <FlaskConical size={14} /> Rebuild Executed Dataset
         </button>
         <button
           className="btn btn-primary"
@@ -116,15 +188,15 @@ export default function ResearchPage() {
           onClick={() =>
             runAction('train', () =>
               api.trainResearchModel({
-                algorithm: 'logistic_regression',
+                algorithm: 'empirical_rules',
                 target_column: 'profitable_after_costs_90m',
-                include_unexecuted: true,
+                include_unexecuted: false,
                 min_rows: status?.config?.MIN_TRADES_BEFORE_TRAINING || 30,
               }),
             )
           }
         >
-          <Cpu size={14} /> Train Candidate
+          <Cpu size={14} /> Train Empirical Model
         </button>
         <button
           className="btn btn-secondary"
@@ -132,7 +204,7 @@ export default function ResearchPage() {
           onClick={() =>
             candidate?.version_id &&
             runAction('replay', () =>
-              api.runResearchReplay({ version_id: candidate.version_id, score_threshold: 0.55, include_unexecuted: true }),
+              api.runResearchReplay({ version_id: candidate.version_id, score_threshold: 0.55, include_unexecuted: false }),
             )
           }
         >
@@ -147,7 +219,7 @@ export default function ResearchPage() {
                 algorithm: 'logistic_regression',
                 target_column: 'profitable_after_costs_90m',
                 windows: status?.config?.WALK_FORWARD_WINDOWS || 5,
-                include_unexecuted: true,
+                include_unexecuted: false,
               }),
             )
           }
@@ -197,6 +269,36 @@ export default function ResearchPage() {
               <div className="text-muted">{new Date((report.generated_at || 0) * 1000).toLocaleString()}</div>
             </div>
           ))}
+        </div>
+      </div>
+
+      <div className="card mt-4">
+        <h4 style={{ marginBottom: 10 }}>Performance Attribution</h4>
+        <div className="text-muted" style={{ fontSize: 12, marginBottom: 12 }}>
+          Sample size: {Number(performance?.sample_size || 0)}
+        </div>
+        <div className="grid-3 gap-3">
+          {reportSections.map(([label, key]) => {
+            const rows = performanceRows(performance, key);
+            return (
+              <div key={key} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>{label}</div>
+                {rows.length === 0 && <div className="text-muted" style={{ fontSize: 12 }}>No data yet.</div>}
+                {rows.map((row) => (
+                  <div key={`${key}-${row.bucket}`} style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8, fontSize: 12, marginBottom: 6 }}>
+                    <span style={{ color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {row.bucket || 'unknown'} ({row.trades || 0})
+                    </span>
+                    <span className="font-mono" style={{ color: Number(row.net_pnl || 0) >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                      {formatPnl(row.net_pnl)}
+                    </span>
+                    <span className="text-muted">Win rate</span>
+                    <span className="font-mono">{Math.round(Number(row.win_rate || 0) * 100)}%</span>
+                  </div>
+                ))}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>

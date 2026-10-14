@@ -130,3 +130,107 @@ class PortfolioRiskServiceTests(unittest.TestCase):
         assessment = self.service.assess(context, signal, 0.2, 1.1002, self.settings, recent_outcomes=[], is_auto_trade=True)
         self.assertFalse(assessment.allow_execute)
         self.assertTrue(any("Projected free margin" in reason for reason in assessment.blocking_reasons))
+
+    def test_non_finite_entry_price_blocks_auto_trade(self):
+        context = self._context()
+        signal = TechnicalSignal(agent_name="SmartAgent", action="BUY", confidence=0.8)
+
+        assessment = self.service.assess(
+            context,
+            signal,
+            0.02,
+            float("nan"),
+            self.settings,
+            recent_outcomes=[],
+            is_auto_trade=True,
+        )
+
+        self.assertFalse(assessment.allow_execute)
+        self.assertTrue(any("entry price" in reason for reason in assessment.blocking_reasons))
+
+    def test_hold_signal_skips_trade_specific_portfolio_checks(self):
+        context = self._context()
+        signal = TechnicalSignal(agent_name="SmartAgent", action="HOLD", confidence=0.2)
+
+        assessment = self.service.assess(
+            context,
+            signal,
+            0.0,
+            0.0,
+            self.settings,
+            recent_outcomes=[],
+            is_auto_trade=True,
+        )
+
+        self.assertFalse(assessment.allow_execute)
+        self.assertEqual(assessment.blocking_reasons, [])
+        self.assertIn("HOLD", assessment.reason)
+        self.assertEqual(assessment.metrics_snapshot.get("skipped"), "hold_signal")
+
+    def test_non_finite_account_equity_blocks_auto_trade(self):
+        context = self._context()
+        context.account_equity = float("nan")
+        signal = TechnicalSignal(agent_name="SmartAgent", action="BUY", confidence=0.8)
+
+        assessment = self.service.assess(
+            context,
+            signal,
+            0.02,
+            1.1002,
+            self.settings,
+            recent_outcomes=[],
+            is_auto_trade=True,
+        )
+
+        self.assertFalse(assessment.allow_execute)
+        self.assertTrue(any("account equity" in reason for reason in assessment.blocking_reasons))
+
+    def test_malformed_recent_outcome_timestamp_does_not_crash_cooldown_check(self):
+        context = self._context()
+        signal = TechnicalSignal(agent_name="SmartAgent", action="BUY", confidence=0.8)
+
+        assessment = self.service.assess(
+            context,
+            signal,
+            0.02,
+            1.1002,
+            self.settings,
+            recent_outcomes=[
+                {
+                    "symbol": "EURUSD",
+                    "action": "BUY",
+                    "profit": 15.0,
+                    "closed_at": "bad-timestamp",
+                }
+            ],
+            is_auto_trade=True,
+        )
+
+        self.assertTrue(assessment.allow_execute)
+        self.assertFalse(any("cooldown" in reason.lower() for reason in assessment.blocking_reasons))
+
+    def test_malformed_open_position_numbers_do_not_crash_exposure_breakdown(self):
+        context = self._context(
+            symbol="USDJPY",
+            positions=[
+                {
+                    "symbol": "EURUSD",
+                    "volume": "bad-volume",
+                    "price_current": "bad-price",
+                    "price_open": 1.1,
+                }
+            ],
+        )
+        signal = TechnicalSignal(agent_name="SmartAgent", action="BUY", confidence=0.8)
+
+        assessment = self.service.assess(
+            context,
+            signal,
+            0.02,
+            145.0,
+            self.settings,
+            recent_outcomes=[],
+            is_auto_trade=True,
+        )
+
+        self.assertIn("exposure_by_symbol", assessment.metrics_snapshot)

@@ -26,8 +26,94 @@ export default function AIActivityPage({ status }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const renderDiagnostics = (activity: {
+    decision_reason?: string;
+    gemini_summary?: string;
+    meta_model_summary?: string;
+    blocking_reasons?: string[];
+    risk_warnings?: string[];
+    machine_reasons?: string[];
+    portfolio_status?: string;
+    allow_execute?: boolean;
+    portfolio_fit_score?: number | null;
+    projected_margin_utilization_pct?: number | null;
+    projected_free_margin_pct?: number | null;
+    gemini_state?: string;
+    gemini_bias?: string;
+    gemini_event_risk?: string;
+    profit_pct?: number | null;
+  }) => {
+    const blockingReasons = Array.isArray(activity.blocking_reasons) ? activity.blocking_reasons : [];
+    const riskWarnings = Array.isArray(activity.risk_warnings) ? activity.risk_warnings : [];
+    const machineReasons = Array.isArray(activity.machine_reasons) ? activity.machine_reasons : [];
+    const hasDetails = Boolean(
+      activity.decision_reason
+      || activity.gemini_summary
+      || activity.meta_model_summary
+      || blockingReasons.length
+      || riskWarnings.length
+      || machineReasons.length
+      || activity.portfolio_status
+      || activity.profit_pct != null,
+    );
+    if (!hasDetails) return null;
+
+    return (
+      <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
+        {activity.decision_reason && (
+          <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+            Decision: {activity.decision_reason}
+          </div>
+        )}
+        {blockingReasons.length > 0 && (
+          <div style={{ fontSize: 11, color: 'var(--accent-red)', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+            Blocked by: {blockingReasons.join(' | ')}
+          </div>
+        )}
+        {riskWarnings.length > 0 && (
+          <div style={{ fontSize: 11, color: 'var(--accent-yellow)', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+            Warnings: {riskWarnings.join(' | ')}
+          </div>
+        )}
+        {machineReasons.length > 0 && (
+          <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+            Machine checks: {machineReasons.join(' | ')}
+          </div>
+        )}
+        {activity.gemini_summary && (
+          <div style={{ fontSize: 11, color: 'var(--accent-blue)', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+            Gemini: {activity.gemini_summary}
+            {activity.gemini_state ? ` (${activity.gemini_state}` : ''}
+            {activity.gemini_bias ? `, bias ${activity.gemini_bias}` : ''}
+            {activity.gemini_event_risk ? `, risk ${activity.gemini_event_risk}` : ''}
+            {activity.gemini_state ? ')' : ''}
+          </div>
+        )}
+        {activity.meta_model_summary && (
+          <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+            Meta model: {activity.meta_model_summary}
+          </div>
+        )}
+        {(activity.portfolio_status || activity.portfolio_fit_score != null || activity.projected_margin_utilization_pct != null || activity.projected_free_margin_pct != null) && (
+          <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+            Portfolio:
+            {activity.portfolio_status ? ` ${activity.portfolio_status}` : ''}
+            {typeof activity.allow_execute === 'boolean' ? ` | execute ${activity.allow_execute ? 'yes' : 'no'}` : ''}
+            {activity.portfolio_fit_score != null ? ` | fit ${(activity.portfolio_fit_score * 100).toFixed(0)}%` : ''}
+            {activity.projected_margin_utilization_pct != null ? ` | margin ${activity.projected_margin_utilization_pct.toFixed(1)}%` : ''}
+            {activity.projected_free_margin_pct != null ? ` | free margin ${activity.projected_free_margin_pct.toFixed(1)}%` : ''}
+          </div>
+        )}
+        {activity.profit_pct != null && (
+          <div style={{ fontSize: 11, color: (activity.profit_pct || 0) >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+            P/L %: {activity.profit_pct >= 0 ? '+' : ''}{activity.profit_pct.toFixed(2)}%
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const load = useCallback(async () => {
-    if (!status?.connected) return;
     setLoading(true);
     setError('');
     try {
@@ -45,25 +131,17 @@ export default function AIActivityPage({ status }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [status?.connected]);
+  }, []);
 
   useEffect(() => {
     load();
-    const t = setInterval(load, 5000);
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void load();
+      }
+    }, 5000);
     return () => clearInterval(t);
   }, [load]);
-
-  if (!status?.connected) {
-    return (
-      <div>
-        <div className="page-header">
-          <h2>AI Brain Activity</h2>
-          <p>Connect to MT5 to view full AI activity and auto-trade decisions.</p>
-        </div>
-        <div className="empty-state">Not connected</div>
-      </div>
-    );
-  }
 
   return (
     <div>
@@ -71,6 +149,12 @@ export default function AIActivityPage({ status }: Props) {
         <h2>AI Brain Activity</h2>
         <p>Live stream of AI decisions and reasons. Logs are shown in full with no cropping.</p>
       </div>
+
+      {!status?.connected && (
+        <div className="warning-banner" style={{ marginBottom: 16 }}>
+          Not connected to MT5. Showing the latest saved AI brain activity from local history.
+        </div>
+      )}
 
       {error && <div className="error-banner">{error}</div>}
 
@@ -107,25 +191,7 @@ export default function AIActivityPage({ status }: Props) {
                 <div style={{ marginTop: 4, color: log.success ? 'var(--accent-green)' : 'var(--accent-red)', fontSize: 12, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
                   {log.detail}
                 </div>
-                {(log.decision_reason || log.gemini_summary || log.meta_model_summary) && (
-                  <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
-                    {log.decision_reason && (
-                      <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
-                        Decision: {log.decision_reason}
-                      </div>
-                    )}
-                    {log.gemini_summary && (
-                      <div style={{ fontSize: 11, color: 'var(--accent-blue)', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
-                        Gemini: {log.gemini_summary}
-                      </div>
-                    )}
-                    {log.meta_model_summary && (
-                      <div style={{ fontSize: 11, color: 'var(--text-secondary)', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
-                        Meta model: {log.meta_model_summary}
-                      </div>
-                    )}
-                  </div>
-                )}
+                {renderDiagnostics(log)}
               </div>
             ))}
           </div>
@@ -158,30 +224,7 @@ export default function AIActivityPage({ status }: Props) {
                 <div style={{ marginTop: 4, color: 'var(--text-secondary)', fontSize: 12, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
                   {activity.detail || '-'}
                 </div>
-                {(activity.decision_reason || activity.gemini_summary || activity.meta_model_summary || activity.profit_pct != null) && (
-                  <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
-                    {activity.decision_reason && (
-                      <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
-                        Decision: {activity.decision_reason}
-                      </div>
-                    )}
-                    {activity.gemini_summary && (
-                      <div style={{ fontSize: 11, color: 'var(--accent-blue)', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
-                        Gemini: {activity.gemini_summary}
-                      </div>
-                    )}
-                    {activity.meta_model_summary && (
-                      <div className="text-muted" style={{ fontSize: 11, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
-                        Meta model: {activity.meta_model_summary}
-                      </div>
-                    )}
-                    {activity.profit_pct != null && (
-                      <div style={{ fontSize: 11, color: (activity.profit_pct || 0) >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-                        P/L %: {activity.profit_pct >= 0 ? '+' : ''}{activity.profit_pct.toFixed(2)}%
-                      </div>
-                    )}
-                  </div>
-                )}
+                {renderDiagnostics(activity)}
               </div>
             ))}
           </div>

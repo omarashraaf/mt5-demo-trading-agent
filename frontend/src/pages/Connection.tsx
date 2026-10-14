@@ -1,221 +1,135 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plug, PlugZap, Search, Trash2, AlertTriangle, HelpCircle, CheckCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { Plug, PlugZap, Search, AlertTriangle, HelpCircle, CheckCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { api } from '../utils/api';
-import type { StatusResponse, SavedCredentials } from '../types';
+import type { StatusResponse } from '../types';
 
 interface Props {
   status: StatusResponse | null;
-  onRefresh: () => void;
+  onRefresh: () => void | Promise<void>;
 }
-
-type SavedIbkrAccount = {
-  id: string;
-  host: string;
-  accountType: 'paper' | 'live';
-  clientId: string;
-  accountId: string;
-  label: string;
-  createdAt: number;
-};
-
-const SAVED_IBKR_KEY = 'trading_saved_ibkr_accounts_v1';
-const SAVED_MT5_CACHE_KEY = 'trading_saved_mt5_accounts_v1';
+const LAST_PLATFORM_KEY = 'linktrade_last_connected_platform';
+type ConnectionPlatform = 'mt5' | 'ibkr' | 'tradestation';
 
 export default function Connection({ status, onRefresh }: Props) {
   const navigate = useNavigate();
-  const [platform, setPlatform] = useState<'mt5' | 'ibkr'>((status?.platform as 'mt5' | 'ibkr') || 'mt5');
-  const [account, setAccount] = useState('');
-  const [password, setPassword] = useState('');
-  const [server, setServer] = useState('');
+  const [localStatusOverride, setLocalStatusOverride] = useState<StatusResponse | null>(null);
+  const [selectedPlatform, setSelectedPlatform] = useState<ConnectionPlatform>('mt5');
   const [terminalPath, setTerminalPath] = useState('');
   const [ibkrHost, setIbkrHost] = useState('127.0.0.1');
-  const [ibkrAccountType, setIbkrAccountType] = useState<'paper' | 'live'>('paper');
+  const [ibkrEnvironment, setIbkrEnvironment] = useState<'paper' | 'live'>('paper');
+  const [ibkrPort, setIbkrPort] = useState('7497');
   const [ibkrClientId, setIbkrClientId] = useState('1');
-  const [ibkrAccountId, setIbkrAccountId] = useState('');
-  const [rememberCredentials, setRememberCredentials] = useState(false);
-  const [rememberIbkrSettings, setRememberIbkrSettings] = useState(false);
+  const [ibkrReadonly, setIbkrReadonly] = useState(false);
+  const [tradeStationEnvironment, setTradeStationEnvironment] = useState<'sim' | 'live'>('sim');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [verifyResult, setVerifyResult] = useState<any>(null);
-  const [savedCreds, setSavedCreds] = useState<SavedCredentials[]>([]);
-  const [savedCredsError, setSavedCredsError] = useState('');
-  const [savedIbkrAccounts, setSavedIbkrAccounts] = useState<SavedIbkrAccount[]>([]);
-  const [savedCredsLoaded, setSavedCredsLoaded] = useState(false);
-  const [savedCredsRetryCount, setSavedCredsRetryCount] = useState(0);
 
-  const connected = Boolean(status?.connected && status?.account);
-  const connectedPlatform = (status?.platform as 'mt5' | 'ibkr') || 'mt5';
-
-  useEffect(() => {
-    if (status?.platform) {
-      setPlatform(status.platform);
-    }
-  }, [status?.platform]);
-
-  const ibkrPort = ibkrAccountType === 'live' ? '7496' : '7497';
-
-  const refreshSavedCredentials = useCallback(async () => {
-    try {
-      const creds = await api.getCredentials();
-      const normalized = creds || [];
-      setSavedCreds(normalized);
-      localStorage.setItem(SAVED_MT5_CACHE_KEY, JSON.stringify(normalized));
-      setSavedCredsError('');
-      setSavedCredsLoaded(true);
-      setSavedCredsRetryCount(0);
-    } catch (e: any) {
-      setSavedCredsLoaded(true);
-      // Keep cached entries on transient backend start delays.
-      setSavedCredsError(e?.message || 'Could not load saved MT5 accounts.');
-    }
-  }, []);
+  const effectiveStatus = localStatusOverride ?? status;
+  const connected = Boolean(effectiveStatus?.connected && effectiveStatus?.account);
+  const connectedPlatform = effectiveStatus?.platform || 'mt5';
+  const autoConnectIssue = effectiveStatus?.auto_connect?.last_error
+    || effectiveStatus?.auto_connect?.pause_reason
+    || '';
+  const liveReadiness = effectiveStatus?.live_trading_readiness;
+  const liveReadinessIssue = !connected && liveReadiness?.status !== 'ready'
+    ? (liveReadiness?.blockers?.[0] || liveReadiness?.warnings?.[0] || '')
+    : '';
+  const connectionIssue = error || autoConnectIssue || liveReadinessIssue;
 
   useEffect(() => {
+    if (status?.connected) {
+      setLocalStatusOverride(status);
+    } else if (!status?.connected) {
+      setLocalStatusOverride(null);
+    }
+  }, [status, loading]);
+
+  const buildOptimisticStatus = useCallback((result: any, nextPlatform: ConnectionPlatform): StatusResponse => ({
+    connected: true,
+    platform: nextPlatform,
+    platforms_supported: ['mt5', 'ibkr', 'tradestation'],
+    account: result?.account ?? null,
+    terminal: effectiveStatus?.terminal ?? null,
+    last_error: null,
+    is_demo: Boolean(result?.is_demo ?? effectiveStatus?.is_demo ?? true),
+    live_trading_enabled: effectiveStatus?.live_trading_enabled ?? true,
+    panic_stop: effectiveStatus?.panic_stop ?? false,
+    active_agent: effectiveStatus?.active_agent || 'SmartAgent',
+    active_strategy: effectiveStatus?.active_strategy,
+    credential_storage_available: effectiveStatus?.credential_storage_available,
+    gemini_available: effectiveStatus?.gemini_available,
+    gemini_degraded: effectiveStatus?.gemini_degraded,
+    gemini_last_error: effectiveStatus?.gemini_last_error,
+    gemini_state: effectiveStatus?.gemini_state,
+    gemini_cooldown_seconds: effectiveStatus?.gemini_cooldown_seconds,
+    gemini_credits_pct: effectiveStatus?.gemini_credits_pct,
+    user_policy: effectiveStatus?.user_policy,
+    runtime_controls: effectiveStatus?.runtime_controls,
+    universe: effectiveStatus?.universe,
+    benzinga: effectiveStatus?.benzinga,
+    portfolio: effectiveStatus?.portfolio,
+    services: effectiveStatus?.services,
+    auto_connect: { pending: false },
+  }), [effectiveStatus]);
+
+  const syncConnectedState = useCallback(async (fallback: StatusResponse) => {
+    setLocalStatusOverride(fallback);
     try {
-      const raw = localStorage.getItem(SAVED_MT5_CACHE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as SavedCredentials[];
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setSavedCreds(parsed);
+      localStorage.setItem(LAST_PLATFORM_KEY, String(fallback.platform || 'mt5'));
+    } catch {
+      // ignore storage issues
+    }
+    for (let i = 0; i < 5; i += 1) {
+      try {
+        const live = await api.getStatus();
+        if (live?.connected) {
+          setLocalStatusOverride(live);
+          try {
+            localStorage.setItem(LAST_PLATFORM_KEY, String(live.platform || fallback.platform || 'mt5'));
+          } catch {
+            // ignore storage issues
+          }
+          await onRefresh();
+          navigate('/');
+          return true;
         }
+      } catch {
+        // keep optimistic state briefly while backend status catches up
       }
-    } catch {
-      // ignore malformed local cache
+      await new Promise((resolve) => setTimeout(resolve, 700));
     }
-    void refreshSavedCredentials();
-  }, [refreshSavedCredentials]);
-
-  useEffect(() => {
-    if (connected) return;
-    if (savedCreds.length > 0) return;
-    if (!savedCredsLoaded) return;
-    if (savedCredsRetryCount >= 3) return;
-    if (!savedCredsError) return;
-
-    const timer = window.setTimeout(() => {
-      setSavedCredsRetryCount((prev) => prev + 1);
-      void refreshSavedCredentials();
-    }, 2500);
-
-    return () => window.clearTimeout(timer);
-  }, [
-    connected,
-    refreshSavedCredentials,
-    savedCreds.length,
-    savedCredsError,
-    savedCredsLoaded,
-    savedCredsRetryCount,
-  ]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(SAVED_IBKR_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as SavedIbkrAccount[];
-      if (Array.isArray(parsed)) {
-        setSavedIbkrAccounts(parsed);
-      }
-    } catch {
-      // ignore malformed local cache
-    }
-  }, []);
-
-  const persistIbkrAccounts = (accounts: SavedIbkrAccount[]) => {
-    setSavedIbkrAccounts(accounts);
-    localStorage.setItem(SAVED_IBKR_KEY, JSON.stringify(accounts));
-  };
-
-  const handleDeleteCredentials = async (acct: number) => {
-    try {
-      await api.deleteCredentials(acct);
-      setSavedCreds((prev) => prev.filter((c) => c.account !== acct));
-    } catch {}
-  };
-
-  const handleDeleteIbkrSettings = (id: string) => {
-    persistIbkrAccounts(savedIbkrAccounts.filter((item) => item.id !== id));
-  };
-
-  const handleLoadIbkrSettings = (saved: SavedIbkrAccount) => {
-    setPlatform('ibkr');
-    setIbkrHost(saved.host || '127.0.0.1');
-    setIbkrAccountType(saved.accountType || 'paper');
-    setIbkrClientId(saved.clientId || '1');
-    setIbkrAccountId(saved.accountId || '');
-  };
-
-  const handleAutoConnectIbkr = async (saved: SavedIbkrAccount) => {
-    setLoading(true);
-    setError('');
-    try {
-      const result = await api.connect({
-        platform: 'ibkr',
-        ibkr_host: saved.host || '127.0.0.1',
-        ibkr_port: saved.accountType === 'live' ? 7496 : 7497,
-        ibkr_client_id: parseInt(saved.clientId || '1', 10),
-        ibkr_account_id: saved.accountId || undefined,
-      });
-      if (!result?.connected) {
-        setError('Auto-connect failed');
-      } else {
-        onRefresh();
-      }
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
-    }
-  };
+    await onRefresh();
+    navigate('/');
+    return false;
+  }, [navigate, onRefresh]);
 
   const handleConnect = async () => {
     setLoading(true);
     setError('');
     try {
-      const result = await api.connect(
-        platform === 'mt5'
-          ? {
-              platform: 'mt5',
-              account: parseInt(account),
-              password,
-              server,
-              terminal_path: terminalPath || undefined,
-              save_credentials: rememberCredentials,
-            }
-          : {
-              platform: 'ibkr',
-              ibkr_host: ibkrHost.trim() || '127.0.0.1',
-              ibkr_port: parseInt(ibkrPort, 10),
-              ibkr_client_id: parseInt(ibkrClientId || '1'),
-              ibkr_account_id: ibkrAccountId.trim() || undefined,
-            }
-      );
-      if (rememberCredentials && result?.credential_status?.saved === false) {
-        setError(result.credential_status.reason || 'Connected, but credentials could not be saved securely.');
+      const result = await api.connect({
+        platform: selectedPlatform,
+        terminal_path: selectedPlatform === 'mt5' ? terminalPath || undefined : undefined,
+        host: selectedPlatform === 'ibkr' ? ibkrHost : undefined,
+        port: selectedPlatform === 'ibkr' ? Number(ibkrPort || 7497) : undefined,
+        client_id: selectedPlatform === 'ibkr' ? Number(ibkrClientId || 1) : undefined,
+        readonly: selectedPlatform === 'ibkr' ? ibkrReadonly : undefined,
+        ibkr_environment: selectedPlatform === 'ibkr' ? ibkrEnvironment : undefined,
+        environment: selectedPlatform === 'tradestation' ? tradeStationEnvironment : undefined,
+      });
+      if (result?.auth_required && result.auth_url) {
+        window.open(result.auth_url, '_blank', 'noopener,noreferrer');
+        setError('TradeStation login opened in your browser. Complete authorization on TradeStation, then return here.');
+        return;
       }
-      if (platform === 'ibkr' && rememberIbkrSettings) {
-        const normalizedHost = ibkrHost.trim() || '127.0.0.1';
-        const normalizedClientId = String(parseInt(ibkrClientId || '1', 10));
-        const normalizedAccount = ibkrAccountId.trim();
-        const deduped = savedIbkrAccounts.filter((item) => !(
-          item.host === normalizedHost
-          && item.accountType === ibkrAccountType
-          && item.clientId === normalizedClientId
-          && item.accountId === normalizedAccount
-        ));
-        const entry: SavedIbkrAccount = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          host: normalizedHost,
-          accountType: ibkrAccountType,
-          clientId: normalizedClientId,
-          accountId: normalizedAccount,
-          label: normalizedAccount || `${ibkrAccountType.toUpperCase()} @ ${normalizedHost}`,
-          createdAt: Date.now(),
-        };
-        persistIbkrAccounts([entry, ...deduped].slice(0, 30));
+      if (!result?.connected) {
+        setError('Connection did not complete. Please try again.');
+        return;
       }
-      onRefresh();
+      await syncConnectedState(buildOptimisticStatus(result, selectedPlatform));
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -226,8 +140,9 @@ export default function Connection({ status, onRefresh }: Props) {
   const handleDisconnect = async () => {
     setLoading(true);
     try {
+      setLocalStatusOverride(null);
       await api.disconnect();
-      onRefresh();
+      await onRefresh();
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -248,33 +163,14 @@ export default function Connection({ status, onRefresh }: Props) {
     }
   };
 
-  const handleAutoConnect = async (acct?: number) => {
-    setLoading(true);
-    setError('');
-    try {
-      const result = await api.autoConnect(acct);
-      if (!result.connected) {
-        setError(result.reason || 'Auto-connect failed');
-      } else if (!result.account) {
-        setError('Connection session is stale. Please click Auto Connect again or use Connect manually.');
-      } else {
-        onRefresh();
-      }
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   return (
     <div style={{ maxWidth: 700, margin: '0 auto' }}>
       <div className="page-header">
-        <h2>Connect to Trading Platform</h2>
-        <p>Select MT5 or IBKR and connect with the required details</p>
+        <h2>Connect Broker Platform</h2>
+        <p>Choose a platform and authenticate only inside the broker-owned local app or browser page.</p>
       </div>
 
-      {!connected && platform === 'mt5' && (
+      {!connected && (
         <div style={{
           background: 'rgba(59, 130, 246, 0.06)',
           border: '1px solid rgba(59, 130, 246, 0.15)',
@@ -287,46 +183,28 @@ export default function Connection({ status, onRefresh }: Props) {
         }}>
           <div className="flex items-center gap-2" style={{ fontWeight: 600, marginBottom: 8, color: 'var(--accent-blue)' }}>
             <HelpCircle size={14} />
-            Where do I find these details?
+            How this connection works
           </div>
           <ol style={{ paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <li>Open your <strong>MetaTrader 5</strong> application on your computer</li>
-            <li>Your <strong>Account Number</strong> is shown in the Navigator panel (left side) or the title bar</li>
-            <li>Your <strong>Password</strong> and <strong>Server</strong> were emailed to you when you created the demo account</li>
-            <li>If you don't have a demo account yet, open MT5 and select <strong>File &gt; Open an Account</strong></li>
+            <li><strong>MT5</strong>: open or log in inside MetaTrader 5 locally, then connect.</li>
+            <li><strong>IBKR</strong>: open and log in inside TWS or IB Gateway with API access enabled, then connect to localhost.</li>
+            <li><strong>TradeStation</strong>: the app opens TradeStation's authorization page in your browser.</li>
+            <li>Live accounts still require live trading enabled and <strong>Demo-Only By Default</strong> turned off in Policy & Runtime.</li>
           </ol>
-        </div>
-      )}
-
-      {!connected && platform === 'ibkr' && (
-        <div style={{
-          background: 'rgba(16, 185, 129, 0.06)',
-          border: '1px solid rgba(16, 185, 129, 0.15)',
-          borderRadius: 8,
-          padding: '16px 20px',
-          marginBottom: 20,
-          fontSize: 13,
-          color: 'var(--text-secondary)',
-          lineHeight: 1.6,
-        }}>
-          <div className="flex items-center gap-2" style={{ fontWeight: 600, marginBottom: 8, color: 'var(--accent-green)' }}>
-            <HelpCircle size={14} />
-            IBKR connection checklist
-          </div>
-          <ol style={{ paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <li>Open <strong>TWS</strong> or <strong>IB Gateway</strong> on your PC</li>
-            <li>Enable API: <strong>Configure &gt; API &gt; Settings &gt; Enable ActiveX and Socket Clients</strong></li>
-            <li>Use port <strong>7497</strong> for Paper, <strong>7496</strong> for Live (unless customized)</li>
-            <li>Use a unique <strong>Client ID</strong> (example: 1)</li>
-          </ol>
+          {liveReadinessIssue && (
+            <div className="warning-banner" style={{ fontSize: 12, marginTop: 12, padding: '8px 12px' }}>
+              <AlertTriangle size={12} />
+              {liveReadinessIssue}
+            </div>
+          )}
         </div>
       )}
 
       {connected && status?.account && (
         <div className="card" style={{ marginBottom: 20 }}>
-          {error && (
+          {connectionIssue && (
             <div className="error-banner" style={{ fontSize: 13, marginBottom: 12 }}>
-              {error}
+              {connectionIssue}
             </div>
           )}
           <div className="flex items-center gap-3" style={{ marginBottom: 16 }}>
@@ -382,11 +260,11 @@ export default function Connection({ status, onRefresh }: Props) {
 
       {!connected && (
         <div className="card">
-          <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>Account Details</h3>
+          <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>Local Platform Connection</h3>
 
-          {error && (
+          {connectionIssue && (
             <div className="error-banner" style={{ fontSize: 13 }}>
-              {error}
+              {connectionIssue}
             </div>
           )}
 
@@ -394,287 +272,127 @@ export default function Connection({ status, onRefresh }: Props) {
             <label>Platform</label>
             <select
               className="form-input"
-              value={platform}
-              onChange={(e) => setPlatform(e.target.value as 'mt5' | 'ibkr')}
+              value={selectedPlatform}
+              onChange={(e) => setSelectedPlatform(e.target.value as ConnectionPlatform)}
+              style={{ fontSize: 15, padding: '12px 16px' }}
             >
-              <option value="mt5">MetaTrader 5 (MT5)</option>
-              <option value="ibkr">Interactive Brokers (IBKR)</option>
+              <option value="mt5">MetaTrader 5 (local terminal)</option>
+              <option value="ibkr">Interactive Brokers (local TWS / IB Gateway)</option>
+              <option value="tradestation">TradeStation (browser authorization)</option>
             </select>
           </div>
 
-          {platform === 'mt5' ? (
-            <>
-              <div className="form-group">
-                <label>Account Number</label>
-                <input
-                  className="form-input"
-                  type="text"
-                  placeholder="e.g. 12345678"
-                  value={account}
-                  onChange={(e) => setAccount(e.target.value)}
-                  style={{ fontSize: 15, padding: '12px 16px' }}
-                />
-              </div>
+          <div className="warning-banner" style={{ fontSize: 12, padding: '10px 12px', marginBottom: 12 }}>
+            <AlertTriangle size={13} />
+            This app never asks for broker login passwords. Log in inside MT5, TWS / IB Gateway, or TradeStation's own browser page.
+          </div>
 
-              <div className="form-group">
-                <label>Password</label>
-                <input
-                  className="form-input"
-                  type="password"
-                  placeholder="Your MT5 password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  style={{ fontSize: 15, padding: '12px 16px' }}
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Server</label>
-                <input
-                  className="form-input"
-                  type="text"
-                  placeholder="e.g. MetaQuotes-Demo"
-                  value={server}
-                  onChange={(e) => setServer(e.target.value)}
-                  style={{ fontSize: 15, padding: '12px 16px' }}
-                />
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="form-group">
-                <label>IBKR Host</label>
-                <input
-                  className="form-input"
-                  type="text"
-                  placeholder="127.0.0.1"
-                  value={ibkrHost}
-                  onChange={(e) => setIbkrHost(e.target.value)}
-                  style={{ fontSize: 15, padding: '12px 16px' }}
-                />
-              </div>
-              <div className="form-group">
-                <label>Account Type</label>
+          {selectedPlatform === 'ibkr' && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 120px 120px', gap: 10, marginBottom: 12 }}>
+              <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                <label>IBKR account environment</label>
                 <select
                   className="form-input"
-                  value={ibkrAccountType}
-                  onChange={(e) => setIbkrAccountType(e.target.value as 'paper' | 'live')}
-                  style={{ fontSize: 15, padding: '12px 16px' }}
+                  value={ibkrEnvironment}
+                  onChange={(e) => {
+                    const environment = e.target.value as 'paper' | 'live';
+                    setIbkrEnvironment(environment);
+                    setIbkrPort(environment === 'paper' ? '7497' : '7496');
+                  }}
                 >
-                  <option value="paper">Paper Trading (Port 7497)</option>
-                  <option value="live">Live Account (Port 7496)</option>
+                  <option value="paper">Paper trading</option>
+                  <option value="live">Live account</option>
                 </select>
-                <div className="text-muted" style={{ fontSize: 12, marginTop: 6 }}>
-                  Port is set automatically to <strong>{ibkrPort}</strong> based on account type.
+                <div className="text-muted" style={{ fontSize: 11, marginTop: 5 }}>
+                  TWS defaults: paper 7497, live 7496. IB Gateway commonly uses paper 4002 and live 4001.
                 </div>
               </div>
               <div className="form-group">
-                <label>Client ID</label>
-                <input
-                  className="form-input"
-                  type="text"
-                  placeholder="1"
-                  value={ibkrClientId}
-                  onChange={(e) => setIbkrClientId(e.target.value)}
-                  style={{ fontSize: 15, padding: '12px 16px' }}
-                />
+                <label>TWS / Gateway host</label>
+                <input className="form-input" value={ibkrHost} onChange={(e) => setIbkrHost(e.target.value)} />
               </div>
               <div className="form-group">
-                <label>Account ID (optional)</label>
-                <input
-                  className="form-input"
-                  type="text"
-                  placeholder="DUxxxxxxx"
-                  value={ibkrAccountId}
-                  onChange={(e) => setIbkrAccountId(e.target.value)}
-                  style={{ fontSize: 15, padding: '12px 16px' }}
-                />
+                <label>Port</label>
+                <input className="form-input" value={ibkrPort} onChange={(e) => setIbkrPort(e.target.value)} />
               </div>
-            </>
-          )}
-
-          {platform === 'mt5' && (
-            <label className="flex items-center gap-2" style={{ fontSize: 13, marginBottom: 16 }}>
-              <input
-                type="checkbox"
-                checked={rememberCredentials}
-                onChange={(e) => setRememberCredentials(e.target.checked)}
-                disabled={status?.credential_storage_available === false}
-              />
-              Remember this account on this device
-            </label>
-          )}
-          {platform === 'ibkr' && (
-            <label className="flex items-center gap-2" style={{ fontSize: 13, marginBottom: 16 }}>
-              <input
-                type="checkbox"
-                checked={rememberIbkrSettings}
-                onChange={(e) => setRememberIbkrSettings(e.target.checked)}
-              />
-              Save account settings on this device
-            </label>
-          )}
-          {status?.credential_storage_available === false && platform === 'mt5' && (
-            <div className="warning-banner" style={{ fontSize: 11, padding: '8px 12px', marginBottom: 12 }}>
-              <AlertTriangle size={12} />
-              Secure credential storage is unavailable, so saved login is disabled.
+              <div className="form-group">
+                <label>Client ID</label>
+                <input className="form-input" value={ibkrClientId} onChange={(e) => setIbkrClientId(e.target.value)} />
+              </div>
+              <label className="flex items-center gap-2" style={{ fontSize: 12, gridColumn: '1 / -1' }}>
+                <input type="checkbox" checked={ibkrReadonly} onChange={(e) => setIbkrReadonly(e.target.checked)} />
+                Read-only IBKR API session
+              </label>
             </div>
           )}
 
-          {platform === 'mt5' && (
-            <>
-              <button
-                onClick={() => setShowAdvanced(!showAdvanced)}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: 'var(--text-muted)',
-                  fontSize: 12,
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 4,
-                  padding: '8px 0',
-                  marginBottom: showAdvanced ? 8 : 0,
-                }}
+          {selectedPlatform === 'tradestation' && (
+            <div className="form-group">
+              <label>TradeStation environment</label>
+              <select
+                className="form-input"
+                value={tradeStationEnvironment}
+                onChange={(e) => setTradeStationEnvironment(e.target.value as 'sim' | 'live')}
               >
-                {showAdvanced ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                Advanced settings
-              </button>
+                <option value="sim">SIM</option>
+                <option value="live">LIVE</option>
+              </select>
+            </div>
+          )}
 
-              {showAdvanced && (
-                <>
-                  <div className="form-group">
-                    <label>Terminal Path (usually auto-detected)</label>
-                    <input
-                      className="form-input"
-                      type="text"
-                      placeholder="Leave empty for auto-detect"
-                      value={terminalPath}
-                      onChange={(e) => setTerminalPath(e.target.value)}
-                    />
-                  </div>
-                  <button className="btn btn-secondary btn-sm mb-4" onClick={handleVerify} disabled={loading}>
-                    <Search size={12} /> Verify Terminal
-                  </button>
-                  {verifyResult && (
-                    <div className={`text-sm ${verifyResult.ok ? 'text-green' : 'text-red'}`} style={{ marginBottom: 12 }}>
-                      {verifyResult.ok
-                        ? `Found: ${verifyResult.name} (Build ${verifyResult.build})`
-                        : `Not found: ${verifyResult.error}`
-                      }
-                    </div>
-                  )}
-                </>
+          {selectedPlatform === 'mt5' && <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            onClick={() => setShowAdvanced((value) => !value)}
+            style={{ marginBottom: showAdvanced ? 12 : 0 }}
+          >
+            {showAdvanced ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            Terminal path
+          </button>}
+
+          {selectedPlatform === 'mt5' && showAdvanced && (
+            <div style={{ marginBottom: 12 }}>
+              <div className="form-group">
+                <label>MT5 terminal executable</label>
+                <input
+                  className="form-input"
+                  type="text"
+                  placeholder="Optional path to terminal64.exe"
+                  value={terminalPath}
+                  onChange={(e) => setTerminalPath(e.target.value)}
+                  style={{ fontSize: 13, padding: '10px 12px' }}
+                />
+              </div>
+              <button type="button" className="btn btn-secondary btn-sm" onClick={handleVerify} disabled={loading}>
+                <Search size={13} />
+                Verify terminal
+              </button>
+              {verifyResult && (
+                <div
+                  className={verifyResult.ok ? 'warning-banner' : 'error-banner'}
+                  style={{ fontSize: 12, marginTop: 10, padding: '8px 12px' }}
+                >
+                  {verifyResult.ok
+                    ? `Terminal found: ${verifyResult.name || 'MetaTrader 5'} build ${verifyResult.build || 'unknown'}`
+                    : (verifyResult.error || 'Terminal verification failed')}
+                </div>
               )}
-            </>
+            </div>
           )}
 
           <button
             className="btn btn-primary"
             onClick={handleConnect}
-            disabled={
-              loading
-              || (platform === 'mt5' && (!account || !password || !server))
-              || (platform === 'ibkr' && (!ibkrHost || !ibkrClientId))
-            }
+            disabled={loading}
             style={{ fontSize: 15, padding: '14px 32px', width: '100%', justifyContent: 'center', marginTop: 8 }}
           >
             {loading ? <span className="loading-spinner" /> : <Plug size={16} />}
-            {platform === 'mt5' ? 'Connect to MT5' : 'Connect to IBKR'}
+            {selectedPlatform === 'mt5'
+              ? 'Open / Connect Local MT5'
+              : selectedPlatform === 'ibkr'
+              ? `Connect IBKR ${ibkrEnvironment === 'paper' ? 'Paper' : 'Live'} Account`
+              : 'Open TradeStation Login'}
           </button>
-        </div>
-      )}
-
-      {!connected && (
-        <div className="card mt-4">
-          <div className="flex justify-between items-center" style={{ marginBottom: 12 }}>
-            <h3 style={{ fontSize: 13, fontWeight: 600 }}>Saved Accounts</h3>
-            <button className="btn btn-secondary btn-sm" onClick={() => void refreshSavedCredentials()}>
-              Refresh
-            </button>
-          </div>
-          <div className="warning-banner" style={{ fontSize: 11, padding: '8px 12px' }}>
-            <CheckCircle size={12} />
-            Passwords are stored outside SQLite and are never returned to the UI.
-          </div>
-          {savedCredsError && (
-            <div className="error-banner" style={{ fontSize: 12, marginTop: 10 }}>
-              {savedCredsError}
-            </div>
-          )}
-          {savedCreds.length === 0 && savedIbkrAccounts.length === 0 && !savedCredsError && savedCredsLoaded && (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10 }}>
-              No saved accounts found yet.
-            </div>
-          )}
-          {!savedCredsLoaded && (
-            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10 }}>
-              Loading saved MT5 accounts...
-            </div>
-          )}
-
-          {savedCreds.map((c) => (
-            <div key={`mt5-${c.account}`} className="flex justify-between items-center" style={{
-              padding: '10px 0',
-              borderBottom: '1px solid var(--border)',
-              fontSize: 13,
-            }}>
-              <div className="flex items-center gap-2">
-                <span className="badge badge-blue" style={{ fontSize: 10 }}>MT5</span>
-                <span style={{ fontWeight: 600 }}>{c.account}</span>
-                <span className="text-muted">on {c.server}</span>
-              </div>
-              <div className="flex gap-2">
-                <button
-                  className="btn btn-primary btn-sm"
-                  onClick={() => {
-                    setPlatform('mt5');
-                    setAccount(String(c.account));
-                    setServer(c.server);
-                    setTerminalPath(c.terminal_path || '');
-                    setPassword('');
-                  }}
-                >
-                  Load
-                </button>
-                <button className="btn btn-secondary btn-sm" onClick={() => handleAutoConnect(c.account)}>
-                  Auto Connect
-                </button>
-                <button className="btn btn-secondary btn-sm" onClick={() => handleDeleteCredentials(c.account)}>
-                  <Trash2 size={10} />
-                </button>
-              </div>
-            </div>
-          ))}
-
-          {savedIbkrAccounts.map((saved) => (
-            <div key={`ibkr-${saved.id}`} className="flex justify-between items-center" style={{
-              padding: '10px 0',
-              borderBottom: '1px solid var(--border)',
-              fontSize: 13,
-            }}>
-              <div className="flex items-center gap-2">
-                <span className="badge badge-purple" style={{ fontSize: 10 }}>IBKR</span>
-                <span style={{ fontWeight: 600 }}>{saved.accountId || `${saved.accountType.toUpperCase()} account`}</span>
-                <span className="text-muted">on {saved.host}:{saved.accountType === 'live' ? 7496 : 7497}</span>
-              </div>
-              <div className="flex gap-2">
-                <button
-                  className="btn btn-primary btn-sm"
-                  onClick={() => handleLoadIbkrSettings(saved)}
-                >
-                  Load
-                </button>
-                <button className="btn btn-secondary btn-sm" onClick={() => handleAutoConnectIbkr(saved)}>
-                  Auto Connect
-                </button>
-                <button className="btn btn-secondary btn-sm" onClick={() => handleDeleteIbkrSettings(saved.id)}>
-                  <Trash2 size={10} />
-                </button>
-              </div>
-            </div>
-          ))}
         </div>
       )}
     </div>

@@ -126,6 +126,19 @@ class ReplayAndAnalyticsTests(unittest.TestCase):
         ])
         self.assertGreaterEqual(result["recommended_min_confidence"], 0.70)
 
+    def test_confidence_calibration_reads_alternate_pnl_fields(self):
+        analytics = AnalyticsService()
+        result = analytics.confidence_calibration([
+            {"confidence": 0.56, "net_pnl": -1.0},
+            {"confidence": 0.58, "profit_usd": -0.5},
+            {"confidence": 0.62, "pnl": -0.4},
+            {"confidence": 0.76, "profit_usd": 1.5},
+            {"confidence": 0.80, "net_pnl": 2.0},
+        ])
+
+        self.assertEqual(result["buckets"]["55-60"]["avg_return"], -0.75)
+        self.assertGreaterEqual(result["recommended_min_confidence"], 0.70)
+
     def test_holding_time_analytics_groups_buckets_and_recommends_category_hold(self):
         analytics = AnalyticsService()
         result = analytics.holding_time_analysis([
@@ -146,5 +159,20 @@ class ReplayAndAnalyticsTests(unittest.TestCase):
         )
         self.assertEqual(
             result["recommendations_by_category"]["Stocks"]["best_bucket"],
+            "60-180 min",
+        )
+
+    def test_holding_time_analytics_reads_alternate_pnl_fields(self):
+        analytics = AnalyticsService()
+        result = analytics.holding_time_analysis([
+            {"holding_minutes": 12, "net_pnl": -1.0, "symbol_category": "Forex"},
+            {"holding_minutes": 25, "profit_usd": -0.8, "symbol_category": "Forex"},
+            {"holding_minutes": 90, "pnl": 1.4, "symbol_category": "Forex"},
+            {"holding_minutes": 120, "net_pnl": 1.2, "symbol_category": "Forex"},
+        ])
+
+        self.assertEqual(result["buckets"]["0-15 min"]["avg_return"], -1.0)
+        self.assertEqual(
+            result["recommendations_by_category"]["Forex"]["best_bucket"],
             "60-180 min",
         )

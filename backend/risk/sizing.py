@@ -1,5 +1,16 @@
-import MetaTrader5 as mt5
 import logging
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except Exception:  # pragma: no cover - handled for non-Windows/cloud runtimes
+    class _MT5Stub:
+        def __getattr__(self, name):
+            if name.isupper():
+                return 0
+            return lambda *args, **kwargs: None
+
+    mt5 = _MT5Stub()
+    MT5_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +26,10 @@ def calculate_position_size(
     max_concurrent: int = 15,
     action: str = "BUY",
 ) -> float:
+    if not MT5_AVAILABLE:
+        logger.warning("MetaTrader5 package unavailable; falling back to fixed lot sizing.")
+        return fixed_lot if fixed_lot > 0 else 0.01
+
     if use_fixed:
         return fixed_lot
 
@@ -70,6 +85,8 @@ def calculate_position_size(
 
 def _cap_by_margin(symbol: str, lots: float, max_margin: float, action: str, lot_step: float, min_lot: float) -> float:
     """Scale down volume if required margin exceeds max_margin per trade."""
+    if not MT5_AVAILABLE:
+        return lots
     try:
         order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
         tick = mt5.symbol_info_tick(symbol)
@@ -101,6 +118,8 @@ def _cap_by_margin(symbol: str, lots: float, max_margin: float, action: str, lot
 
 def _get_tick_value(symbol: str, info) -> float:
     """Get tick value in account currency."""
+    if not MT5_AVAILABLE:
+        return 0.0
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         return 0.0
@@ -110,6 +129,8 @@ def _get_tick_value(symbol: str, info) -> float:
 
 
 def _get_min_lot(symbol: str) -> float:
+    if not MT5_AVAILABLE:
+        return 0.01
     info = mt5.symbol_info(symbol)
     return info.volume_min if info else 0.01
 

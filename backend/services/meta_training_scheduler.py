@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import tempfile
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +25,9 @@ class MetaTrainingScheduler:
         auto_approve: bool = True,
         min_precision: float = 0.50,
         min_f1: float = 0.45,
+        min_positive_samples: int = 20,
+        target_column: str = "profitable_after_costs_180m",
+        should_skip: Optional[Callable[[], bool]] = None,
     ):
         self.db = db
         self.research_cycle_service = research_cycle_service
@@ -32,6 +37,9 @@ class MetaTrainingScheduler:
         self.auto_approve = bool(auto_approve)
         self.min_precision = float(min_precision)
         self.min_f1 = float(min_f1)
+        self.min_positive_samples = int(min_positive_samples)
+        self.target_column = str(target_column or "profitable_after_costs_180m")
+        self.should_skip = should_skip
 
         self._task: Optional[asyncio.Task] = None
         self._running = False
@@ -53,6 +61,8 @@ class MetaTrainingScheduler:
             "auto_approve": self.auto_approve,
             "min_precision": self.min_precision,
             "min_f1": self.min_f1,
+            "min_positive_samples": self.min_positive_samples,
+            "target_column": self.target_column,
             "last_run_at": self._last_run_at,
             "last_train_at": self._last_train_at,
             "last_trained_closed_count": self._last_trained_closed_count,
@@ -85,8 +95,8 @@ class MetaTrainingScheduler:
         first_cycle = True
         while self._running:
             if first_cycle:
-                # Avoid startup DB contention with UI/API requests.
-                await asyncio.sleep(min(30, max(5, self.interval_seconds // 3)))
+                # Avoid startup DB contention with UI/API requests and live trading.
+                await asyncio.sleep(max(60, self.interval_seconds))
                 first_cycle = False
             self._last_run_at = time.time()
             try:
@@ -102,6 +112,21 @@ class MetaTrainingScheduler:
     async def _maybe_train_once(self):
         if self.db is None or self.research_cycle_service is None:
             return
+        try:
+            temp_free = shutil.disk_usage(tempfile.gettempdir()).free
+            if temp_free < 256 * 1024 * 1024:
+                self._last_error = "Meta training skipped: temp disk has less than 256MB free."
+                logger.warning(self._last_error)
+                return
+        except Exception:
+            pass
+        if self.should_skip is not None:
+            try:
+                if bool(self.should_skip()):
+                    logger.debug("Meta training skipped: runtime is busy.")
+                    return
+            except Exception:
+                pass
 
         closed_count = await self.db.count_trade_outcomes()
         if closed_count < self.min_closed_trades:
@@ -119,42 +144,31 @@ class MetaTrainingScheduler:
             closed_count,
             self._last_trained_closed_count,
         )
-        summary = await self.research_cycle_service.train_candidate_model(
-            algorithm="logistic_regression",
-            target_column="profitable_after_costs_90m",
-            include_unexecuted=False,  # learn only from real executed outcomes
+        result = await self.research_cycle_service.maybe_train_from_new_trade_outcome(
             min_rows=self.min_closed_trades,
+            cooldown_seconds=0,
+            auto_approve=self.auto_approve,
+            min_precision=self.min_precision,
+            min_f1=self.min_f1,
+            min_positive_samples=self.min_positive_samples,
+            target_column=self.target_column,
         )
-        version_id = str(summary.get("version_id", "")).strip()
-        evaluation = summary.get("evaluation", {}) or {}
-        precision = float(evaluation.get("precision", 0.0) or 0.0)
-        f1 = float(evaluation.get("f1", 0.0) or 0.0)
-        sample_count = int(evaluation.get("sample_count", 0) or 0)
-
-        approved = False
-        activated = False
-        if self.auto_approve and version_id:
-            if sample_count >= self.min_closed_trades and precision >= self.min_precision and f1 >= self.min_f1:
-                await self.research_cycle_service.approve_model(version_id)
-                activation = await self.research_cycle_service.activate_approved_model()
-                approved = True
-                activated = bool(activation.get("activated"))
+        version_id = str(result.get("version_id", "")).strip()
+        approved = bool(result.get("approved", False))
+        activated = bool(result.get("activated", False))
+        if result.get("trained"):
+            reasons = result.get("auto_approve_reasons", []) or []
+            if approved:
                 logger.info(
-                    "Meta model auto-approved and activation attempted: version=%s activated=%s precision=%.3f f1=%.3f",
+                    "Meta model auto-approved and activation attempted: version=%s activated=%s",
                     version_id,
                     activated,
-                    precision,
-                    f1,
                 )
             else:
                 logger.info(
-                    "Meta model candidate kept unapproved: version=%s sample=%s precision=%.3f f1=%.3f thresholds=(%.3f/%.3f)",
-                    version_id,
-                    sample_count,
-                    precision,
-                    f1,
-                    self.min_precision,
-                    self.min_f1,
+                    "Meta model candidate kept unapproved: version=%s reasons=%s",
+                    version_id or "n/a",
+                    reasons,
                 )
 
         self._last_train_at = time.time()

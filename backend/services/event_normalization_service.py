@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from domain.models import ExternalEvent
@@ -156,4 +157,11 @@ class EventNormalizationService:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.timestamp()
         except ValueError:
+            pass
+        try:
+            dt = parsedate_to_datetime(cleaned)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except (TypeError, ValueError, IndexError):
             return None

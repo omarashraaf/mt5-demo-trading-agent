@@ -7,15 +7,22 @@ venv/
 
 # Node
 node_modules/
+.npm-cache/
 dist/
 dist-electron/
 release/
+release-*/
 backend_dist/
 backend_build/
 backend_spec/
+.playwright-cli/
+.playwright-mcp/
+test-results/
 
 # Database
 *.db
+*.db-shm
+*.db-wal
 
 # Logs
 *.log
@@ -25,6 +32,12 @@ backend/research_exports/
 research_exports/
 backend/research_artifacts/
 research_artifacts/
+output/
+
+# Local diagnostics and generated test artifacts
+.tmp/
+**/.tmp/
+backend/tmp_*
 
 # IDE
 .idea/

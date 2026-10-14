@@ -7,13 +7,27 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from config import config
-from api.routes import cloud_secret_service, apply_runtime_gemini_credentials, hydrate_gemini_credentials_from_cloud
+from api.routes import (
+    cloud_secret_service,
+    secret_store,
+    apply_runtime_gemini_credentials,
+    hydrate_gemini_credentials_from_cloud,
+    _current_gemini_status,
+    verify_gemini_live_availability,
+    benzinga_adapter,
+)
 from services.supabase_admin_service import SupabaseAdminService
+from services.api_key_health_service import (
+    API_KEY_HEALTH_SETTINGS_STATE_KEY,
+    ApiKeyHealthConfig,
+    ApiKeyHealthService,
+)
 from storage.db import Database
 
 router = APIRouter()
@@ -29,11 +43,38 @@ ADMIN_SESSION_TTL_SECONDS = 60 * 60 * 12
 _admin_users_cache: list[dict] = []
 _admin_users_cache_at: float = 0.0
 _admin_users_cache_lock = asyncio.Lock()
+api_key_health_service: Optional[ApiKeyHealthService] = None
 
 
 def set_database(database: Database):
     global db
     db = database
+
+
+def set_api_key_health_service(service: Optional[ApiKeyHealthService]):
+    global api_key_health_service
+    api_key_health_service = service
+
+
+def _ensure_api_key_health_service() -> ApiKeyHealthService:
+    global api_key_health_service
+    if api_key_health_service is None:
+        api_key_health_service = ApiKeyHealthService(
+            gemini_status_getter=_current_gemini_status,
+            benzinga_adapter=benzinga_adapter,
+            config=ApiKeyHealthConfig(
+                enabled=bool(config.API_HEALTH_ALERTS_ENABLED),
+                check_interval_seconds=int(config.API_HEALTH_ALERT_INTERVAL_SECONDS),
+                smtp_host=config.API_HEALTH_SMTP_HOST,
+                smtp_port=int(config.API_HEALTH_SMTP_PORT),
+                smtp_user=config.API_HEALTH_SMTP_USER,
+                smtp_password=config.API_HEALTH_SMTP_PASSWORD,
+                sender_email=config.API_HEALTH_ALERT_SENDER_EMAIL,
+                receiver_email=config.API_HEALTH_ALERT_RECEIVER_EMAIL,
+                alert_cooldown_seconds=int(config.API_HEALTH_ALERT_COOLDOWN_SECONDS),
+            ),
+        )
+    return api_key_health_service
 
 
 async def _ensure_database() -> Database:
@@ -52,6 +93,30 @@ class CreateAdminUserRequest(BaseModel):
     email: str
     password: str
     role: str = "user"
+
+
+class ApiHealthEmailAlertsRequest(BaseModel):
+    enabled: bool
+
+
+async def _load_api_key_health_settings(service: ApiKeyHealthService) -> None:
+    database = await _ensure_database()
+    state = await database.get_runtime_state(API_KEY_HEALTH_SETTINGS_STATE_KEY)
+    if not state:
+        return
+    if "email_alerts_enabled" in state:
+        service.set_alerts_enabled(bool(state.get("email_alerts_enabled")))
+
+
+async def _save_api_key_health_settings(service: ApiKeyHealthService) -> None:
+    database = await _ensure_database()
+    await database.save_runtime_state(
+        API_KEY_HEALTH_SETTINGS_STATE_KEY,
+        {
+            "email_alerts_enabled": service.email_alerts_enabled,
+            "updated_at": time.time(),
+        },
+    )
 
 
 class UpdateRoleRequest(BaseModel):
@@ -680,16 +745,16 @@ async def admin_get_cloud_gemini(authorization: Optional[str] = Header(default=N
     if not cloud_secret_service.configured:
         raise HTTPException(status_code=503, detail="Cloud secret service is not configured.")
     try:
-        row = await asyncio.to_thread(cloud_secret_service.get_secret, "GEMINI_API_KEY")
-        model_row = await asyncio.to_thread(cloud_secret_service.get_secret, "GEMINI_MODEL")
+        key = await asyncio.to_thread(secret_store.get_cloud_secret, "GEMINI_API_KEY", migrate_plaintext=True)
+        model = await asyncio.to_thread(secret_store.get_cloud_secret, "GEMINI_MODEL", migrate_plaintext=True)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to fetch cloud Gemini config: {exc}") from exc
-    key = str((row or {}).get("value") or "")
+    key = str(key or "")
     masked = f"{key[:4]}...{key[-4:]}" if len(key) >= 8 else ("*" * len(key))
     return {
         "configured": bool(key),
         "api_key_masked": masked,
-        "model": str((model_row or {}).get("value") or ""),
+        "model": str(model or ""),
         "table": config.CLOUD_SECRETS_TABLE,
     }
 
@@ -704,9 +769,9 @@ async def admin_set_cloud_gemini(req: GeminiCloudConfigRequest, authorization: O
         raise HTTPException(status_code=400, detail="api_key is required.")
     model = str(req.model or "").strip()
     try:
-        await asyncio.to_thread(cloud_secret_service.upsert_secret, key="GEMINI_API_KEY", value=api_key)
+        await asyncio.to_thread(secret_store.store_cloud_secret, "GEMINI_API_KEY", api_key)
         if model:
-            await asyncio.to_thread(cloud_secret_service.upsert_secret, key="GEMINI_MODEL", value=model)
+            await asyncio.to_thread(secret_store.store_cloud_secret, "GEMINI_MODEL", model)
         applied = await hydrate_gemini_credentials_from_cloud()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to save cloud Gemini config: {exc}") from exc
@@ -719,4 +784,55 @@ async def admin_set_cloud_gemini(req: GeminiCloudConfigRequest, authorization: O
         "gemini_available": bool(applied.get("gemini_available")),
         "event_classifier_available": bool(applied.get("event_classifier_available")),
         "strategy_advisor_available": bool(applied.get("strategy_advisor_available")),
+    }
+
+
+@router.get("/admin/api-keys-health")
+async def admin_api_keys_health(
+    authorization: Optional[str] = Header(default=None),
+    force_refresh: bool = False,
+    trigger_alerts: bool = False,
+):
+    await _require_admin(authorization)
+    service = _ensure_api_key_health_service()
+    await _load_api_key_health_settings(service)
+    if force_refresh:
+        gemini_verification = await verify_gemini_live_availability()
+        snapshot = await service.run_check(force_refresh=True, send_alerts=bool(trigger_alerts))
+        snapshot["gemini_live_verification"] = gemini_verification
+        return snapshot
+    return service.get_snapshot(force_refresh=False)
+
+
+@router.post("/admin/api-keys-health/email-alerts")
+async def admin_api_keys_health_email_alerts(
+    req: ApiHealthEmailAlertsRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    await _require_admin(authorization)
+    service = _ensure_api_key_health_service()
+    service.set_alerts_enabled(bool(req.enabled))
+    await _save_api_key_health_settings(service)
+    return service.get_snapshot(force_refresh=False)
+
+
+@router.get("/internal/api-keys-health/cron")
+async def internal_api_keys_health_cron(authorization: Optional[str] = Header(default=None)):
+    cron_secret = str(os.getenv("CRON_SECRET", "")).strip()
+    if cron_secret:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing cron authorization.")
+        token = authorization.split(" ", 1)[1].strip()
+        if token != cron_secret:
+            raise HTTPException(status_code=401, detail="Invalid cron authorization.")
+    service = _ensure_api_key_health_service()
+    await _load_api_key_health_settings(service)
+    gemini_verification = await verify_gemini_live_availability()
+    snapshot = await service.run_check(force_refresh=True, send_alerts=True)
+    return {
+        "ok": True,
+        "checked_at": snapshot.get("checked_at"),
+        "overall_status": snapshot.get("overall_status"),
+        "unhealthy_count": snapshot.get("unhealthy_count"),
+        "gemini_live_verification_ok": bool(gemini_verification.get("ok")),
     }

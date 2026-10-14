@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import pickle
 import time
 from pathlib import Path
 from typing import Optional
-
-import pandas as pd
 
 from domain.models import (
     AntiChurnAssessment,
@@ -21,6 +20,24 @@ from domain.models import (
 from research.feature_builder import build_feature_snapshot_from_inputs
 
 logger = logging.getLogger(__name__)
+
+_pd = None
+_pd_checked = False
+
+
+def _load_pandas():
+    global _pd, _pd_checked
+    if _pd_checked:
+        return _pd
+    _pd_checked = True
+    try:
+        import pandas as pd  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional in cloud runtimes
+        logger.warning("Meta-model pandas unavailable during lazy import: %s", exc)
+        _pd = None
+        return None
+    _pd = pd
+    return _pd
 
 
 class MetaModelService:
@@ -40,7 +57,12 @@ class MetaModelService:
         quality_blend_alpha: float = 0.35,
     ):
         self.db = db
-        self.artifacts_dir = Path(artifacts_dir)
+        artifacts_path = Path(artifacts_dir)
+        if artifacts_path.is_absolute():
+            self.artifacts_dir = artifacts_path
+        else:
+            backend_root = Path(__file__).resolve().parent.parent
+            self.artifacts_dir = (backend_root / artifacts_path).resolve()
         self.enabled = enabled
         self.min_profit_probability = float(min_profit_probability)
         self.hard_block_threshold = float(hard_block_threshold)
@@ -63,9 +85,13 @@ class MetaModelService:
 
     @property
     def is_active(self) -> bool:
-        return bool(self.enabled and self._model is not None and self._feature_columns)
+        return bool(self.enabled and self._model is not None and self._feature_columns and _load_pandas() is not None)
 
     async def refresh_active_model(self, *, force: bool = False):
+        pd = _load_pandas()
+        if pd is None:
+            self._clear_active()
+            return
         if not self.enabled or self.db is None:
             self._clear_active()
             return
@@ -77,23 +103,45 @@ class MetaModelService:
         self._last_refresh_at = time.time()
 
         approved = await self.db.get_latest_approved_model_version()
-        if approved is None:
-            self._clear_active()
-            return
-        target_definition = str(approved.get("target_definition") or "").strip().lower()
-        if target_definition == "no_trade_label":
-            logger.warning(
-                "Approved meta-model %s targets no_trade_label; keeping meta-model inactive for live gating.",
-                approved.get("version_id"),
-            )
+        selected = approved if self._is_usable_live_model(approved) else None
+        if selected is None and hasattr(self.db, "list_model_versions"):
+            try:
+                versions = await self.db.list_model_versions(limit=60)
+            except Exception:
+                versions = []
+            usable_fallbacks = [row for row in versions if self._is_usable_live_model(row)]
+            if usable_fallbacks:
+                usable_fallbacks.sort(
+                    key=lambda row: (
+                        float((row.get("evaluation_metrics_json") or {}).get("f1", 0.0) or 0.0),
+                        float((row.get("evaluation_metrics_json") or {}).get("precision", 0.0) or 0.0),
+                        float(row.get("training_date", 0.0) or 0.0),
+                    ),
+                    reverse=True,
+                )
+                selected = usable_fallbacks[0]
+                if approved is not None:
+                    logger.warning(
+                        "Approved meta-model %s is unusable; activating fallback model %s (%s) for live gating.",
+                        approved.get("version_id"),
+                        selected.get("version_id"),
+                        selected.get("approval_status"),
+                    )
+                else:
+                    logger.info(
+                        "No approved usable model; activating fallback model %s (%s) for live gating.",
+                        selected.get("version_id"),
+                        selected.get("approval_status"),
+                    )
+        if selected is None:
             self._clear_active()
             return
 
-        version_id = str(approved.get("version_id") or "")
+        version_id = str(selected.get("version_id") or "")
         if version_id and version_id == self._active_version_id and self._model is not None:
             return
 
-        artifact_name, summary_name = self._parse_notes_for_artifacts(str(approved.get("notes") or ""))
+        artifact_name, summary_name = self._parse_notes_for_artifacts(str(selected.get("notes") or ""))
         artifact_path = self.artifacts_dir / (artifact_name or f"{version_id}.pkl")
         summary_path = self.artifacts_dir / (summary_name or f"{version_id}.json")
         if not artifact_path.exists() or not summary_path.exists():
@@ -134,6 +182,36 @@ class MetaModelService:
             pass
         logger.info("Meta-model activated: version=%s", version_id)
 
+    def _is_usable_live_model(self, model_row: dict | None) -> bool:
+        if not model_row:
+            return False
+        target_definition = str(model_row.get("target_definition") or "").strip().lower()
+        if target_definition == "no_trade_label":
+            return False
+        evaluation = model_row.get("evaluation_metrics_json") or {}
+        try:
+            precision = float(evaluation.get("precision", 0.0) or 0.0)
+            recall = float(evaluation.get("recall", 0.0) or 0.0)
+            f1 = float(evaluation.get("f1", 0.0) or 0.0)
+            sample_count = int(evaluation.get("dataset_row_count", evaluation.get("sample_count", 0)) or 0)
+            confusion = evaluation.get("confusion_matrix", {}) or {}
+            positive_count = int(
+                evaluation.get(
+                    "positive_samples_total",
+                    int(confusion.get("tp", 0) or 0) + int(confusion.get("fn", 0) or 0),
+                )
+                or 0
+            )
+        except Exception:
+            return False
+        return (
+            sample_count >= 50
+            and positive_count >= 12
+            and precision >= 0.50
+            and recall >= 0.05
+            and f1 >= 0.45
+        )
+
     def _clear_active(self):
         self._active_version_id = ""
         self._model = None
@@ -161,8 +239,11 @@ class MetaModelService:
         gemini_assessment: GeminiAssessment | None,
         portfolio_risk_assessment: PortfolioRiskAssessment,
         anti_churn_blocked: bool = False,
+        refresh_model: bool = True,
     ) -> tuple[TradeDecisionAssessment, dict]:
-        await self.refresh_active_model()
+        pd = _load_pandas()
+        if refresh_model:
+            await self.refresh_active_model()
 
         assessment = {
             "enabled": bool(self.enabled),
@@ -201,6 +282,9 @@ class MetaModelService:
         try:
             probs = self._model.predict_proba(frame[self._feature_columns])
             profit_probability = float(probs[0][1])
+            if not math.isfinite(profit_probability):
+                raise ValueError("non-finite profit probability")
+            profit_probability = max(0.0, min(1.0, profit_probability))
         except Exception as exc:
             logger.warning("Meta-model scoring failed: %s", exc)
             assessment["reason"] = f"scoring_failed: {exc}"
@@ -210,7 +294,12 @@ class MetaModelService:
         no_trade_probability = 1.0 - profit_probability
         quality_before = float(trade_decision.trade_quality_assessment.final_trade_quality_score or 0.0)
         quality_after = (1.0 - self.quality_blend_alpha) * quality_before + self.quality_blend_alpha * profit_probability
-        blocked = profit_probability < self.hard_block_threshold and trade_decision.final_signal.action in {"BUY", "SELL"}
+        force_execute_any_conditions = bool((context.user_policy or {}).get("force_execute_any_conditions", False))
+        blocked = (
+            profit_probability < self.hard_block_threshold
+            and trade_decision.final_signal.action in {"BUY", "SELL"}
+            and not force_execute_any_conditions
+        )
         caution = profit_probability < self.min_profit_probability and trade_decision.final_signal.action in {"BUY", "SELL"}
 
         updated_quality: TradeQualityAssessment = trade_decision.trade_quality_assessment.model_copy(deep=True)
@@ -225,6 +314,8 @@ class MetaModelService:
             new_reasons.append(
                 f"Meta-model caution: profit_probability={profit_probability:.2f} below preferred {self.min_profit_probability:.2f}"
             )
+        if force_execute_any_conditions and trade_decision.final_signal.action in {"BUY", "SELL"}:
+            new_reasons.append("Force execution mode enabled: meta-model hard block bypassed.")
         if new_reasons:
             updated_quality.no_trade_reasons = list(dict.fromkeys(new_reasons))
 
@@ -236,6 +327,7 @@ class MetaModelService:
             "expected_edge": expected_edge,
             "no_trade_probability": no_trade_probability,
             "blocked": blocked,
+            "force_execute_any_conditions": force_execute_any_conditions,
             "quality_before": quality_before,
             "quality_after": updated_quality.final_trade_quality_score,
         }
@@ -273,3 +365,71 @@ class MetaModelService:
             }
         )
         return updated, assessment
+
+    async def preview_signal_insight(
+        self,
+        *,
+        context: MarketContext,
+        signal: TechnicalSignal,
+        quality: TradeQualityAssessment,
+        gemini_assessment: GeminiAssessment | None,
+        portfolio_fit_score: float,
+        anti_churn_blocked: bool = False,
+        refresh_model: bool = True,
+    ) -> dict:
+        pd = _load_pandas()
+        if refresh_model:
+            await self.refresh_active_model()
+
+        assessment = {
+            "enabled": bool(self.enabled),
+            "active": self.is_active,
+            "model_version_id": self._active_version_id if self.is_active else "",
+            "profit_probability": 0.0,
+            "expected_edge": 0.0,
+            "no_trade_probability": 1.0,
+            "reason": "no approved model",
+            "input_quality_score": float(quality.final_trade_quality_score or 0.0),
+            "quality_threshold": float(quality.threshold or 0.0),
+        }
+        if not self.is_active:
+            return assessment
+
+        feature_snapshot = build_feature_snapshot_from_inputs(
+            context=context,
+            signal=signal,
+            quality=quality,
+            gemini=gemini_assessment,
+            portfolio_risk=PortfolioRiskAssessment(portfolio_fit_score=float(portfolio_fit_score or 0.0)),
+            anti_churn=AntiChurnAssessment(blocked=bool(anti_churn_blocked)),
+        )
+
+        feature_row = {c: feature_snapshot.get(c.removeprefix("f_"), "") for c in self._feature_columns}
+        frame = pd.DataFrame([feature_row])
+        for col in self._numeric_feature_columns:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0.0).astype(float)
+        for col in self._categorical_feature_columns:
+            if col in frame.columns:
+                frame[col] = frame[col].fillna("").astype(str)
+        try:
+            probs = self._model.predict_proba(frame[self._feature_columns])
+            profit_probability = float(probs[0][1])
+            if not math.isfinite(profit_probability):
+                raise ValueError("non-finite profit probability")
+            profit_probability = max(0.0, min(1.0, profit_probability))
+        except Exception as exc:
+            logger.warning("Meta-model preview scoring failed: %s", exc)
+            assessment["reason"] = f"scoring_failed: {exc}"
+            return assessment
+
+        assessment["profit_probability"] = round(profit_probability, 4)
+        assessment["expected_edge"] = round((profit_probability * 2.0) - 1.0, 4)
+        assessment["no_trade_probability"] = round(1.0 - profit_probability, 4)
+        if profit_probability < self.hard_block_threshold:
+            assessment["reason"] = "hard_block_risk"
+        elif profit_probability < self.min_profit_probability:
+            assessment["reason"] = "caution"
+        else:
+            assessment["reason"] = "supportive"
+        return assessment

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -7,7 +8,23 @@ from domain.models import GeminiAssessment, MarketContext, TechnicalSignal, Trad
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
-    return max(minimum, min(maximum, value))
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return minimum
+    if not math.isfinite(parsed):
+        return minimum
+    return max(minimum, min(maximum, parsed))
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
 
 
 class TradeQualityService:
@@ -41,11 +58,12 @@ class TradeQualityService:
             if now_et.weekday() >= 5:
                 return False, "Market closed (weekend)."
 
-        # US stocks: regular session only (safer default).
+        # US stocks: allow extended session (pre/after market) so dashboard rows
+        # can transition out of "closed" as soon as premarket opens.
         if cat == "Stocks":
-            if self._in_time_window(now_et, 9, 30, 16, 0):
+            if self._in_time_window(now_et, 4, 0, 20, 0):
                 return True, ""
-            return False, "US stocks are outside regular session (09:30-16:00 ET)."
+            return False, "US stocks are outside extended session (04:00-20:00 ET)."
 
         # Indices: US indices during US cash, GER40 during EU cash.
         if cat == "Indices":
@@ -54,9 +72,9 @@ class TradeQualityService:
                     return True, ""
                 return False, "GER40 is outside European cash session (09:00-17:30 CET/CEST)."
             if any(token in sym for token in ("US30", "US100", "US500", "SPX500", "NAS100")):
-                if self._in_time_window(now_et, 9, 30, 16, 0):
+                if self._in_time_window(now_et, 4, 0, 20, 0):
                     return True, ""
-                return False, "US indices are outside US cash session (09:30-16:00 ET)."
+                return False, "US indices are outside extended session (04:00-20:00 ET)."
             # Unknown index fallback: keep conservative US cash window.
             if self._in_time_window(now_et, 9, 30, 16, 0):
                 return True, ""
@@ -79,7 +97,8 @@ class TradeQualityService:
         portfolio_fit_score: float,
         threshold_boost: float = 0.0,
     ) -> TradeQualityAssessment:
-        if signal.action not in {"BUY", "SELL"}:
+        action = str(signal.action or "").strip().upper()
+        if action not in {"BUY", "SELL"}:
             summary = signal.reason or "No executable setup."
             return TradeQualityAssessment(
                 final_trade_quality_score=0.0,
@@ -93,12 +112,26 @@ class TradeQualityService:
         user_policy = context.user_policy or {}
         tick = context.tick or {}
         meta = signal.metadata or {}
-        entry_price = tick.get("ask", 0.0) if signal.action == "BUY" else tick.get("bid", 0.0)
-        rr_ratio = self._reward_risk_ratio(entry_price, signal.stop_loss, signal.take_profit)
-        atr_pct = float(meta.get("atr_pct", 0.0))
-        spread_points = float(tick.get("spread", 0.0))
-        symbol_point = float(context.symbol_info.point) if context.symbol_info and context.symbol_info.point else 0.0
-        policy_min_rr = float(user_policy.get("min_reward_risk", 1.8))
+        entry_price = _safe_float(tick.get("ask", 0.0) if action == "BUY" else tick.get("bid", 0.0), 0.0)
+        raw_spread = tick.get("spread", 0.0)
+        spread_points = _safe_float(raw_spread, float("nan"))
+        spread_valid = math.isfinite(spread_points) and spread_points >= 0.0
+        symbol_point = _safe_float(context.symbol_info.point, 0.0) if context.symbol_info and context.symbol_info.point else 0.0
+        rr_ratio = self._reward_risk_ratio(
+            entry_price,
+            signal.stop_loss,
+            signal.take_profit,
+            spread_points=spread_points if spread_valid else 0.0,
+            point=symbol_point,
+        )
+        targets_valid = self._directionally_valid_targets(
+            entry_price,
+            action,
+            signal.stop_loss,
+            signal.take_profit,
+        )
+        atr_pct = _safe_float(meta.get("atr_pct", 0.0), 0.0)
+        policy_min_rr = _safe_float(user_policy.get("min_reward_risk", 1.8), 1.8)
         effective_min_rr = max(0.8, policy_min_rr)
         profile_threshold = profile.quality_threshold if profile else 0.75
         threshold = round(min(0.95, profile_threshold + self._mode_threshold_adjustment(user_policy) + threshold_boost), 2)
@@ -117,13 +150,13 @@ class TradeQualityService:
 
         h1_trend = meta.get("h1_trend", "flat")
         h4_trend = meta.get("h4_trend", "flat")
-        action_bias = "bullish" if signal.action == "BUY" else "bearish"
+        action_bias = "bullish" if action == "BUY" else "bearish"
         aligned = h1_trend == h4_trend == action_bias
         contradicting_structure = h1_trend != h4_trend and h1_trend != "flat" and h4_trend != "flat"
 
         trend_alignment_score = 0.92 if aligned else 0.45 if h1_trend == action_bias or h4_trend == action_bias else 0.18
-        momentum_quality_score = _clamp(0.5 + float(meta.get("momentum_score", 0.0)) * 2.5)
-        entry_timing_score = _clamp(0.45 + float(meta.get("entry_score", 0.0)) * 3.0)
+        momentum_quality_score = _clamp(0.5 + _safe_float(meta.get("momentum_score", 0.0), 0.0) * 2.5)
+        entry_timing_score = _clamp(0.45 + _safe_float(meta.get("entry_score", 0.0), 0.0) * 3.0)
         volatility_quality_score = self._volatility_score(atr_pct, profile.min_atr_pct if profile else 0.2)
         reward_risk_score = self._reward_risk_score(rr_ratio, effective_min_rr)
         spread_quality_score = self._spread_score(spread_points, profile_spread_limit_points)
@@ -138,17 +171,29 @@ class TradeQualityService:
             no_trade_reasons.append("H1 and H4 structure disagree.")
         if not user_policy.get("allow_counter_trend_trades", False) and not aligned:
             no_trade_reasons.append("User policy blocks counter-trend or weakly aligned trades.")
+        if entry_price <= 0.0:
+            no_trade_reasons.append("No valid live entry price is available for trade-quality assessment.")
         if profile and atr_pct < profile.min_atr_pct:
             no_trade_reasons.append(
                 f"ATR regime too weak for {profile.profile_name} ({atr_pct:.2f}% < {profile.min_atr_pct:.2f}%)."
             )
-        if profile and spread_points > profile_spread_limit_points:
+        if not spread_valid:
+            no_trade_reasons.append("Spread is not available or invalid for trade-quality assessment.")
+        elif profile and spread_points > profile_spread_limit_points:
             spread_price = spread_points * symbol_point if symbol_point > 0 else spread_points
             no_trade_reasons.append(
                 f"Spread too wide for {profile.profile_name} ({spread_points:.1f} pts / {spread_price:.3f} > {profile.max_spread:.3f})."
             )
+        stop_loss = _safe_float(signal.stop_loss, 0.0)
+        take_profit = _safe_float(signal.take_profit, 0.0)
+        if stop_loss <= 0.0 or take_profit <= 0.0:
+            no_trade_reasons.append("Protective stop-loss and take-profit are required before execution.")
+        elif not targets_valid:
+            no_trade_reasons.append(
+                f"Invalid {action} targets: stop-loss and take-profit are not positioned around live entry."
+            )
         if rr_ratio < effective_min_rr:
-            no_trade_reasons.append(f"Reward:risk deteriorated to {rr_ratio:.2f}.")
+            no_trade_reasons.append(f"Cost-adjusted reward:risk deteriorated to {rr_ratio:.2f}.")
         if self._is_choppy(meta):
             no_trade_reasons.append("Price is too close to chop/mean without clean structure.")
         if self._is_late_entry(meta):
@@ -189,7 +234,7 @@ class TradeQualityService:
         summary = (
             "Hold the setup."
             if no_trade_zone
-            else f"High-quality {signal.action} setup with score {final_score:.2f}."
+            else f"High-quality {action} setup with score {final_score:.2f}."
         )
 
         return TradeQualityAssessment(
@@ -222,42 +267,86 @@ class TradeQualityService:
         entry_price: float,
         stop_loss: float | None,
         take_profit: float | None,
+        *,
+        spread_points: float = 0.0,
+        point: float = 0.0,
     ) -> float:
         if entry_price <= 0 or stop_loss is None or take_profit is None:
             return 0.0
-        sl_distance = abs(entry_price - stop_loss)
-        tp_distance = abs(take_profit - entry_price)
-        if sl_distance <= 0:
+        entry = _safe_float(entry_price, 0.0)
+        sl = _safe_float(stop_loss, 0.0)
+        tp = _safe_float(take_profit, 0.0)
+        spread = _safe_float(spread_points, 0.0)
+        point_value = _safe_float(point, 0.0)
+        if entry <= 0 or sl <= 0 or tp <= 0:
             return 0.0
-        return tp_distance / sl_distance
+        sl_distance = abs(entry - sl)
+        tp_distance = abs(tp - entry)
+        spread_cost = max(0.0, spread) * point_value if point_value > 0 else 0.0
+        adjusted_risk = sl_distance + spread_cost
+        adjusted_reward = max(0.0, tp_distance - spread_cost)
+        if adjusted_risk <= 0:
+            return 0.0
+        return adjusted_reward / adjusted_risk
+
+    def _directionally_valid_targets(
+        self,
+        entry_price: float,
+        action: str,
+        stop_loss: float | None,
+        take_profit: float | None,
+    ) -> bool:
+        action = str(action or "").strip().upper()
+        if entry_price <= 0 or stop_loss is None or take_profit is None:
+            return False
+        entry = _safe_float(entry_price, 0.0)
+        sl = _safe_float(stop_loss, 0.0)
+        tp = _safe_float(take_profit, 0.0)
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            return False
+        if action == "BUY":
+            return sl < entry < tp
+        if action == "SELL":
+            return tp < entry < sl
+        return False
 
     def _volatility_score(self, atr_pct: float, min_atr_pct: float) -> float:
-        if atr_pct <= 0:
+        parsed_atr_pct = _safe_float(atr_pct, 0.0)
+        parsed_min_atr_pct = _safe_float(min_atr_pct, 0.0)
+        if parsed_atr_pct <= 0 or parsed_min_atr_pct <= 0:
             return 0.0
-        if atr_pct >= min_atr_pct * 1.8:
+        if parsed_atr_pct >= parsed_min_atr_pct * 1.8:
             return 0.95
-        return _clamp(atr_pct / max(min_atr_pct * 1.25, 0.01))
+        return _clamp(parsed_atr_pct / max(parsed_min_atr_pct * 1.25, 0.01))
 
     def _reward_risk_score(self, rr_ratio: float, min_rr: float) -> float:
-        if rr_ratio <= 0:
+        parsed_rr_ratio = _safe_float(rr_ratio, 0.0)
+        parsed_min_rr = _safe_float(min_rr, 0.0)
+        if parsed_rr_ratio <= 0 or parsed_min_rr <= 0:
             return 0.0
-        if rr_ratio >= min_rr * 1.3:
+        if parsed_rr_ratio >= parsed_min_rr * 1.3:
             return 0.95
-        return _clamp(rr_ratio / max(min_rr * 1.15, 0.01))
+        return _clamp(parsed_rr_ratio / max(parsed_min_rr * 1.15, 0.01))
 
     def _spread_score(self, spread: float, max_spread: float) -> float:
-        if spread <= 0:
+        parsed_spread = _safe_float(spread, 0.0)
+        parsed_max_spread = _safe_float(max_spread, 0.0)
+        if parsed_spread <= 0 or parsed_max_spread <= 0:
             return 0.0
-        if spread >= max_spread:
+        if parsed_spread >= parsed_max_spread:
             return 0.0
-        return round(_clamp(1.0 - spread / max(max_spread, 1.0)), 3)
+        return round(_clamp(1.0 - parsed_spread / max(parsed_max_spread, 1.0)), 3)
 
     def _spread_limit_points(self, max_spread: float, point: float) -> float:
         # MT5 tick spread is in points, while profile limits are maintained in
         # price terms. Convert to points before comparison.
-        if point <= 0:
-            return max_spread
-        return max_spread / point
+        max_spread_value = _safe_float(max_spread, 0.0)
+        point_value = _safe_float(point, 0.0)
+        if max_spread_value <= 0:
+            return 0.0
+        if point_value <= 0:
+            return max_spread_value
+        return max_spread_value / point_value
 
     def _news_alignment(
         self,
@@ -269,7 +358,8 @@ class TradeQualityService:
         if not assessment or not assessment.used or assessment.degraded:
             return self._event_alignment_from_context(context, signal)
 
-        direction = "bullish" if signal.action == "BUY" else "bearish"
+        action = str(signal.action or "").strip().upper()
+        direction = "bullish" if action == "BUY" else "bearish"
         base = 0.55
         if assessment.news_bias == direction:
             base = 0.82
@@ -278,7 +368,10 @@ class TradeQualityService:
         else:
             base = 0.18
 
-        risk_penalty = {"low": 0.0, "medium": 0.04, "high": 0.10}[assessment.event_risk]
+        risk_penalty = {"low": 0.0, "medium": 0.04, "high": 0.10}.get(
+            str(assessment.event_risk).lower(),
+            0.10,
+        )
         contradiction_penalty = 0.12 if assessment.contradiction_flag else 0.0
         alignment = _clamp(base - risk_penalty)
         return alignment, contradiction_penalty
@@ -291,7 +384,8 @@ class TradeQualityService:
         if not context.normalized_news:
             return 0.55, 0.0
 
-        direction = "bullish" if signal.action == "BUY" else "bearish"
+        action = str(signal.action or "").strip().upper()
+        direction = "bullish" if action == "BUY" else "bearish"
         weights = {"high": 1.0, "medium": 0.6, "low": 0.3}
         risk_order = {"low": 0, "medium": 1, "high": 2}
         bias_score = 0.0
@@ -326,12 +420,12 @@ class TradeQualityService:
         return _clamp(alignment - risk_penalty), _clamp(contradiction, 0.0, 0.18)
 
     def _is_choppy(self, meta: dict) -> bool:
-        position_in_range = float(meta.get("position_in_range", 0.5))
+        position_in_range = _safe_float(meta.get("position_in_range", 0.5), 0.5)
         entry_signal = str(meta.get("entry_signal", "none"))
         return 0.43 <= position_in_range <= 0.57 and entry_signal in {"none", ""}
 
     def _is_late_entry(self, meta: dict) -> bool:
-        ema_distance_atr = float(meta.get("ema_distance_atr", 0.0))
+        ema_distance_atr = _safe_float(meta.get("ema_distance_atr", 0.0), 0.0)
         return ema_distance_atr >= 1.1
 
     def _session_allowed(self, sessions: list[str]) -> bool:

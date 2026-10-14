@@ -9,11 +9,11 @@ const isDev = !app.isPackaged;
 let backendProcess: ChildProcess | null = null;
 let webServer: HttpServer | null = null;
 
-const API_HOST = '127.0.0.1';
-const API_PORT = 8000;
+const API_HOST = process.env.LINKTRADE_API_HOST || '127.0.0.1';
+const API_PORT = Number(process.env.LINKTRADE_API_PORT || process.env.VITE_API_PORT || 8000);
 const API_STATUS_PATH = '/api/status';
-const WEB_HOST = '127.0.0.1';
-const WEB_PORT = 5173;
+const WEB_HOST = process.env.LINKTRADE_WEB_HOST || '127.0.0.1';
+const WEB_PORT = Number(process.env.LINKTRADE_WEB_PORT || 5173);
 const DESKTOP_WEB_URL = process.env.LINKTRADE_WEB_URL || `http://${WEB_HOST}:${WEB_PORT}/auth`;
 
 function writeStartupLog(message: string): void {
@@ -322,6 +322,7 @@ async function ensureBackendRunning(): Promise<void> {
         shell: spec.shell ?? false,
         stdio: 'ignore',
         detached: false,
+        windowsHide: true,
         env: {
           ...process.env,
           PYTHONUNBUFFERED: '1',

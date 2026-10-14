@@ -1,5 +1,5 @@
 import { Routes, Route, NavLink, useLocation, Navigate } from 'react-router-dom';
-import { useState, useCallback, useEffect } from 'react';
+import { Suspense, lazy, useState, useCallback, useEffect, useRef } from 'react';
 import {
   LayoutDashboard,
   Plug,
@@ -20,20 +20,24 @@ import { api } from './utils/api';
 import type { StatusResponse } from './types';
 import SimpleDashboard from './pages/SimpleDashboard';
 import Connection from './pages/Connection';
-import Market from './pages/Market';
-import Strategy from './pages/Strategy';
-import RiskManagement from './pages/RiskManagement';
-import Execution from './pages/Execution';
-import Logs from './pages/Logs';
-import AIActivityPage from './pages/AIActivity';
-import ChatPage from './pages/Chat';
-import TradeHistoryPage from './pages/TradeHistory';
-import EventsPage from './pages/Events';
 import AuthPage from './pages/Auth';
 import { useAuth } from './context/AuthContext';
-import AdminPortal from './pages/admin/AdminPortal';
 import { runtimeConfig } from './config';
 import linkTradeLogo from './assets/linktrade-logo.png';
+
+const Market = lazy(() => import('./pages/Market'));
+const Strategy = lazy(() => import('./pages/Strategy'));
+const RiskManagement = lazy(() => import('./pages/RiskManagement'));
+const Execution = lazy(() => import('./pages/Execution'));
+const Logs = lazy(() => import('./pages/Logs'));
+const AIActivityPage = lazy(() => import('./pages/AIActivity'));
+const ChatPage = lazy(() => import('./pages/Chat'));
+const TradeHistoryPage = lazy(() => import('./pages/TradeHistory'));
+const EventsPage = lazy(() => import('./pages/Events'));
+const AdminPortal = lazy(() => import('./pages/admin/AdminPortal'));
+
+const LAST_MT5_ACCOUNT_KEY = 'linktrade_last_mt5_account_id';
+const LAST_PLATFORM_KEY = 'linktrade_last_connected_platform';
 
 const ADVANCED_NAV = [
   { path: '/chat', label: 'Gemini Chat', icon: MessageSquare },
@@ -47,18 +51,53 @@ const ADVANCED_NAV = [
   { path: '/logs', label: 'Logs', icon: ScrollText },
 ];
 
+function PageFallback() {
+  return (
+    <div className="card" style={{ marginBottom: 0 }}>
+      Loading...
+    </div>
+  );
+}
+
 export default function App() {
   const location = useLocation();
   const { loading: authLoading, user, signOut, role, approved, accessStatus } = useAuth();
   const [status, setStatus] = useState<StatusResponse | null>(null);
+  const reconnectVisibleUntilRef = useRef(0);
+  const [autoReconnectInProgress, setAutoReconnectInProgress] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(() => {
     return localStorage.getItem('advancedNav') === 'true';
   });
+  const connected = Boolean(status?.connected);
 
   const refreshStatus = useCallback(async () => {
     try {
       const s = await api.getStatus();
       setStatus(s);
+      if (s?.connected) {
+        setAutoReconnectInProgress(false);
+        reconnectVisibleUntilRef.current = 0;
+        if (s?.platform) {
+          localStorage.setItem(LAST_PLATFORM_KEY, String(s.platform));
+        }
+        const login = s?.account?.login;
+        if (typeof login === 'number' && Number.isFinite(login)) {
+          localStorage.setItem(LAST_MT5_ACCOUNT_KEY, String(login));
+        }
+        return;
+      }
+      if (s?.auto_connect?.pending) {
+        setAutoReconnectInProgress(true);
+        reconnectVisibleUntilRef.current = Date.now() + 12000;
+        return;
+      }
+      if (s?.auto_connect?.paused) {
+        setAutoReconnectInProgress(false);
+        reconnectVisibleUntilRef.current = 0;
+        return;
+      }
+      setAutoReconnectInProgress(false);
+      reconnectVisibleUntilRef.current = 0;
     } catch {
       // Keep last known status on transient API timeouts to avoid UI flicker
       // between dashboard and connection state.
@@ -66,10 +105,48 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let inFlight = false;
+
+    const schedule = () => {
+      if (cancelled) return;
+      const hidden = document.visibilityState === 'hidden';
+      const intervalMs = hidden ? 30000 : connected ? 8000 : 12000;
+      timer = setTimeout(tick, intervalMs);
+    };
+
+    const tick = async () => {
+      if (cancelled) return;
+      if (inFlight) {
+        schedule();
+        return;
+      }
+      inFlight = true;
+      try {
+        await refreshStatus();
+      } finally {
+        inFlight = false;
+        schedule();
+      }
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        if (timer) clearTimeout(timer);
+        void tick();
+      }
+    };
+
     refreshStatus();
-    const timer = setInterval(refreshStatus, 8000);
-    return () => clearInterval(timer);
-  }, [refreshStatus]);
+    schedule();
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [connected, refreshStatus]);
 
   const toggleAdvanced = () => {
     setAdvancedOpen((prev) => {
@@ -78,7 +155,18 @@ export default function App() {
     });
   };
 
-  const connected = Boolean(status?.connected && status?.account);
+  const hasSavedMt5Hint = Boolean(localStorage.getItem(LAST_MT5_ACCOUNT_KEY));
+  const preferredPlatform = String(localStorage.getItem(LAST_PLATFORM_KEY) || '').trim().toLowerCase();
+  const allowMt5ReconnectHint = preferredPlatform === '' || preferredPlatform === 'mt5';
+  const reconnectWindowActive = reconnectVisibleUntilRef.current > Date.now();
+  const reconnecting = !connected && allowMt5ReconnectHint && hasSavedMt5Hint && (
+    autoReconnectInProgress
+    || Boolean(status?.auto_connect?.pending)
+    || reconnectWindowActive
+  );
+  const accountModeLabel = connected
+    ? (status?.is_demo ? 'Demo Mode' : 'Live Mode')
+    : (reconnecting ? 'Reconnecting' : 'Not connected');
   const authed = Boolean(user) || !runtimeConfig.requireAuth;
   let portalRedirectTarget: URL | null = null;
   try {
@@ -93,7 +181,11 @@ export default function App() {
   );
 
   if (location.pathname.startsWith('/admin')) {
-    return <AdminPortal />;
+    return (
+      <Suspense fallback={<PageFallback />}>
+        <AdminPortal />
+      </Suspense>
+    );
   }
 
   if (authLoading) {
@@ -159,7 +251,9 @@ export default function App() {
                 {status?.account?.name || `Account ${status?.account?.login}`}
               </span>
             ) : (
-              'Demo Mode'
+              <span style={{ color: reconnecting ? 'var(--accent-orange)' : 'var(--text-muted)' }}>
+                {accountModeLabel}
+              </span>
             )}
           </div>
           {runtimeConfig.requireAuth && (
@@ -246,25 +340,42 @@ export default function App() {
       </aside>
 
       <main className="main-content">
-        <div className="warning-banner">
-          This is a demo account. Practice trading with virtual money. Results here do not guarantee real profits.
-        </div>
+        {connected && status?.is_demo && (
+          <div className="warning-banner">
+            This is a demo account. Practice trading with virtual money. Results here do not guarantee real profits.
+          </div>
+        )}
 
-        <Routes>
-          <Route path="/auth" element={<Navigate to="/" replace />} />
-          <Route path="/" element={<SimpleDashboard status={status} onRefresh={refreshStatus} />} />
-          <Route path="/connection" element={<Connection status={status} onRefresh={refreshStatus} />} />
-          <Route path="/market" element={<Market connected={connected} />} />
-          <Route path="/strategy" element={<Strategy connected={connected} />} />
-          <Route path="/risk" element={<RiskManagement status={status} />} />
-          <Route path="/execution" element={<Execution connected={connected} status={status} />} />
-          <Route path="/trade-history" element={<TradeHistoryPage connected={connected} />} />
-          <Route path="/ai-activity" element={<AIActivityPage status={status} />} />
-          <Route path="/chat" element={<ChatPage connected={connected} />} />
-          <Route path="/logs" element={<Logs />} />
-          <Route path="/events" element={<EventsPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        {connected && !status?.is_demo && (
+          <div
+            className="warning-banner"
+            style={{
+              background: 'rgba(239, 68, 68, 0.08)',
+              borderColor: 'rgba(239, 68, 68, 0.5)',
+              color: 'var(--accent-red)',
+            }}
+          >
+            Live MT5 account connected. Real-money safeguards are active.
+          </div>
+        )}
+
+        <Suspense fallback={<PageFallback />}>
+          <Routes>
+            <Route path="/auth" element={<Navigate to="/" replace />} />
+            <Route path="/" element={<SimpleDashboard status={status} onRefresh={refreshStatus} reconnecting={reconnecting} />} />
+            <Route path="/connection" element={<Connection status={status} onRefresh={refreshStatus} />} />
+            <Route path="/market" element={<Market connected={connected} />} />
+            <Route path="/strategy" element={<Strategy connected={connected} />} />
+            <Route path="/risk" element={<RiskManagement status={status} />} />
+            <Route path="/execution" element={<Execution connected={connected} status={status} />} />
+            <Route path="/trade-history" element={<TradeHistoryPage connected={connected} />} />
+            <Route path="/ai-activity" element={<AIActivityPage status={status} />} />
+            <Route path="/chat" element={<ChatPage connected={connected} />} />
+            <Route path="/logs" element={<Logs />} />
+            <Route path="/events" element={<EventsPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Suspense>
       </main>
     </div>
   );

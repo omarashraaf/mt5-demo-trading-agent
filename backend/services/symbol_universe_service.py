@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from config import AppConfig, config
 
@@ -17,8 +18,18 @@ ASSET_CLASS_ALIASES = {
 SYMBOL_ALIASES = {
     "SPX500": "US500",
     "NAS100": "US100",
+    "DAX": "GER40",
+    "DAX40": "GER40",
+    "DE40": "GER40",
+    "GER30": "GER40",
+    "GER30M": "GER40",
+    "GDAXIM": "GER40",
+    "FTSE100": "UK100",
+    "FTSE": "UK100",
     "XAUUSD": "GOLD",
     "XAU": "GOLD",
+    "XAGUSD": "SILVER",
+    "XAG": "SILVER",
     "XTIUSD": "WTI",
     "USOIL": "WTI",
     "XBRUSD": "BRENT",
@@ -29,11 +40,25 @@ PREFERRED_BROKER_SYMBOLS = {
     "US500": ["US500", "SPX500"],
     "US100": ["US100", "NAS100"],
     "US30": ["US30"],
-    "GER40": ["GER40", "DAX40"],
+    "GER40": ["DE40", "DAX", "GER30", "GER30M", "GDAXIM", "GER40", "DAX40"],
+    "UK100": ["UK100", "FTSE100", "FTSE"],
     "GOLD": ["XAUUSD", "XAU", "GOLD"],
+    "SILVER": ["XAGUSD", "XAG", "SILVER"],
     "WTI": ["USOIL", "XTIUSD", "WTI"],
     "BRENT": ["UKOIL", "XBRUSD", "BRENT"],
 }
+
+AGGRESSIVE_CFD_FOCUS_SYMBOLS = [
+    "US500",
+    "US100",
+    "US30",
+    "GER40",
+    "UK100",
+    "GOLD",
+    "SILVER",
+    "WTI",
+    "BRENT",
+]
 
 
 @dataclass(frozen=True)
@@ -53,7 +78,7 @@ class SymbolUniverseService:
 
     def summary(self) -> UniverseSummary:
         return UniverseSummary(
-            mode="broker-stocks-indices-commodities-no-forex",
+            mode="broker-all-supported-asset-classes",
             active_asset_classes=list(self.config.ACTIVE_ASSET_CLASSES),
             enabled_symbols=list(self.config.ENABLED_SYMBOLS),
             disabled_symbols=list(self.config.DISABLED_SYMBOLS),
@@ -62,13 +87,15 @@ class SymbolUniverseService:
 
     def summary_dict(self) -> dict:
         return {
-            "mode": "broker-stocks-indices-commodities-no-forex",
+            "mode": "broker-all-supported-asset-classes",
             "active_asset_classes": list(self.config.ACTIVE_ASSET_CLASSES),
             "enabled_symbols": list(self.config.ENABLED_SYMBOLS),
             "auto_trade_fallback_symbols": list(self.config.AUTO_TRADE_FALLBACK_SYMBOLS),
             "disabled_symbols": list(self.config.DISABLED_SYMBOLS),
             "symbol_profile_overrides": dict(self.config.SYMBOL_PROFILE_OVERRIDES),
             "selection_mode": "all_active_asset_classes" if self.uses_all_symbols else "explicit_symbols",
+            "aggressive_focus": "cfd_indices_commodities",
+            "aggressive_cfd_symbols": list(AGGRESSIVE_CFD_FOCUS_SYMBOLS),
         }
 
     @property
@@ -84,7 +111,7 @@ class SymbolUniverseService:
         return ASSET_CLASS_ALIASES.get(cleaned.upper(), cleaned.title())
 
     def canonical_symbol(self, symbol: str | None) -> str:
-        cleaned = (symbol or "").strip().upper()
+        cleaned = symbol.strip().upper() if isinstance(symbol, str) else ""
         if not cleaned:
             return ""
         return SYMBOL_ALIASES.get(cleaned, cleaned)
@@ -99,11 +126,13 @@ class SymbolUniverseService:
             return "Indices"
         if override in {"commodities", "gold"}:
             return "Commodities"
+        if override == "silver":
+            return "Commodities"
         if override == "stocks":
             return "Stocks"
         if canonical in {"US500", "US100", "US30", "GER40", "SPX500", "NAS100"}:
             return "Indices"
-        if canonical in {"GOLD", "WTI", "BRENT", "NATGAS", "XAUUSD", "USOIL", "UKOIL", "XTIUSD", "XBRUSD"}:
+        if canonical in {"GOLD", "SILVER", "WTI", "BRENT", "NATGAS", "XAUUSD", "XAGUSD", "USOIL", "UKOIL", "XTIUSD", "XBRUSD"}:
             return "Commodities"
         if len(canonical) == 6 and canonical.isalpha():
             return "Forex"
@@ -147,6 +176,8 @@ class SymbolUniverseService:
     def filter_market_symbols(self, symbols: list[dict], *, include_inactive: bool = False) -> list[dict]:
         filtered: list[dict] = []
         for symbol_info in symbols:
+            if not isinstance(symbol_info, dict):
+                continue
             symbol = self.canonical_symbol(symbol_info.get("name", ""))
             category = self.normalize_asset_class(symbol_info.get("category"))
             is_active = self.is_symbol_active(symbol, category)
@@ -164,7 +195,9 @@ class SymbolUniverseService:
         grouped: dict[str, list[dict]] = {}
         ordered: list[str] = []
         for item in market_symbols:
-            canonical = self.canonical_symbol(item.get("canonical_symbol") or item.get("name", ""))
+            if not isinstance(item, dict):
+                continue
+            canonical = self._item_canonical_symbol(item)
             if not canonical:
                 continue
             if canonical not in grouped:
@@ -193,7 +226,9 @@ class SymbolUniverseService:
     def resolve_requested_symbols(self, symbols: list[str], market_symbols: list[dict]) -> list[str]:
         grouped: dict[str, list[dict]] = {}
         for item in market_symbols:
-            canonical = self.canonical_symbol(item.get("canonical_symbol") or item.get("name", ""))
+            if not isinstance(item, dict):
+                continue
+            canonical = self._item_canonical_symbol(item)
             if not canonical:
                 continue
             grouped.setdefault(canonical, []).append(item)
@@ -204,7 +239,7 @@ class SymbolUniverseService:
             canonical = self.canonical_symbol(symbol)
             actual = self._pick_best_market_symbol(
                 canonical=canonical,
-                requested_raw=(symbol or "").strip().upper(),
+                requested_raw=self._symbol_name(symbol).upper(),
                 candidates=grouped.get(canonical, []),
             )
             if not actual or actual in seen_actual:
@@ -217,6 +252,29 @@ class SymbolUniverseService:
         requested = self.config.AUTO_TRADE_FALLBACK_SYMBOLS or self.config.ENABLED_SYMBOLS
         resolved = self.resolve_requested_symbols(requested, market_symbols)
         return resolved[:limit] if limit is not None else resolved
+
+    def aggressive_cfd_symbols(self, market_symbols: list[dict], *, limit: int | None = None) -> list[str]:
+        resolved = self.resolve_requested_symbols(AGGRESSIVE_CFD_FOCUS_SYMBOLS, market_symbols)
+        category_by_name = {
+            self._symbol_name(item.get("name")).upper(): self.normalize_asset_class(item.get("category"))
+            for item in market_symbols
+            if isinstance(item, dict) and self._symbol_name(item.get("name"))
+        }
+        filtered: list[str] = []
+        seen: set[str] = set()
+        for symbol in resolved:
+            canonical = self.canonical_symbol(symbol)
+            expected = self.expected_category_for_symbol(canonical)
+            if expected not in {"Indices", "Commodities"}:
+                continue
+            actual_category = category_by_name.get(self._symbol_name(symbol).upper())
+            if actual_category and actual_category not in {"Indices", "Commodities"}:
+                continue
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            filtered.append(symbol)
+        return filtered[:limit] if limit is not None else filtered
 
     def inactive_reason(self, symbol: str | None, category: str | None = None) -> str:
         canonical = self.canonical_symbol(symbol)
@@ -246,7 +304,7 @@ class SymbolUniverseService:
                 item=item,
             ),
         )
-        return best.get("name", "")
+        return self._symbol_name(best.get("name"))
 
     def _score_market_symbol(
         self,
@@ -255,13 +313,15 @@ class SymbolUniverseService:
         requested_raw: str,
         item: dict,
     ) -> int:
-        raw = (item.get("name", "") or "").strip().upper()
+        raw = self._symbol_name(item.get("name")).upper()
         category = self.normalize_asset_class(item.get("category"))
-        path = (item.get("path", "") or "").lower()
-        desc = (item.get("description", "") or "").lower()
+        path = self._lower_text(item.get("path"))
+        desc = self._lower_text(item.get("description"))
         expected_category = self.expected_category_for_symbol(canonical)
 
         score = 0
+        if raw:
+            score += 10
         if requested_raw and raw == requested_raw:
             score += 120
 
@@ -272,16 +332,31 @@ class SymbolUniverseService:
         if expected_category and category == expected_category:
             score += 45
         elif expected_category == "Commodities" and category == "Stocks":
-            score -= 60
+            score -= 160
         elif expected_category == "Indices" and category == "Stocks":
-            score -= 35
+            score -= 120
         elif expected_category and category not in {expected_category, "Other"}:
             score -= 20
 
-        if item.get("trade_enabled"):
+        trade_enabled = item.get("trade_enabled")
+        if self._truthy_flag(trade_enabled):
             score += 12
-        if item.get("visible"):
+        elif self._falsey_flag(trade_enabled):
+            score -= 140
+        visible = item.get("visible")
+        if self._truthy_flag(visible):
             score += 5
+        elif self._falsey_flag(visible):
+            score -= 140
+        # Prefer symbols that currently have executable quotes.
+        try:
+            bid = float(item.get("bid", 0.0) or 0.0)
+            ask = float(item.get("ask", 0.0) or 0.0)
+        except Exception:
+            bid = 0.0
+            ask = 0.0
+        if math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > bid:
+            score += 20
 
         if self._matches_expected_hints(canonical, path, desc):
             score += 25
@@ -293,10 +368,49 @@ class SymbolUniverseService:
 
         return score
 
+    def _truthy_flag(self, value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        if isinstance(value, (int, float)):
+            return value == 1
+        return False
+
+    def _falsey_flag(self, value) -> bool:
+        if isinstance(value, bool):
+            return not value
+        if isinstance(value, str):
+            return value.strip().lower() in {"0", "false", "no", "n", "off"}
+        if isinstance(value, (int, float)):
+            return value == 0
+        return False
+
+    def _lower_text(self, value) -> str:
+        return value.lower() if isinstance(value, str) else ""
+
+    def _symbol_name(self, value) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    def _item_canonical_symbol(self, item: dict) -> str:
+        canonical = self.canonical_symbol(self._symbol_name(item.get("canonical_symbol")))
+        if canonical:
+            return canonical
+        name = self._symbol_name(item.get("name"))
+        canonical = self.canonical_symbol(name)
+        if canonical:
+            for separator in (".", "-", "_"):
+                prefix = name.split(separator, 1)[0]
+                prefix_canonical = self.canonical_symbol(prefix)
+                if prefix_canonical in PREFERRED_BROKER_SYMBOLS:
+                    return prefix_canonical
+        return canonical
+
     def _matches_expected_hints(self, canonical: str, path: str, desc: str) -> bool:
         haystack = f"{path} {desc}"
         hints = {
             "GOLD": ("gold", "bullion", "metal", "xau", "metals"),
+            "SILVER": ("silver", "xag", "metal", "metals"),
             "WTI": ("wti", "oil", "crude", "energy", "usoil"),
             "BRENT": ("brent", "oil", "crude", "energy", "ukoil"),
             "US500": ("index", "spx", "s&p", "cash", "indices"),

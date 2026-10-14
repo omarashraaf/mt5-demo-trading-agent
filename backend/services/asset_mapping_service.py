@@ -66,6 +66,8 @@ class AssetMappingService:
         for candidate in candidates.values():
             symbol = self.universe_service.canonical_symbol(candidate.symbol)
             inferred_category = self._infer_category(symbol)
+            if inferred_category not in {"Indices", "Commodities"}:
+                continue
             if not self.universe_service.is_symbol_active(symbol, inferred_category):
                 continue
             result.append(candidate.model_copy(update={"symbol": symbol}))

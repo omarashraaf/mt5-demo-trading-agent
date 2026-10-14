@@ -19,6 +19,19 @@ from dotenv import load_dotenv
 
 from agent.interface import AgentInput, TradeSignal, TradingAgent
 from domain.models import GeminiAssessment
+from services.gemini_model_fallback import (
+    build_structured_output_model_candidates,
+    cooldown_remaining_seconds,
+    is_rate_limit_error,
+    mark_model_cooldown,
+    next_available_model,
+)
+from services.nvidia_chat_client import (
+    NvidiaChatCompletionsClient,
+    nvidia_api_key,
+    nvidia_model_name,
+    nvidia_provider_enabled,
+)
 
 load_dotenv()
 
@@ -89,14 +102,40 @@ class GeminiAgent(TradingAgent):
 
     def __init__(self):
         self._client = None
-        self.model_name: str = (os.getenv("GEMINI_MODEL", "gemma-3-1b-it") or "gemma-3-1b-it").strip()
+        self.model_name: str = (os.getenv("GEMINI_MODEL", "gemma-4-26b-a4b-it") or "gemma-4-26b-a4b-it").strip()
+        self.active_model_name: str = self.model_name
         self._last_call_time: float = 0.0
         self._unavailable_reason: str = ""
         self._runtime_last_error: str = ""
+        self._runtime_last_error_at: float = 0.0
+        self._runtime_last_success_at: float = 0.0
         self._quota_block_until: float = 0.0
+        self._model_cooldown_until: dict[str, float] = {}
         self._init_client()
 
     def _init_client(self):
+        if nvidia_provider_enabled(model_name=self.model_name):
+            api_key = nvidia_api_key(os.getenv("GEMINI_API_KEY", ""))
+            if not api_key:
+                self._unavailable_reason = "NVIDIA_API_KEY not set"
+                logger.warning(self._unavailable_reason)
+                self._client = None
+                return
+            try:
+                self.model_name = nvidia_model_name(self.model_name)
+                self.active_model_name = self.model_name
+                self._client = NvidiaChatCompletionsClient(
+                    api_key=api_key,
+                    timeout_seconds=float(os.getenv("GEMINI_TIMEOUT_SECONDS", "25") or 25),
+                )
+                self._unavailable_reason = ""
+                logger.info("Gemini advisory agent initialized through NVIDIA chat completions")
+            except Exception as exc:
+                self._unavailable_reason = str(exc)
+                logger.error("Failed to initialize NVIDIA chat completions: %s", exc)
+                self._client = None
+            return
+
         if genai is None or types is None:
             self._unavailable_reason = (
                 f"google-genai dependency unavailable: {GEMINI_IMPORT_ERROR}"
@@ -148,24 +187,94 @@ class GeminiAgent(TradingAgent):
         return self._runtime_last_error
 
     @property
+    def runtime_last_error_at(self) -> float:
+        return self._runtime_last_error_at
+
+    @property
+    def runtime_last_success_at(self) -> float:
+        return self._runtime_last_success_at
+
+    @property
     def degraded(self) -> bool:
         return bool(self._runtime_last_error)
 
     def mark_runtime_error(self, error: str):
         self._runtime_last_error = str(error or "").strip()
+        self._runtime_last_error_at = time.time() if self._runtime_last_error else 0.0
 
     def clear_runtime_error(self):
         self._runtime_last_error = ""
+        self._runtime_last_error_at = 0.0
+
+    def mark_runtime_success(self):
+        self.clear_runtime_error()
+        self._runtime_last_success_at = time.time()
 
     def _quota_block_message(self) -> str:
-        remaining = max(0, int(self._quota_block_until - time.time()))
+        remaining = cooldown_remaining_seconds(self._model_candidates(), self._model_cooldown_until)
         return f"Gemini temporarily blocked after quota exhaustion. Retry in ~{remaining}s."
 
     def _is_quota_blocked(self) -> bool:
-        return self._quota_block_until > time.time()
+        return next_available_model(self._model_candidates(), self._model_cooldown_until) is None
 
     def _mark_quota_exhausted(self, cooldown_seconds: int = 1800):
-        self._quota_block_until = max(self._quota_block_until, time.time() + cooldown_seconds)
+        active_model = self.active_model_name or self.model_name
+        if active_model:
+            self._model_cooldown_until[active_model] = max(
+                float(self._model_cooldown_until.get(active_model, 0.0) or 0.0),
+                time.time() + cooldown_seconds,
+            )
+        self._sync_quota_block()
+
+    def _model_candidates(self) -> list[str]:
+        return build_structured_output_model_candidates(
+            self.model_name,
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+        )
+
+    def _sync_quota_block(self):
+        candidates = self._model_candidates()
+        if next_available_model(candidates, self._model_cooldown_until) is not None:
+            self._quota_block_until = 0.0
+            return
+        remaining = cooldown_remaining_seconds(candidates, self._model_cooldown_until)
+        self._quota_block_until = time.time() + remaining if remaining > 0 else 0.0
+
+    def _generate_with_model_fallback(self, *, contents, config):
+        if self._client is None:
+            raise RuntimeError("Gemini client is not initialized.")
+        last_error: Exception | None = None
+        for model_name in self._model_candidates():
+            if float(self._model_cooldown_until.get(model_name, 0.0) or 0.0) > time.time():
+                continue
+            try:
+                response = self._client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+                self.active_model_name = model_name
+                self._sync_quota_block()
+                return response
+            except Exception as exc:
+                last_error = exc
+                if is_rate_limit_error(exc):
+                    self.mark_runtime_error("Quota exhausted / rate limited. Using technical logic only until quota resets.")
+                    mark_model_cooldown(
+                        self._model_cooldown_until,
+                        model_name,
+                        error_text=str(exc),
+                        default_seconds=1800.0,
+                    )
+                    self._sync_quota_block()
+                    logger.warning("Gemini model %s rate limited, trying fallback model.", model_name)
+                    continue
+                raise
+        self._sync_quota_block()
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("All configured Gemini models are in cooldown.")
 
     def evaluate(self, input_data: AgentInput) -> TradeSignal:
         assessment = self.assess(input_data)
@@ -210,17 +319,19 @@ class GeminiAgent(TradingAgent):
                 time.sleep(4.5 - (now - self._last_call_time))
             self._last_call_time = time.time()
 
-            contents = self._build_contents(input_data, technical_signal)
+            contents = (
+                f"{SYSTEM_INSTRUCTION}\n\n"
+                "Input payload (JSON):\n"
+                f"{self._build_contents(input_data, technical_signal)}"
+            )
             config_kwargs = {
-                "system_instruction": SYSTEM_INSTRUCTION,
                 "temperature": 0.1,
                 "response_mime_type": "application/json",
             }
             if self._supports_google_search():
                 config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
             config = types.GenerateContentConfig(**config_kwargs)
-            response = self._client.models.generate_content(
-                model=self.model_name,
+            response = self._generate_with_model_fallback(
                 contents=contents,
                 config=config,
             )
@@ -228,15 +339,15 @@ class GeminiAgent(TradingAgent):
             assessment = self._parse_assessment(text)
             assessment.used = True
             assessment.available = True
-            assessment.raw_payload = {"raw_text": text}
-            self.clear_runtime_error()
+            assessment.raw_payload = {"raw_text": text, "model": self.active_model_name}
+            self.mark_runtime_success()
             return assessment
         except Exception as exc:
             error_str = str(exc)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            if is_rate_limit_error(error_str):
                 logger.warning("Gemini rate limited for %s", input_data.symbol)
-                self._mark_quota_exhausted()
-                self.clear_runtime_error()
+                self._sync_quota_block()
+                self.mark_runtime_error("Quota exhausted / rate limited. Using technical logic only until quota resets.")
                 return GeminiAssessment(
                     used=False,
                     available=False,
@@ -295,13 +406,16 @@ class GeminiAgent(TradingAgent):
             self._last_call_time = time.time()
 
             config = types.GenerateContentConfig(
-                system_instruction=NORMALIZED_NEWS_SYSTEM_INSTRUCTION,
                 temperature=0.1,
                 response_mime_type="application/json",
             )
-            response = self._client.models.generate_content(
-                model=self.model_name,
-                contents=self._build_normalized_news_contents(context, technical_signal, normalized_news),
+            contents = (
+                f"{NORMALIZED_NEWS_SYSTEM_INSTRUCTION}\n\n"
+                "Input payload (JSON):\n"
+                f"{self._build_normalized_news_contents(context, technical_signal, normalized_news)}"
+            )
+            response = self._generate_with_model_fallback(
+                contents=contents,
                 config=config,
             )
             text = (response.text or "").strip()
@@ -312,15 +426,16 @@ class GeminiAgent(TradingAgent):
             assessment.raw_payload = {
                 "raw_text": text,
                 "normalized_news_count": len(normalized_news),
+                "model": self.active_model_name,
             }
-            self.clear_runtime_error()
+            self.mark_runtime_success()
             return assessment
         except Exception as exc:
             error_str = str(exc)
             logger.error("Gemini normalized-news assessment failed for %s: %s", context.symbol, exc)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                self._mark_quota_exhausted()
-                self.clear_runtime_error()
+            if is_rate_limit_error(error_str):
+                self._sync_quota_block()
+                self.mark_runtime_error("Quota exhausted / rate limited. Using technical logic only until quota resets.")
                 return GeminiAssessment(
                     used=False,
                     available=False,
@@ -448,6 +563,10 @@ Return only the required JSON schema."""
             data = json.loads(cleaned)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Malformed Gemini JSON: {cleaned[:200]}") from exc
+        if isinstance(data, list):
+            data = next((item for item in data if isinstance(item, dict)), {})
+        if not isinstance(data, dict):
+            data = {}
 
         news_bias = str(data.get("news_bias", "neutral")).lower()
         if news_bias not in {"bullish", "bearish", "neutral"}:

@@ -1,4 +1,4 @@
-export interface AccountInfo {
+﻿export interface AccountInfo {
   login: number;
   name: string;
   server: string;
@@ -60,6 +60,7 @@ export interface ExternalEventRecord {
   id: number;
   source: string;
   source_event_id: string;
+  dedupe_key?: string;
   title: string;
   summary: string;
   timestamp_utc: number;
@@ -68,6 +69,10 @@ export interface ExternalEventRecord {
   country: string;
   importance: string;
   affected_assets: string[];
+  raw_payload?: Record<string, unknown>;
+  created_at?: number;
+  usable?: boolean;
+  usability_reason?: string;
 }
 
 export interface EventAssetMappingRecord {
@@ -99,7 +104,7 @@ export interface GeminiEventAssessmentRecord {
   created_at: number;
 }
 
-export type PolicyMode = 'safe' | 'balanced' | 'aggressive';
+export type PolicyMode = 'safe' | 'balanced' | 'aggressive' | 'custom';
 export type GeminiRole = 'off' | 'advisory' | 'confirmation-required';
 
 export interface UserPolicySettings {
@@ -107,11 +112,23 @@ export interface UserPolicySettings {
   allowed_symbols: string[];
   max_risk_per_trade: number;
   max_daily_drawdown: number;
+  max_weekly_loss?: number;
+  max_drawdown?: number;
   max_open_trades: number;
   max_trades_per_symbol: number;
+  max_correlated_exposure?: number;
+  max_lot_size?: number;
+  max_leverage_exposure?: number;
+  max_trades_per_day?: number;
   max_margin_utilization: number;
   min_free_margin: number;
   min_reward_risk: number;
+  max_spread?: number;
+  min_confidence?: number;
+  allowed_asset_classes?: string[];
+  news_blackout_behavior?: 'block' | 'reduce_size' | 'warn' | string;
+  auto_trading_allowed?: boolean;
+  live_execution_allowed?: boolean;
   allow_counter_trend_trades: boolean;
   allow_overnight_holding: boolean;
   gemini_role: GeminiRole;
@@ -123,29 +140,79 @@ export interface RuntimeControls {
   auto_trade_enabled: boolean;
   auto_trade_scan_interval_seconds: number;
   panic_stop: boolean;
+  auto_trade_budget_mode?: 'full_margin' | 'custom_budget';
+  auto_trade_budget_usd?: number | null;
+}
+
+export interface KillSwitchState {
+  enabled: boolean;
+  reason?: string;
+  set_by?: string;
+  set_at?: number;
+}
+
+export interface ApiKeyHealthItem {
+  id: string;
+  name: string;
+  configured: boolean;
+  enabled: boolean;
+  available: boolean;
+  degraded: boolean;
+  state: string;
+  credits_pct?: number | null;
+  status: 'healthy' | 'warning' | 'degraded' | 'offline' | 'inactive' | 'low_credits' | string;
+  reason?: string;
+  checked_at: number;
+}
+
+export interface ApiKeysHealthResponse {
+  checked_at: number;
+  overall_status: 'healthy' | 'warning' | 'degraded' | string;
+  unhealthy_count: number;
+  warning_count?: number;
+  items: ApiKeyHealthItem[];
+  email_alerts?: {
+    enabled: boolean;
+    configured: boolean;
+    last_alert_at?: number | null;
+  };
 }
 
 export interface PolicySettingsResponse {
   user_policy: UserPolicySettings;
-  presets: Record<PolicyMode, UserPolicySettings>;
+  presets: Partial<Record<PolicyMode, UserPolicySettings>>;
   runtime_controls: RuntimeControls;
   runtime_settings: Record<string, unknown>;
   universe?: UniverseSettings;
   event_providers?: {
-    finnhub?: ProviderHealth;
+    benzinga?: ProviderHealth;
   };
 }
 
+export type TradingPlatform = 'mt5' | 'ibkr' | 'tradestation';
+
 export interface StatusResponse {
   connected: boolean;
-  platform?: 'mt5' | 'ibkr';
-  platforms_supported?: Array<'mt5' | 'ibkr'>;
+  platform?: TradingPlatform;
+  platforms_supported?: TradingPlatform[];
+  service_mode?: 'lite' | 'pro' | 'auto' | string;
+  background_services?: {
+    cloud_pro_services_enabled?: boolean;
+    auto_services_enabled?: boolean;
+    cloud_sync_enabled?: boolean;
+    cloud_brain_enabled?: boolean;
+    cloud_archive_enabled?: boolean;
+    meta_training_enabled?: boolean;
+    scheduled_reconciliation_enabled?: boolean;
+  };
   account: AccountInfo | null;
   terminal: TerminalInfo | null;
   last_error: string | null;
   is_demo: boolean;
   live_trading_enabled: boolean;
   panic_stop: boolean;
+  kill_switch?: KillSwitchState;
+  reconciliation?: ReconciliationReport;
   active_agent: string;
   active_strategy?: {
     id: string;
@@ -156,14 +223,87 @@ export interface StatusResponse {
   gemini_degraded?: boolean;
   gemini_last_error?: string | null;
   gemini_state?: 'available' | 'degraded' | 'cooldown' | 'unavailable' | string;
+  gemini_primary_model?: string;
+  gemini_active_model?: string;
+  gemini_using_fallback_model?: boolean;
   gemini_cooldown_seconds?: number;
   gemini_credits_pct?: number;
   user_policy?: UserPolicySettings;
   runtime_controls?: RuntimeControls;
+  permissions?: {
+    can_view_market_data?: boolean;
+    can_create_strategy?: boolean;
+    can_generate_signal?: boolean;
+    can_paper_trade?: boolean;
+    can_execute_demo?: boolean;
+    can_execute_live?: boolean;
+    can_enable_autotrader?: boolean;
+    can_manage_risk?: boolean;
+    can_access_logs?: boolean;
+    can_access_research?: boolean;
+    can_connect_broker?: boolean;
+    can_manage_secrets?: boolean;
+    can_access_admin?: boolean;
+  };
   universe?: UniverseSettings;
-  finnhub?: ProviderHealth;
+  benzinga?: ProviderHealth;
+  api_keys_health?: ApiKeysHealthResponse;
   portfolio?: PortfolioSnapshot;
+  portfolio_targets?: {
+    stop_loss_usd?: number | null;
+    take_profit_usd?: number | null;
+    updated_at?: number;
+    close_inflight?: boolean;
+    mode?: 'auto' | 'manual';
+    last_trigger?: Record<string, unknown>;
+  };
+  publish_readiness?: {
+    score: number;
+    status: 'ready' | 'warning' | 'blocked' | string;
+    blockers: string[];
+    warnings: string[];
+    checks?: Record<string, unknown>;
+  };
+  live_trading_readiness?: {
+    status: 'ready' | 'warning' | 'blocked' | string;
+    can_execute_live_orders: boolean;
+    blockers: string[];
+    warnings: string[];
+    checks?: {
+      platform?: string;
+      connected?: boolean;
+      account_is_demo?: boolean;
+      backend_live_trading_enabled?: boolean;
+      demo_only_default?: boolean;
+      panic_stop?: boolean;
+      trade_server_connected?: boolean;
+      position_manager_running?: boolean;
+      auto_trade_enabled?: boolean;
+      auto_trade_session_armed?: boolean;
+      gemini_available?: boolean;
+      [key: string]: unknown;
+    };
+  };
   services?: Record<string, unknown>;
+  auto_connect?: {
+    pending: boolean;
+    last_started_at?: number;
+    last_finished_at?: number;
+    last_error?: string;
+    paused?: boolean;
+    paused_at?: number;
+    pause_reason?: string;
+  };
+}
+
+export interface EventMarketRecommendation {
+  symbol: string;
+  score?: number;
+  event_title?: string;
+  event_type?: string;
+  bias?: 'bullish' | 'bearish' | 'neutral' | string;
+  event_risk?: 'low' | 'medium' | 'high' | string;
+  news: NormalizedNewsItem[];
 }
 
 export interface StrategyProfile {
@@ -177,6 +317,31 @@ export interface StrategyProfile {
   config: Record<string, unknown>;
 }
 
+export interface CompiledStrategy {
+  version: number;
+  intent: string;
+  symbols: string[];
+  asset_classes?: string[];
+  market_selection_mode?: string | null;
+  market_region_hint?: string | null;
+  entry_action: 'BUY' | 'SELL' | string;
+  fixed_lot_size: number | null;
+  allocation_pct_free_margin?: number | null;
+  cadence_buy_every_seconds: number;
+  cadence_sell_after_seconds: number;
+  hold_for_seconds?: number;
+  apply_under_any_conditions: boolean;
+  policy_mode: PolicyMode;
+  gemini_role: GeminiRole;
+  scan_interval_seconds: number;
+  min_reward_risk: number;
+  human_summary?: string;
+  assumptions?: string[];
+  missing_details?: string[];
+  warnings: string[];
+  summary_lines: string[];
+}
+
 export interface StrategiesResponse {
   active_strategy_id: string;
   items: StrategyProfile[];
@@ -188,6 +353,26 @@ export interface TickData {
   ask: number;
   spread: number;
   time: number;
+  time_msc?: number;
+}
+
+export interface ReconciliationIssue {
+  code: string;
+  severity: string;
+  message: string;
+  local_ticket?: number | null;
+  broker_ticket?: number | null;
+  details?: Record<string, unknown>;
+}
+
+export interface ReconciliationReport {
+  checked_at: number;
+  status: string;
+  reason?: string;
+  issue_count: number;
+  issues: ReconciliationIssue[];
+  local_open_count: number;
+  broker_open_count: number;
 }
 
 export interface BarData {
@@ -319,6 +504,54 @@ export interface OrderResult {
   comment: string;
 }
 
+export interface SimulatedExecutionResult {
+  id: number;
+  timestamp: number;
+  order_id?: number | null;
+  signal_id?: number | null;
+  symbol: string;
+  action: string;
+  volume: number;
+  price?: number | null;
+  stop_loss?: number | null;
+  take_profit?: number | null;
+  execution_mode: 'paper' | 'shadow' | string;
+  idempotency_key?: string;
+  account_key?: string;
+  execution_context?: string;
+  result_json?: string;
+}
+
+export interface ExplainableTradeCard {
+  signal_id: number;
+  order_id?: number | null;
+  symbol: string;
+  market?: string;
+  action: 'BUY' | 'SELL' | 'HOLD' | string;
+  confidence?: number | null;
+  risk_score?: number | null;
+  risk_mode?: string;
+  entry_reference_price?: number | null;
+  stop_loss?: number | null;
+  take_profit?: number | null;
+  reward?: number | null;
+  invalidation_level?: number | null;
+  timeframe_alignment?: Record<string, unknown>;
+  technical_evidence?: Record<string, unknown>;
+  news_gemini_evidence?: Record<string, unknown>;
+  disagreement_warnings?: unknown[];
+  portfolio_exposure_impact?: Record<string, unknown>;
+  broker_preflight_status?: {
+    approved?: boolean;
+    reason?: string;
+  };
+  final_decision?: string;
+  block_reasons?: string[];
+  execution_status?: Record<string, unknown>;
+  model_strategy_version?: Record<string, unknown>;
+  created_at?: number;
+}
+
 export interface PositionInfo {
   ticket: number;
   symbol: string;
@@ -331,6 +564,67 @@ export interface PositionInfo {
   profit: number;
   time: number;
   comment: string;
+  close_pending?: boolean;
+  close_order_id?: number | null;
+  close_order_status?: string | null;
+  estimated_margin?: number | null;
+  started_with_usd?: number | null;
+  entry_market_value_usd?: number | null;
+  margin_used_usd?: number | null;
+  margin_used_source?: 'entry_market_value' | 'broker_estimate' | string | null;
+  budget_vs_margin_delta_usd?: number | null;
+  budget_vs_margin_delta_pct?: number | null;
+  sl_amount_usd?: number | null;
+  tp_amount_usd?: number | null;
+  target_management_mode?: 'automatic' | 'manual' | 'pending_auto' | string;
+  target_management_updated_at?: number | null;
+  signal_reason?: string | null;
+  risk_reason?: string | null;
+  expected_profit_time_minutes?: number | null;
+  expected_profit_time_remaining_minutes?: number | null;
+  expected_profit_eta_timestamp?: number | null;
+  execution_trace?: {
+    source?: string;
+    reason?: string;
+    policy_mode?: string;
+    requested_agent_name?: string;
+    active_agent_name?: string;
+    amount_usd?: number | null;
+    preflight_reason?: string;
+    strategy?: {
+      id?: string;
+      name?: string;
+      brief?: string;
+      human_summary?: string;
+      summary_lines?: string[];
+    };
+    gemini?: {
+      state?: string;
+      active_model?: string;
+      available?: boolean;
+      cooldown_seconds?: number;
+    };
+    meta_model?: {
+      active?: boolean;
+      version_id?: string;
+    };
+    signal_snapshot?: {
+      agent_name?: string;
+      confidence?: number;
+      reason?: string;
+      stop_loss?: number | null;
+      take_profit?: number | null;
+    };
+  } | null;
+}
+
+export interface PortfolioTargetsResponse {
+  stop_loss_usd?: number | null;
+  take_profit_usd?: number | null;
+  updated_at?: number;
+  close_inflight?: boolean;
+  mode?: 'auto' | 'manual';
+  last_trigger?: Record<string, unknown>;
 }
 
 export interface AgentInfo {
@@ -372,6 +666,15 @@ export interface Recommendation {
   portfolio_risk?: PortfolioRiskAssessment;
   anti_churn?: AntiChurnAssessment;
   gemini_confirmation?: GeminiAssessment | null;
+  news?: {
+    sentiment: 'bullish' | 'bearish' | 'neutral' | string;
+    impact: 'low' | 'medium' | 'high' | string;
+    relevance: 'direct' | 'indirect' | 'global' | string;
+    strength: number;
+    risk_flag: boolean;
+    message?: string;
+    news_unavailable?: boolean;
+  };
   execution_reason?: string;
   recommended_amount_usd?: number;
   recommended_amount_pct_free_margin?: number;
@@ -381,6 +684,10 @@ export interface Recommendation {
   commission_percent_rate?: number | null;
   commission_notional_1lot?: number | null;
   commission_samples?: number | null;
+  recommended_policy_mode?: PolicyMode | null;
+  auto_execution_allowed_by_mode?: boolean;
+  auto_execution_skipped_reason?: string;
+  auto_execution_result?: OrderResult | null;
 }
 
 export interface SmartEvaluateResponse {
@@ -404,6 +711,17 @@ export interface AIActivity {
   confidence?: number;
   success?: boolean;
   quality_score?: number;
+  blocking_reasons?: string[];
+  risk_warnings?: string[];
+  machine_reasons?: string[];
+  portfolio_status?: string;
+  allow_execute?: boolean;
+  portfolio_fit_score?: number | null;
+  projected_margin_utilization_pct?: number | null;
+  projected_free_margin_pct?: number | null;
+  gemini_state?: string;
+  gemini_bias?: string;
+  gemini_event_risk?: string;
 }
 
 export interface ChatMessageItem {
@@ -464,6 +782,7 @@ export interface TradeHistoryItem {
   ticket: number | null;
   signal_id: number | null;
   symbol: string;
+  origin?: 'app_opened' | 'broker_imported' | 'mt5_connected_account';
   action: 'BUY' | 'SELL';
   status: 'open' | 'closed';
   opened_at: number;
@@ -471,6 +790,7 @@ export interface TradeHistoryItem {
   duration_minutes: number | null;
   volume: number;
   entry_price: number | null;
+  close_price?: number | null;
   stop_loss: number | null;
   take_profit: number | null;
   profit_usd: number | null;
@@ -501,6 +821,17 @@ export interface TradeHistoryItem {
     quality_after: number;
   } | null;
   post_analysis?: {
+    executed_plan?: {
+      entry_price?: number;
+      stop_loss?: number;
+      take_profit?: number;
+      volume?: number;
+      started_with_usd?: number;
+      sl_amount_usd?: number;
+      tp_amount_usd?: number;
+      sl_pct_of_start?: number;
+      tp_pct_of_start?: number;
+    };
     summary?: string;
     what_went_well?: string[];
     mistakes?: string[];
@@ -532,6 +863,12 @@ export interface TradeHistoryItem {
     generated_at?: number;
   } | null;
   exit_reason?: string | null;
+  audit_trail?: {
+    time?: number | null;
+    type: string;
+    title: string;
+    detail: string;
+  }[];
 }
 
 export interface TradeHistoryResponse {
@@ -582,14 +919,24 @@ export interface ResearchStatusResponse {
   };
   meta_model_active: boolean;
   meta_model_active_version: string;
+  meta_model_inactive_reason?: string;
   active_approved_model?: ResearchModelVersion | null;
   last_training_run?: ResearchRunRecord | null;
   last_replay_run?: Record<string, unknown> | null;
   last_walk_forward_run?: Record<string, unknown> | null;
   best_candidate_model?: ResearchModelVersion | null;
   recent_attribution_reports?: Array<Record<string, unknown>>;
+  model_quality?: {
+    score: number;
+    status: 'ready' | 'warning' | 'blocked' | string;
+    blockers: string[];
+    warnings: string[];
+    checks?: Record<string, unknown>;
+  };
   incremental_training?: {
     last_run_at: number;
     last_closed_count: number;
+    local_closed_count?: number;
+    clean_app_closed_count?: number;
   };
 }

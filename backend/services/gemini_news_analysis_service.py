@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
+from typing import Any
 
 from domain.models import GeminiAssessment, MarketContext, NormalizedNewsItem, TechnicalSignal
 
@@ -142,9 +144,43 @@ class GeminiNewsAnalysisService:
 
         assessment.used = True
         assessment.available = True
+        self._sanitize_assessment(assessment, default_symbol=context.symbol)
         if not assessment.affected_symbols:
             assessment.affected_symbols = [context.symbol]
         return assessment
+
+    def _sanitize_assessment(self, assessment: GeminiAssessment, *, default_symbol: str) -> None:
+        if assessment.news_bias not in {"bullish", "bearish", "neutral"}:
+            assessment.news_bias = "neutral"
+        if assessment.macro_relevance not in {"low", "medium", "high"}:
+            assessment.macro_relevance = "low"
+        if assessment.event_risk not in {"low", "medium", "high"}:
+            assessment.event_risk = "low"
+        if assessment.advisory_action not in {"BUY", "SELL", "HOLD"}:
+            assessment.advisory_action = "HOLD"
+        assessment.confidence_adjustment = self._bounded_float(
+            assessment.confidence_adjustment,
+            default=0.0,
+            minimum=-0.12,
+            maximum=0.08,
+        )
+        assessment.source_quality_score = self._bounded_float(
+            assessment.source_quality_score,
+            default=0.0,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if not assessment.affected_symbols:
+            assessment.affected_symbols = [default_symbol]
+
+    def _bounded_float(self, value: Any, *, default: float, minimum: float, maximum: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            parsed = float(default)
+        if not math.isfinite(parsed):
+            parsed = float(default)
+        return max(float(minimum), min(float(maximum), parsed))
 
     def _agent_input_fallback(self, context: MarketContext):
         from agent.interface import AgentInput

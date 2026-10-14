@@ -1,18 +1,79 @@
-import { runtimeConfig } from '../config';
+﻿import { runtimeConfig } from '../config';
 import { supabase } from '@/lib/supabase';
 
 const BASE_URL = runtimeConfig.apiBaseUrl;
-const LOCAL_PORT_FALLBACK_URL = BASE_URL.includes('127.0.0.1:8000')
-  ? null
-  : BASE_URL.includes('localhost:8000')
-    ? null
-    : BASE_URL.includes('127.0.0.1:8002')
-      ? BASE_URL.replace('127.0.0.1:8002', '127.0.0.1:8000')
-      : BASE_URL.includes('localhost:8002')
-        ? BASE_URL.replace('localhost:8002', 'localhost:8000')
-        : null;
+const LOCAL_PORT_FALLBACK_URL = runtimeConfig.allowLocalFallback
+  ? (
+    BASE_URL.includes('127.0.0.1:8000')
+      ? BASE_URL.replace('127.0.0.1:8000', '127.0.0.1:8002')
+      : BASE_URL.includes('localhost:8000')
+        ? BASE_URL.replace('localhost:8000', 'localhost:8002')
+        : BASE_URL.includes('127.0.0.1:8002')
+          ? BASE_URL.replace('127.0.0.1:8002', '127.0.0.1:8000')
+          : BASE_URL.includes('localhost:8002')
+            ? BASE_URL.replace('localhost:8002', 'localhost:8000')
+            : null
+  )
+  : null;
 
 let preferredBaseUrl: string = BASE_URL;
+let cachedAccessToken: string | null = null;
+let authCacheInitialized = false;
+let authSubscriptionInitialized = false;
+const inflightGetRequests = new Map<string, Promise<unknown>>();
+const responseCache = new Map<string, { expiresAt: number; value: unknown }>();
+
+function clearRequestCaches() {
+  inflightGetRequests.clear();
+  responseCache.clear();
+}
+
+function stableIdempotencyKey(scope: string, payload: Record<string, unknown>): string {
+  const normalized = Object.keys(payload)
+    .sort()
+    .map((key) => `${key}=${String(payload[key] ?? '')}`)
+    .join('|');
+  let hash = 0;
+  for (let i = 0; i < normalized.length; i += 1) {
+    hash = ((hash << 5) - hash + normalized.charCodeAt(i)) | 0;
+  }
+  return `${scope}:${Math.abs(hash).toString(36)}:${normalized.slice(0, 48)}`;
+}
+
+function cacheTtlMs(path: string): number {
+  if (
+    path.includes('/status')
+    || path.includes('/positions')
+    || path.includes('/market/ticks')
+    || path.includes('/auto-trade/status')
+    || path.includes('/auto-trade/activity')
+    || path.includes('/agent/smart-evaluate')
+    || path.includes('/logs')
+  ) {
+    return 0;
+  }
+  if (path.includes('/market/available-symbols')) return 15000;
+  if (path.includes('/strategies')) return 10000;
+  if (path.includes('/research/status')) return 15000;
+  if (path.includes('/trade-history')) return 5000;
+  if (path.includes('/events/recommendations')) return 10000;
+  return 0;
+}
+
+async function ensureAuthCache() {
+  if (!supabase) return;
+  if (!authSubscriptionInitialized) {
+    authSubscriptionInitialized = true;
+    supabase.auth.onAuthStateChange((_event, session) => {
+      cachedAccessToken = session?.access_token ?? null;
+      clearRequestCaches();
+    });
+  }
+  if (authCacheInitialized) return;
+  authCacheInitialized = true;
+  const { data } = await supabase.auth.getSession();
+  cachedAccessToken = data.session?.access_token ?? null;
+}
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
@@ -27,10 +88,9 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   let authHeader: Record<string, string> = {};
   if (supabase) {
-    const { data } = await supabase.auth.getSession();
-    const accessToken = data.session?.access_token;
-    if (accessToken) {
-      authHeader = { Authorization: `Bearer ${accessToken}` };
+    await ensureAuthCache();
+    if (cachedAccessToken) {
+      authHeader = { Authorization: `Bearer ${cachedAccessToken}` };
     }
   }
   const optionHeaders = options?.headers
@@ -48,100 +108,149 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     headers: mergedHeaders,
   };
   const adminPath = path.startsWith('/admin/');
+  const cacheKey = `${method}:${path}`;
+  const ttlMs = method === 'GET' ? cacheTtlMs(path) : 0;
 
-  const candidates = adminPath
-    ? (
-      LOCAL_PORT_FALLBACK_URL
-        ? [BASE_URL, LOCAL_PORT_FALLBACK_URL]
-        : [BASE_URL]
-    )
-    : (
-      LOCAL_PORT_FALLBACK_URL
-        ? [preferredBaseUrl, preferredBaseUrl === BASE_URL ? LOCAL_PORT_FALLBACK_URL : BASE_URL]
-        : [preferredBaseUrl]
-    );
+  if (method === 'GET') {
+    const cached = responseCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value as T;
+    }
+    const inflight = inflightGetRequests.get(cacheKey);
+    if (inflight) {
+      return inflight as Promise<T>;
+    }
+  } else {
+    clearRequestCaches();
+  }
 
-  let res: Response | null = null;
-  let lastError: unknown = null;
-  for (let i = 0; i < candidates.length; i += 1) {
-    const base = candidates[i];
-    const tradeExecutionPath = (
-      path.includes('/trade/execute-recommendation')
-      || path.includes('/trade/quick-buy')
-      || path.includes('/trade/execute')
-    );
-    const liveTickPath = path.includes('/market/ticks');
-    // Never retry trade execution requests on the client side.
-    // A second attempt can feel like lag and may risk duplicate intents.
-    const connectPath = (
-      path.includes('/connect')
-      || path.includes('/credentials/auto-connect')
-    );
-    const autoConnectPath = path.includes('/credentials/auto-connect');
-    const maxAttemptsForBase = (adminPath || tradeExecutionPath || liveTickPath || isMutation || connectPath) ? 1 : (i === 0 ? 2 : 1);
-    for (let attemptIdx = 0; attemptIdx < maxAttemptsForBase; attemptIdx += 1) {
-      try {
-        const scanLikePath = path.includes('/agent/smart-evaluate') || path.includes('/auto-trade/activity');
-        const availableSymbolsPath = path.includes('/market/available-symbols');
-        const statusPath = path.includes('/status') || path.includes('/auto-trade/status');
-        const timeoutMs = liveTickPath
-          ? (i === 0 ? 1200 : 1800)
-          : adminPath
-          ? (i === 0 ? 9000 : 12000)
-          : scanLikePath
-          ? (i === 0 ? 45000 : 55000)
-          : availableSymbolsPath
-            ? (i === 0 ? 70000 : 80000)
-          : tradeExecutionPath
-            ? (i === 0 ? 25000 : 30000)
-            : autoConnectPath
-              ? (i === 0 ? 22000 : 28000)
-            : connectPath
-              ? (i === 0 ? 90000 : 120000)
-            : statusPath
-              ? (i === 0 ? 15000 : 22000)
-              : isMutation
-                ? (i === 0 ? 12000 : 16000)
-                : (i === 0 ? 25000 : 32000);
-        const attempt = await fetchWithTimeout(`${base}${path}`, requestOptions, timeoutMs);
-        preferredBaseUrl = base;
-        res = attempt;
-        break;
-      } catch (err) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          if (connectPath) {
-            lastError = new Error('Connection timed out. Please verify backend is running and MT5 terminal (or IBKR TWS/Gateway) is reachable.');
+  const executeRequest = async (): Promise<T> => {
+    const candidates = adminPath
+      ? (
+        LOCAL_PORT_FALLBACK_URL
+          ? [BASE_URL, LOCAL_PORT_FALLBACK_URL]
+          : [BASE_URL]
+      )
+      : (
+        LOCAL_PORT_FALLBACK_URL
+          ? [preferredBaseUrl, preferredBaseUrl === BASE_URL ? LOCAL_PORT_FALLBACK_URL : BASE_URL]
+          : [preferredBaseUrl]
+      );
+
+    let res: Response | null = null;
+    let lastError: unknown = null;
+    for (let i = 0; i < candidates.length; i += 1) {
+      const base = candidates[i];
+      const tradeExecutionPath = (
+        path.includes('/trade/execute-recommendation')
+        || path.includes('/trade/quick-buy')
+        || path.includes('/trade/execute')
+        || path.includes('/positions/close')
+        || path.includes('/positions/modify')
+      );
+      const liveTickPath = path.includes('/market/ticks');
+      const connectPath = (
+        path.includes('/connect')
+        || path.includes('/credentials/auto-connect')
+      );
+      const autoConnectPath = path.includes('/credentials/auto-connect');
+      const strategyPreviewPath = path.includes('/strategies/preview');
+      const strategyBuildPath = path.includes('/strategies/build') || path.includes('/strategies/update');
+      const autoTradeControlPath = (
+        path.includes('/auto-trade/start')
+        || path.includes('/auto-trade/stop')
+        || path.includes('/auto-trade/settings')
+      );
+      const maxAttemptsForBase = (adminPath || tradeExecutionPath || liveTickPath || isMutation || connectPath) ? 1 : (i === 0 ? 2 : 1);
+      for (let attemptIdx = 0; attemptIdx < maxAttemptsForBase; attemptIdx += 1) {
+        try {
+          const scanLikePath = path.includes('/agent/smart-evaluate') || path.includes('/auto-trade/activity');
+          const availableSymbolsPath = path.includes('/market/available-symbols');
+          const statusPath = path.includes('/status') || path.includes('/auto-trade/status');
+          const timeoutMs = liveTickPath
+            ? (i === 0 ? 1000 : 1500)
+            : adminPath
+            ? (i === 0 ? 9000 : 12000)
+            : scanLikePath
+            ? (i === 0 ? 45000 : 55000)
+            : availableSymbolsPath
+              ? (i === 0 ? 70000 : 80000)
+              : tradeExecutionPath
+                ? (i === 0 ? 90000 : 100000)
+                : strategyPreviewPath
+                  ? (i === 0 ? 18000 : 22000)
+                  : strategyBuildPath
+                    ? (i === 0 ? 20000 : 26000)
+                    : autoTradeControlPath
+                      ? (i === 0 ? 30000 : 40000)
+                      : autoConnectPath
+                        ? (i === 0 ? 10000 : 15000)
+                        : connectPath
+                          ? (i === 0 ? 35000 : 50000)
+                          : statusPath
+                            ? (i === 0 ? 8000 : 12000)
+                            : isMutation
+                              ? (i === 0 ? 12000 : 16000)
+                              : (i === 0 ? 25000 : 32000);
+          const attempt = await fetchWithTimeout(`${base}${path}`, requestOptions, timeoutMs);
+          preferredBaseUrl = base;
+          res = attempt;
+          break;
+        } catch (err) {
+          if (err instanceof Error && err.name === 'AbortError') {
+            if (strategyPreviewPath) {
+              lastError = new Error('Strategy preview is taking longer than expected. Please wait a moment and try again.');
+            } else if (connectPath) {
+              lastError = new Error('Connection timed out. Please verify backend is running and the MT5 terminal is reachable.');
+            } else if (tradeExecutionPath) {
+              lastError = new Error('Trade request timed out while waiting for broker confirmation. Check Trade History/Activity before retrying; the broker may still respond after the browser timeout.');
+            } else {
+              lastError = new Error('Request timed out. Please verify backend is running and reachable.');
+            }
+          } else if (err instanceof Error && err.message.toLowerCase().includes('signal is aborted')) {
+            lastError = new Error('Request was interrupted. Please retry connection and keep this page open until the response returns.');
+          } else if (err instanceof Error && err.message.toLowerCase().includes('failed to fetch')) {
+            lastError = new Error('Failed to fetch from backend. Retrying automatically...');
           } else {
-            lastError = new Error('Request timed out. Please verify backend is running and reachable.');
+            lastError = err;
           }
-        } else if (err instanceof Error && err.message.toLowerCase().includes('signal is aborted')) {
-          lastError = new Error('Request was interrupted. Please retry connection and keep this page open until the response returns.');
-        } else if (err instanceof Error && err.message.toLowerCase().includes('failed to fetch')) {
-          lastError = new Error('Failed to fetch from backend. Retrying automatically...');
-        } else {
-          lastError = err;
-        }
-        if (!isMutation && attemptIdx < maxAttemptsForBase - 1) {
-          await new Promise((resolve) => setTimeout(resolve, 200));
+          if (!isMutation && attemptIdx < maxAttemptsForBase - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          }
         }
       }
+      if (res) break;
     }
-    if (res) break;
+
+    if (!res) {
+      throw lastError instanceof Error ? lastError : new Error('Network request failed');
+    }
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      if (path.startsWith('/admin/') && (res.status === 401 || res.status === 403)) {
+        localStorage.removeItem('linktrade_admin_token');
+        throw new Error('Admin session expired. Please login again.');
+      }
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+
+    const json = await res.json();
+    if (ttlMs > 0) {
+      responseCache.set(cacheKey, { expiresAt: Date.now() + ttlMs, value: json });
+    }
+    return json as T;
+  };
+
+  if (method === 'GET') {
+    const promise = executeRequest().finally(() => {
+      inflightGetRequests.delete(cacheKey);
+    });
+    inflightGetRequests.set(cacheKey, promise);
+    return promise;
   }
 
-  if (!res) {
-    throw lastError instanceof Error ? lastError : new Error('Network request failed');
-  }
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    if (path.startsWith('/admin/') && (res.status === 401 || res.status === 403)) {
-      localStorage.removeItem('linktrade_admin_token');
-      throw new Error('Admin session expired. Please login again.');
-    }
-    throw new Error(err.detail || `HTTP ${res.status}`);
-  }
-  return res.json();
+  return executeRequest();
 }
 
 function adminAuthHeaders(): Record<string, string> {
@@ -233,24 +342,40 @@ export const api = {
       headers: adminAuthHeaders(),
     }),
 
+  adminApiKeysHealth: (forceRefresh: boolean = false) =>
+    request<import('@/types').ApiKeysHealthResponse>(
+      `/admin/api-keys-health${forceRefresh ? '?force_refresh=1' : ''}`,
+      { headers: adminAuthHeaders() },
+    ),
+
+  adminSetApiHealthEmailAlerts: (enabled: boolean) =>
+    request<import('@/types').ApiKeysHealthResponse>('/admin/api-keys-health/email-alerts', {
+      method: 'POST',
+      headers: adminAuthHeaders(),
+      body: JSON.stringify({ enabled }),
+    }),
+
   // Connection
   connect: (data: {
-    platform?: 'mt5' | 'ibkr';
-    account?: number;
-    password?: string;
-    server?: string;
+    platform?: 'mt5' | 'ibkr' | 'tradestation';
     terminal_path?: string;
-    save_credentials?: boolean;
-    ibkr_host?: string;
-    ibkr_port?: number;
-    ibkr_client_id?: number;
-    ibkr_account_id?: string;
+    host?: string;
+    port?: number;
+    client_id?: number;
+    account_id?: string;
+    readonly?: boolean;
+    ibkr_environment?: 'paper' | 'live';
+    environment?: 'sim' | 'live';
+    redirect_uri?: string;
   }) =>
     request<{
       connected: boolean;
-      platform?: 'mt5' | 'ibkr';
+      platform?: 'mt5' | 'ibkr' | 'tradestation';
       account?: import('@/types').AccountInfo;
       is_demo?: boolean;
+      auth_required?: boolean;
+      auth_url?: string;
+      environment?: 'paper' | 'sim' | 'live';
       credential_status?: { requested?: boolean; saved?: boolean; reason?: string };
     }>('/connect', { method: 'POST', body: JSON.stringify(data) }),
 
@@ -273,9 +398,9 @@ export const api = {
   getTick: (symbol: string) =>
     request<import('@/types').TickData>(`/market/tick/${symbol}`),
 
-  getTicks: (symbols: string[]) =>
+  getTicks: (symbols: string[], uiFast: boolean = true) =>
     request<{ ticks: Record<string, import('@/types').TickData> }>(
-      `/market/ticks?symbols=${encodeURIComponent(symbols.join(','))}`
+      `/market/ticks?symbols=${encodeURIComponent(symbols.join(','))}${uiFast ? '&ui_fast=1' : ''}`
     ),
 
   getBars: (symbol: string, timeframe: string, count: number = 100) =>
@@ -284,15 +409,26 @@ export const api = {
   getSymbolInfo: (symbol: string) =>
     request(`/market/symbol-info/${symbol}`),
 
-  getAvailableSymbols: (category?: string, tradeableOnly: boolean = false) =>
+  getAvailableSymbols: (category?: string, tradeableOnly: boolean = false, includeInactive: boolean = false) =>
     request<{
       total: number;
+      symbols: Array<{
+        name: string; description: string; category: string;
+        visible: boolean; trade_enabled: boolean; bid: number; ask: number; spread: number;
+        live_quote?: boolean; requires_connection?: boolean; source?: string;
+        active_in_current_mode?: boolean; inactive_reason?: string;
+      }>;
       categories: Record<string, Array<{
         name: string; description: string; category: string;
         visible: boolean; trade_enabled: boolean; bid: number; ask: number; spread: number;
+        live_quote?: boolean; requires_connection?: boolean; source?: string;
+        active_in_current_mode?: boolean; inactive_reason?: string;
       }>>;
       category_counts: Record<string, number>;
-    }>(`/market/available-symbols?tradeable_only=${tradeableOnly}${category ? `&category=${category}` : ''}`),
+      connected?: boolean;
+      live_quotes?: boolean;
+      source?: string;
+    }>(`/market/available-symbols?tradeable_only=${tradeableOnly}&include_inactive=${includeInactive}${category ? `&category=${category}` : ''}`),
 
   autoDetectSymbols: (categories?: string[]) =>
     request<{ detected: string[]; count: number }>('/market/auto-detect-symbols', {
@@ -321,7 +457,13 @@ export const api = {
   getStrategies: () =>
     request<import('@/types').StrategiesResponse>('/strategies'),
 
-  buildStrategy: (data: { name: string; description: string }) =>
+  previewStrategy: (data: { name: string; description: string; apply_under_any_conditions?: boolean }) =>
+    request<{
+      ok: boolean;
+      strategy: import('@/types').StrategyProfile;
+    }>('/strategies/preview', { method: 'POST', body: JSON.stringify(data) }),
+
+  buildStrategy: (data: { name: string; description: string; apply_under_any_conditions?: boolean }) =>
     request<{
       ok: boolean;
       active_strategy_id: string;
@@ -340,6 +482,24 @@ export const api = {
       scan_interval: number;
     }>('/strategies/select', { method: 'POST', body: JSON.stringify({ strategy_id: strategyId }) }),
 
+  updateStrategy: (data: { strategy_id: string; name: string; description: string; apply_under_any_conditions?: boolean }) =>
+    request<{
+      ok: boolean;
+      active_strategy_id: string;
+      strategy: import('@/types').StrategyProfile;
+      active_agent: string;
+      user_policy: import('@/types').UserPolicySettings;
+    }>('/strategies/update', { method: 'POST', body: JSON.stringify(data) }),
+
+  deleteStrategy: (strategyId: string) =>
+    request<{
+      ok: boolean;
+      deleted_strategy_id: string;
+      active_strategy_id: string;
+      active_agent: string;
+      user_policy: import('@/types').UserPolicySettings;
+    }>('/strategies/delete', { method: 'POST', body: JSON.stringify({ strategy_id: strategyId }) }),
+
   // Trading
   executeTrade: (data: {
     symbol: string;
@@ -348,14 +508,39 @@ export const api = {
     stop_loss: number;
     take_profit: number;
     signal_id?: number;
-  }) =>
-    request<import('@/types').OrderResult>('/trade/execute', { method: 'POST', body: JSON.stringify(data) }),
+    idempotency_key?: string;
+  }) => {
+    const payload = {
+      ...data,
+      idempotency_key: data.idempotency_key || stableIdempotencyKey('manual', data),
+    };
+    return request<import('@/types').OrderResult>('/trade/execute', { method: 'POST', body: JSON.stringify(payload) });
+  },
 
-  getPositions: (symbol?: string) =>
-    request<import('@/types').PositionInfo[]>(`/positions${symbol ? `?symbol=${symbol}` : ''}`),
+  getPositions: (symbol?: string, includeMargin: boolean = false) =>
+    request<import('@/types').PositionInfo[]>(
+      `/positions?include_margin=${includeMargin ? 'true' : 'false'}${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ''}`
+    ),
 
   closePosition: (ticket: number) =>
     request<import('@/types').OrderResult>('/positions/close', { method: 'POST', body: JSON.stringify({ ticket }) }),
+  cancelPositionClose: (ticket: number) =>
+    request<import('@/types').OrderResult>('/positions/cancel-close', { method: 'POST', body: JSON.stringify({ ticket }) }),
+
+  closeAllPositions: () =>
+    request<{
+      success: boolean;
+      requested: number;
+      closed: number;
+      failed: number;
+      results: Array<Record<string, unknown>>;
+    }>('/positions/close-all', { method: 'POST' }),
+
+  modifyPosition: (ticket: number, stopLoss: number, takeProfit: number) =>
+    request<import('@/types').OrderResult>('/positions/modify', {
+      method: 'POST',
+      body: JSON.stringify({ ticket, stop_loss: stopLoss, take_profit: takeProfit }),
+    }),
 
   // Risk
   getRiskSettings: () =>
@@ -367,12 +552,43 @@ export const api = {
   setPanicStop: (active: boolean) =>
     request('/risk/panic-stop', { method: 'POST', body: JSON.stringify({ active }) }),
 
+  getPortfolioTargets: () =>
+    request<import('@/types').PortfolioTargetsResponse>('/risk/portfolio-targets'),
+
+  setPortfolioTargets: (data: {
+    stop_loss_usd?: number | null;
+    take_profit_usd?: number | null;
+    mode?: 'auto' | 'manual';
+  }) =>
+    request<import('@/types').PortfolioTargetsResponse>('/risk/portfolio-targets', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
   // Logs
   getLogs: (limit: number = 100, logType: string = 'all') =>
     request<import('@/types').LogEntry[]>(`/logs?limit=${limit}&log_type=${logType}`),
 
-  getTradeHistory: (limit: number = 50) =>
-    request<import('@/types').TradeHistoryResponse>(`/trade-history?limit=${limit}`),
+  getTradeHistory: (limit: number = 50, view: 'closed' | 'all' = 'closed') =>
+    request<import('@/types').TradeHistoryResponse>(
+      `/trade-history?limit=${limit}&view=${encodeURIComponent(view)}`
+    ),
+
+  reconcileRuntimeState: (limit: number = 300) =>
+    request<import('@/types').ReconciliationReport>(`/reconcile?limit=${encodeURIComponent(String(limit))}`, {
+      method: 'POST',
+    }),
+
+  getSimulatedExecutionResults: (limit: number = 100) =>
+    request<import('@/types').SimulatedExecutionResult[]>(
+      `/execution/simulated-results?limit=${encodeURIComponent(String(limit))}`
+    ),
+
+  getTradeCard: (signalId: number) =>
+    request<import('@/types').ExplainableTradeCard>(
+      `/trade-card/${encodeURIComponent(String(signalId))}`
+    ),
+
   analyzeTradeHistoryItem: (
     ticket: number,
     forceRefresh: boolean = false,
@@ -400,38 +616,65 @@ export const api = {
       },
     ),
 
-  // Credentials
-  getCredentials: () =>
-    request<import('@/types').SavedCredentials[]>('/credentials'),
-
-  saveCredentials: (data: { account: number; server: string; password: string; terminal_path?: string }) =>
-    request('/credentials', { method: 'POST', body: JSON.stringify(data) }),
-
-  deleteCredentials: (account: number) =>
-    request(`/credentials/${account}`, { method: 'DELETE' }),
-
-  autoConnect: (accountId?: number) =>
-    request<{ connected: boolean; reason?: string; account?: import('@/types').AccountInfo }>(
-      `/credentials/auto-connect${accountId ? `?account_id=${accountId}` : ''}`
-    ),
-
   // Smart Evaluate
-  smartEvaluate: (symbols?: string[]) =>
+  smartEvaluate: (symbols?: string[], options?: { manual?: boolean; autoExecute?: boolean }) =>
     request<import('@/types').SmartEvaluateResponse>('/agent/smart-evaluate', {
       method: 'POST',
-      body: JSON.stringify({ symbols }),
+      body: JSON.stringify({ symbols, manual: !!options?.manual, auto_execute: !!options?.autoExecute }),
     }),
 
-  executeRecommendation: (signalId: number, amountUsd?: number, sl?: number, tp?: number) =>
-    request<import('@/types').OrderResult>('/trade/execute-recommendation', {
+  executeRecommendation: (signalId: number, amountUsd?: number, sl?: number, tp?: number) => {
+    const payload = {
+      signal_id: signalId,
+      amount_usd: amountUsd || undefined,
+      custom_stop_loss: sl || undefined,
+      custom_take_profit: tp || undefined,
+    };
+    return request<import('@/types').OrderResult>('/trade/execute-recommendation', {
       method: 'POST',
-      body: JSON.stringify({ signal_id: signalId, amount_usd: amountUsd || undefined, custom_stop_loss: sl || undefined, custom_take_profit: tp || undefined }),
-    }),
+      body: JSON.stringify({
+        ...payload,
+        idempotency_key: stableIdempotencyKey('recommendation', payload),
+      }),
+    });
+  },
 
-  quickBuy: (symbol: string, amountUsd: number, sl?: number, tp?: number, action: string = 'BUY') =>
+  quickBuy: (
+    symbol: string,
+    amountUsd: number,
+    sl?: number,
+    tp?: number,
+    action: string = 'BUY',
+    context?: {
+      signal_id?: number | null;
+      signal_confidence?: number | null;
+      quality_score?: number | null;
+      signal_reason?: string | null;
+      signal_agent_name?: string | null;
+    },
+  ) =>
     request<import('@/types').OrderResult>('/trade/quick-buy', {
       method: 'POST',
-      body: JSON.stringify({ symbol, amount_usd: amountUsd, action, custom_stop_loss: sl || undefined, custom_take_profit: tp || undefined }),
+      body: JSON.stringify({
+        symbol,
+        amount_usd: amountUsd,
+        action,
+        custom_stop_loss: sl || undefined,
+        custom_take_profit: tp || undefined,
+        signal_id: context?.signal_id ?? undefined,
+        signal_confidence: context?.signal_confidence ?? undefined,
+        quality_score: context?.quality_score ?? undefined,
+        signal_reason: context?.signal_reason ?? undefined,
+        signal_agent_name: context?.signal_agent_name ?? undefined,
+        idempotency_key: stableIdempotencyKey('quick_buy', {
+          symbol,
+          amount_usd: amountUsd,
+          action,
+          custom_stop_loss: sl || undefined,
+          custom_take_profit: tp || undefined,
+          signal_id: context?.signal_id ?? undefined,
+        }),
+      }),
     }),
 
   calculateVolume: (symbol: string, amountUsd: number) =>
@@ -439,6 +682,7 @@ export const api = {
       symbol: string; amount_usd: number; volume: number;
       actual_cost: number; price: number; contract_size: number;
       volume_min: number; volume_max: number;
+      trade_tick_value?: number; trade_tick_size?: number; point?: number;
       min_sl_tp_dollars: number; stops_level: number;
     }>(`/trade/calculate-volume?symbol=${symbol}&amount_usd=${amountUsd}`),
 
@@ -447,6 +691,8 @@ export const api = {
     request<{
       running: boolean;
       enabled: boolean;
+      budget_mode?: 'full_margin' | 'custom_budget';
+      budget_usd?: number | null;
       min_confidence: number;
       scan_interval: number;
       last_scan: number;
@@ -462,8 +708,21 @@ export const api = {
         decision_reason?: string;
         gemini_summary?: string;
         meta_model_summary?: string;
+        blocking_reasons?: string[];
+        risk_warnings?: string[];
+        machine_reasons?: string[];
+        portfolio_status?: string;
+        allow_execute?: boolean;
+        portfolio_fit_score?: number | null;
+        projected_margin_utilization_pct?: number | null;
+        projected_free_margin_pct?: number | null;
+        gemini_state?: string;
+        gemini_bias?: string;
+        gemini_event_risk?: string;
       }>;
       panic_stop: boolean;
+      budget_mode?: 'full_margin' | 'custom_budget';
+      budget_usd?: number | null;
       position_manager_running?: boolean;
       managed_tickets?: number[];
       portfolio?: import('@/types').PortfolioSnapshot;
@@ -473,18 +732,30 @@ export const api = {
         degraded: boolean;
         last_error?: string | null;
         state?: 'available' | 'degraded' | 'cooldown' | 'unavailable' | string;
+        primary_model?: string;
+        active_model?: string;
+        using_fallback_model?: boolean;
         cooldown_seconds?: number;
         credits_pct?: number;
       };
     }>('/auto-trade/status'),
 
-  startAutoTrade: () =>
-    request('/auto-trade/start', { method: 'POST' }),
+  startAutoTrade: (settings?: {
+    budget_mode?: 'full_margin' | 'custom_budget';
+    budget_usd?: number;
+  }) =>
+    request('/auto-trade/start', { method: 'POST', body: JSON.stringify(settings ?? {}) }),
 
   stopAutoTrade: () =>
     request('/auto-trade/stop', { method: 'POST' }),
 
-  updateAutoTradeSettings: (settings: { enabled?: boolean; min_confidence?: number; scan_interval?: number }) =>
+  updateAutoTradeSettings: (settings: {
+    enabled?: boolean;
+    min_confidence?: number;
+    scan_interval?: number;
+    budget_mode?: 'full_margin' | 'custom_budget';
+    budget_usd?: number;
+  }) =>
     request('/auto-trade/settings', { method: 'POST', body: JSON.stringify(settings) }),
 
   getAIActivity: (limit: number = 50) =>
@@ -498,6 +769,17 @@ export const api = {
         decision_reason?: string;
         gemini_summary?: string;
         meta_model_summary?: string;
+        blocking_reasons?: string[];
+        risk_warnings?: string[];
+        machine_reasons?: string[];
+        portfolio_status?: string;
+        allow_execute?: boolean;
+        portfolio_fit_score?: number | null;
+        projected_margin_utilization_pct?: number | null;
+        projected_free_margin_pct?: number | null;
+        gemini_state?: string;
+        gemini_bias?: string;
+        gemini_event_risk?: string;
       }>;
       position_manager: {
         running: boolean;
@@ -531,9 +813,9 @@ export const api = {
   clearChatHistory: () =>
     request<{ cleared: boolean }>('/chat/history', { method: 'DELETE' }),
 
-  // External events (Finnhub)
-  getFinnhubHealth: () =>
-    request<{ provider: import('@/types').ProviderHealth; universe?: Record<string, unknown> }>('/events/finnhub/health'),
+  // External events (Benzinga)
+  getBenzingaHealth: () =>
+    request<{ provider: import('@/types').ProviderHealth; universe?: Record<string, unknown> }>('/events/benzinga/health'),
 
   refreshEvents: (data?: {
     from_date?: string;
@@ -553,7 +835,7 @@ export const api = {
       degraded_reasons?: string[];
       from_date?: string;
       to_date?: string;
-      finnhub?: import('@/types').ProviderHealth;
+      benzinga?: import('@/types').ProviderHealth;
     }>('/events/refresh', {
       method: 'POST',
       body: JSON.stringify(data || {}),
@@ -561,6 +843,13 @@ export const api = {
 
   getLatestEvents: (limit: number = 25) =>
     request<{ events: import('@/types').ExternalEventRecord[]; count: number }>(`/events/latest?limit=${limit}`),
+  getFilteredEvents: (params?: { limit?: number; eventType?: string; orderBy?: 'timestamp' | 'created' }) => {
+    const q = new URLSearchParams();
+    q.set('limit', String(params?.limit ?? 25));
+    if (params?.eventType) q.set('event_type', params.eventType);
+    if (params?.orderBy) q.set('order_by', params.orderBy);
+    return request<{ events: import('@/types').ExternalEventRecord[]; count: number }>(`/events/latest?${q.toString()}`);
+  },
 
   getEventMappings: (limit: number = 100, eventId?: number) =>
     request<{ mappings: import('@/types').EventAssetMappingRecord[]; count: number }>(
@@ -571,6 +860,15 @@ export const api = {
     request<{ assessments: import('@/types').GeminiEventAssessmentRecord[]; count: number }>(
       `/events/gemini-assessments?limit=${limit}${eventId ? `&event_id=${eventId}` : ''}`,
     ),
+  getEventRecommendations: (params?: { limit?: number; forceRefresh?: boolean; classifyWithGemini?: boolean }) => {
+    const q = new URLSearchParams();
+    q.set('limit', String(params?.limit ?? 8));
+    if (params?.forceRefresh != null) q.set('force_refresh', params.forceRefresh ? '1' : '0');
+    if (params?.classifyWithGemini != null) q.set('classify_with_gemini', params.classifyWithGemini ? '1' : '0');
+    return request<{ provider: import('@/types').ProviderHealth; recommendations: import('@/types').EventMarketRecommendation[]; count: number }>(
+      `/events/recommendations?${q.toString()}`
+    );
+  },
 
   // Research cycle
   getResearchStatus: () =>
@@ -588,7 +886,7 @@ export const api = {
     }),
 
   trainResearchModel: (data: {
-    algorithm?: 'logistic_regression' | 'gradient_boosting';
+    algorithm?: 'logistic_regression' | 'gradient_boosting' | 'empirical_rules';
     target_column?: string;
     include_unexecuted?: boolean;
     min_rows?: number;
@@ -610,7 +908,7 @@ export const api = {
     }),
 
   runResearchWalkForward: (data: {
-    algorithm?: 'logistic_regression' | 'gradient_boosting';
+    algorithm?: 'logistic_regression' | 'gradient_boosting' | 'empirical_rules';
     target_column?: string;
     score_threshold?: number;
     windows?: number;
@@ -639,4 +937,7 @@ export const api = {
 
   listAttributionReports: (limit: number = 20) =>
     request<{ reports: import('@/types').ResearchReportRecord[] }>(`/research/reports?limit=${limit}`),
+
+  getPerformanceAttribution: (limit: number = 2000) =>
+    request<Record<string, unknown>>(`/analytics/performance?limit=${encodeURIComponent(String(limit))}`),
 };

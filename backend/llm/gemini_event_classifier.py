@@ -4,11 +4,25 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from dotenv import load_dotenv
 
 from domain.models import CandidateAssetMapping, ExternalEvent, GeminiEventAssessment
+from services.gemini_model_fallback import (
+    build_structured_output_model_candidates,
+    cooldown_remaining_seconds,
+    is_rate_limit_error,
+    mark_model_cooldown,
+    next_available_model,
+)
+from services.nvidia_chat_client import (
+    NvidiaChatCompletionsClient,
+    nvidia_api_key,
+    nvidia_model_name,
+    nvidia_provider_enabled,
+)
 
 load_dotenv()
 
@@ -66,12 +80,15 @@ class GeminiEventClassifier:
         max_retries: int = 1,
         model_name: str | None = None,
     ):
-        self.api_key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+        self.api_key = (api_key or nvidia_api_key(os.getenv("GEMINI_API_KEY", ""))).strip()
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
-        self.model_name = (model_name or os.getenv("GEMINI_MODEL", "gemma-3-1b-it")).strip() or "gemma-3-1b-it"
+        self.model_name = (model_name or os.getenv("GEMINI_MODEL", "gemma-4-26b-a4b-it")).strip() or "gemma-4-26b-a4b-it"
+        self.active_model_name = self.model_name
         self._client = None
         self._unavailable_reason = ""
+        self._quota_cooldown_until = 0.0
+        self._model_cooldown_until: dict[str, float] = {}
         self._init_client()
 
     @property
@@ -90,6 +107,9 @@ class GeminiEventClassifier:
     ) -> GeminiEventAssessment:
         if not self.available:
             return self._fallback_assessment(event, candidate_mappings, error=self.unavailable_reason)
+        self._sync_quota_block()
+        if time.time() < self._quota_cooldown_until:
+            return self._fallback_assessment(event, candidate_mappings, error="quota_cooldown")
 
         attempts = max(1, self.max_retries + 1)
         last_error: Exception | None = None
@@ -101,6 +121,9 @@ class GeminiEventClassifier:
                 )
             except Exception as exc:
                 last_error = exc
+                if is_rate_limit_error(exc):
+                    self._sync_quota_block()
+                    return self._fallback_assessment(event, candidate_mappings, error="quota_cooldown")
                 logger.warning("Gemini event classification degraded for %s: %s", event.title, exc)
         return self._fallback_assessment(event, candidate_mappings, error=str(last_error) if last_error else "Gemini classification failed.")
 
@@ -109,21 +132,88 @@ class GeminiEventClassifier:
         event: ExternalEvent,
         candidate_mappings: list[CandidateAssetMapping],
     ) -> GeminiEventAssessment:
-        prompt = self._build_prompt(event, candidate_mappings)
+        prompt = (
+            f"{EVENT_CLASSIFIER_INSTRUCTION}\n\n"
+            "Input payload:\n"
+            f"{self._build_prompt(event, candidate_mappings)}"
+        )
         config = types.GenerateContentConfig(
-            system_instruction=EVENT_CLASSIFIER_INSTRUCTION,
             temperature=0.1,
             response_mime_type="application/json",
         )
-        response = self._client.models.generate_content(
-            model=self.model_name,
+        response = self._generate_with_model_fallback(
             contents=prompt,
             config=config,
         )
         text = (response.text or "").strip()
         return self._parse_response(text, event=event)
 
+    def _model_candidates(self) -> list[str]:
+        return build_structured_output_model_candidates(
+            self.model_name,
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+        )
+
+    def _sync_quota_block(self):
+        candidates = self._model_candidates()
+        if next_available_model(candidates, self._model_cooldown_until) is not None:
+            self._quota_cooldown_until = 0.0
+            return
+        remaining = cooldown_remaining_seconds(candidates, self._model_cooldown_until)
+        self._quota_cooldown_until = time.time() + remaining if remaining > 0 else 0.0
+
+    def _generate_with_model_fallback(self, *, contents: str, config):
+        last_error: Exception | None = None
+        for model_name in self._model_candidates():
+            if float(self._model_cooldown_until.get(model_name, 0.0) or 0.0) > time.time():
+                continue
+            try:
+                response = self._client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+                self.active_model_name = model_name
+                self._sync_quota_block()
+                return response
+            except Exception as exc:
+                last_error = exc
+                if is_rate_limit_error(exc):
+                    mark_model_cooldown(
+                        self._model_cooldown_until,
+                        model_name,
+                        error_text=str(exc),
+                        default_seconds=60.0,
+                    )
+                    self._sync_quota_block()
+                    logger.warning("Gemini event classifier model %s rate limited, trying fallback model.", model_name)
+                    continue
+                raise
+        self._sync_quota_block()
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("All configured Gemini event classifier models are in cooldown.")
+
     def _init_client(self):
+        if nvidia_provider_enabled(api_key=self.api_key, model_name=self.model_name):
+            if not self.api_key:
+                self._unavailable_reason = "NVIDIA_API_KEY not set"
+                self._client = None
+                return
+            try:
+                self.model_name = nvidia_model_name(self.model_name)
+                self.active_model_name = self.model_name
+                self._client = NvidiaChatCompletionsClient(
+                    api_key=self.api_key,
+                    timeout_seconds=self.timeout_seconds,
+                )
+                self._unavailable_reason = ""
+            except Exception as exc:  # pragma: no cover - defensive init guard
+                self._unavailable_reason = str(exc)
+                self._client = None
+            return
+
         if genai is None or types is None:
             self._unavailable_reason = (
                 f"google-genai dependency unavailable: {GEMINI_IMPORT_ERROR}"
@@ -187,6 +277,10 @@ class GeminiEventClassifier:
             cleaned = cleaned[4:].strip()
 
         data = json.loads(cleaned)
+        if isinstance(data, list):
+            data = next((item for item in data if isinstance(item, dict)), {})
+        if not isinstance(data, dict):
+            data = {}
         affected_assets = [str(item).strip().upper() for item in data.get("affected_assets", []) if str(item).strip()]
         bias_by_asset = {}
         for symbol in ("US100", "US500", "US30", "GER40", "GOLD", "WTI", "BRENT"):
@@ -214,7 +308,7 @@ class GeminiEventClassifier:
             confidence_adjustment=max(-0.10, min(0.10, float(data.get("confidence_adjustment", 0.0)))),
             contradiction_flag=bool(data.get("contradiction_flag", False)),
             summary_reason=str(data.get("summary_reason", "")),
-            raw_payload={"raw_text": cleaned},
+            raw_payload={"raw_text": cleaned, "model": self.active_model_name},
         )
 
     def _fallback_assessment(

@@ -100,7 +100,7 @@ export default function Market({ connected }: Props) {
       }
     };
     void run();
-    const t = setInterval(run, 150);
+    const t = setInterval(run, document.visibilityState === 'visible' ? 350 : 2500);
     return () => {
       cancelled = true;
       clearInterval(t);

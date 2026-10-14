@@ -3,7 +3,7 @@ import { RefreshCw, Filter } from 'lucide-react';
 import { api } from '../utils/api';
 import type { LogEntry, TradeHistoryResponse, TradeHistoryItem } from '../types';
 
-const LOG_TYPES = ['all', 'signals', 'risk', 'orders', 'connections', 'errors'];
+const LOG_TYPES = ['all', 'signals', 'risk', 'orders', 'connections', 'errors', 'ai_activity'];
 
 export default function Logs() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -61,6 +61,12 @@ export default function Logs() {
     return `${sign}$${n.toFixed(2)}`;
   };
 
+  const formatPlainMoney = (v: number | null | undefined) => {
+    if (v === null || v === undefined) return '-';
+    const n = Number(v);
+    return `$${n.toFixed(2)}`;
+  };
+
   const formatPct = (v: number | null | undefined) => {
     if (v === null || v === undefined) return '-';
     const n = Number(v);
@@ -83,6 +89,7 @@ export default function Logs() {
       case 'order': return 'badge-green';
       case 'connection': return 'badge-yellow';
       case 'error': return 'badge-red';
+      case 'ai_activity': return 'badge-purple';
       default: return 'badge-blue';
     }
   };
@@ -100,6 +107,14 @@ export default function Logs() {
         return `${l.event} - account=${l.account} server=${l.server} ${l.details || ''}`;
       case 'error':
         return `[${l.source}] ${l.message} ${l.details || ''}`;
+      case 'ai_activity': {
+        const symbol = l.symbol ? ` ${l.symbol}` : '';
+        const ticket = l.ticket ? ` ticket=${l.ticket}` : '';
+        const decision = l.decision_reason ? ` | ${l.decision_reason}` : '';
+        const gemini = l.gemini_summary ? ` | Gemini: ${l.gemini_summary}` : '';
+        const meta = l.meta_model_summary ? ` | Meta: ${l.meta_model_summary}` : '';
+        return `${l.action}${symbol}${ticket} - ${l.detail || ''}${decision}${gemini}${meta}`;
+      }
       default:
         return JSON.stringify(log);
     }
@@ -173,10 +188,10 @@ export default function Logs() {
                 <tr>
                   <th>Time</th>
                   <th>Trade</th>
-                  <th>Started</th>
-                  <th>Ended</th>
+                  <th>Started Budget</th>
+                  <th>Ended Budget</th>
                   <th>P/L</th>
-                  <th>Entry</th>
+                  <th>Entry / Filled Value</th>
                   <th>SL / TP</th>
                   <th>Status</th>
                   <th>Duration</th>
@@ -192,7 +207,7 @@ export default function Logs() {
                       <div className="text-muted">#{trade.ticket ?? '-'} • {trade.volume.toFixed(2)} lots</div>
                     </td>
                     <td className="text-sm">
-                      <div>{formatMoney(trade.started_with_usd)}</div>
+                      <div>{formatPlainMoney(trade.started_with_usd)}</div>
                       <div className="text-muted">
                         {trade.started_with_source === 'provided'
                           ? 'provided'
@@ -201,7 +216,7 @@ export default function Logs() {
                             : 'unknown'}
                       </div>
                     </td>
-                    <td className="text-sm">{formatMoney(trade.ended_with_usd)}</td>
+                    <td className="text-sm">{formatPlainMoney(trade.ended_with_usd)}</td>
                     <td className="text-sm">
                       <div style={{ color: (trade.profit_usd || 0) >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontWeight: 600 }}>
                         {formatMoney(trade.profit_usd)}
@@ -210,7 +225,7 @@ export default function Logs() {
                     </td>
                     <td className="text-sm">
                       <div>{trade.entry_price ? trade.entry_price.toFixed(5) : '-'}</div>
-                      <div className="text-muted">{formatMoney(trade.entry_market_value_usd)}</div>
+                      <div className="text-muted">filled {formatPlainMoney(trade.entry_market_value_usd)}</div>
                     </td>
                     <td className="text-sm">
                       <div>SL {trade.stop_loss ? trade.stop_loss.toFixed(5) : '-'}</div>

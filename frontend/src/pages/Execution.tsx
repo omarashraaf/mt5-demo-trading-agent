@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { X, Play, AlertOctagon } from 'lucide-react';
+import { X, Play, AlertOctagon, Pencil } from 'lucide-react';
 import { api } from '../utils/api';
 import { FALLBACK_SYMBOL_LIST, ACTIVE_SYMBOL_MODE_LABEL } from '../utils/symbolUniverse';
 import type { StatusResponse, PositionInfo, OrderResult, EvaluateResponse } from '../types';
@@ -19,7 +19,13 @@ export default function Execution({ connected, status }: Props) {
   const [timeframe, setTimeframe] = useState('H1');
   const [loading, setLoading] = useState(false);
   const [executing, setExecuting] = useState(false);
+  const [manualAction, setManualAction] = useState<'BUY' | 'SELL'>('BUY');
+  const [manualQuantity, setManualQuantity] = useState('1');
+  const [manualStopLoss, setManualStopLoss] = useState('0');
+  const [manualTakeProfit, setManualTakeProfit] = useState('0');
   const [error, setError] = useState('');
+  const killSwitchActive = Boolean(status?.kill_switch?.enabled);
+  const killSwitchReason = status?.kill_switch?.reason || 'Global trading kill switch is active.';
 
   const refreshPositions = useCallback(async () => {
     if (!connected) return;
@@ -33,7 +39,11 @@ export default function Execution({ connected, status }: Props) {
 
   useEffect(() => {
     refreshPositions();
-    const t = setInterval(refreshPositions, 3000);
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshPositions();
+      }
+    }, document.visibilityState === 'visible' ? 3000 : 10000);
     return () => clearInterval(t);
   }, [refreshPositions]);
 
@@ -87,7 +97,64 @@ export default function Execution({ connected, status }: Props) {
 
   const handleClosePosition = async (ticket: number) => {
     try {
-      const result = await api.closePosition(ticket);
+      const position = positions.find((item) => item.ticket === ticket);
+      const result = position?.close_pending
+        ? await api.cancelPositionClose(ticket)
+        : await api.closePosition(ticket);
+      setOrderHistory((prev) => [result, ...prev].slice(0, 20));
+      await refreshPositions();
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
+
+  const handleManualOrder = async () => {
+    const quantity = Number(manualQuantity);
+    const stopLoss = Number(manualStopLoss || 0);
+    const takeProfit = Number(manualTakeProfit || 0);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      setError('Enter a quantity greater than zero. IBKR stock quantities are shares, not MT5 lots.');
+      return;
+    }
+    if (![stopLoss, takeProfit].every(Number.isFinite) || stopLoss < 0 || takeProfit < 0) {
+      setError('Stop loss and take profit must be valid positive prices or zero.');
+      return;
+    }
+    setExecuting(true);
+    setError('');
+    try {
+      const order = await api.executeTrade({
+        symbol,
+        action: manualAction,
+        volume: quantity,
+        stop_loss: stopLoss,
+        take_profit: takeProfit,
+      });
+      setLastOrder(order);
+      setOrderHistory((prev) => [order, ...prev].slice(0, 20));
+      await refreshPositions();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setExecuting(false);
+    }
+  };
+
+  const handleModifyPosition = async (position: PositionInfo) => {
+    const slInput = window.prompt('Enter new stop loss price (0 to clear):', String(position.stop_loss || 0));
+    if (slInput == null) return;
+    const tpInput = window.prompt('Enter new take profit price (0 to clear):', String(position.take_profit || 0));
+    if (tpInput == null) return;
+
+    const nextSL = Number(slInput);
+    const nextTP = Number(tpInput);
+    if (!Number.isFinite(nextSL) || !Number.isFinite(nextTP)) {
+      setError('Stop loss and take profit must be valid numbers.');
+      return;
+    }
+
+    try {
+      const result = await api.modifyPosition(position.ticket, nextSL, nextTP);
       setOrderHistory((prev) => [result, ...prev].slice(0, 20));
       await refreshPositions();
     } catch (e: any) {
@@ -133,6 +200,11 @@ export default function Execution({ connected, status }: Props) {
       </div>
 
       {error && <div className="error-banner">{error}</div>}
+      {killSwitchActive && (
+        <div className="error-banner mb-4">
+          Global trading kill switch active: {killSwitchReason}. New orders are blocked.
+        </div>
+      )}
       {status?.panic_stop && (
         <div className="error-banner mb-4" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <span>⚠ PANIC STOP ACTIVE - Trading halted</span>
@@ -141,6 +213,36 @@ export default function Execution({ connected, status }: Props) {
           </button>
         </div>
       )}
+
+      <div className="card mb-4">
+        <div className="card-header"><h3>Manual Broker Order</h3></div>
+        <p className="text-sm text-muted mb-4">
+          Submit directly to the connected broker. For IBKR stocks, quantity means shares. Orders may remain pending outside regular market hours.
+        </p>
+        <div className="flex gap-3 items-center mb-4" style={{ flexWrap: 'wrap' }}>
+          <div className="form-group" style={{ margin: 0, minWidth: 120 }}>
+            <label>Action</label>
+            <select className="form-input" value={manualAction} onChange={(e) => setManualAction(e.target.value as 'BUY' | 'SELL')}>
+              <option value="BUY">Buy</option><option value="SELL">Sell</option>
+            </select>
+          </div>
+          <div className="form-group" style={{ margin: 0, minWidth: 120 }}>
+            <label>Quantity</label>
+            <input className="form-input" type="number" min="0.0001" step="0.0001" value={manualQuantity} onChange={(e) => setManualQuantity(e.target.value)} />
+          </div>
+          <div className="form-group" style={{ margin: 0, minWidth: 140 }}>
+            <label>Stop Loss (optional)</label>
+            <input className="form-input" type="number" min="0" step="0.01" value={manualStopLoss} onChange={(e) => setManualStopLoss(e.target.value)} />
+          </div>
+          <div className="form-group" style={{ margin: 0, minWidth: 140 }}>
+            <label>Take Profit (optional)</label>
+            <input className="form-input" type="number" min="0" step="0.01" value={manualTakeProfit} onChange={(e) => setManualTakeProfit(e.target.value)} />
+          </div>
+        </div>
+        <button className="btn btn-primary" onClick={handleManualOrder} disabled={executing || status?.panic_stop || killSwitchActive}>
+          <Play size={14} /> {executing ? 'Submitting...' : `Submit ${manualAction} Order`}
+        </button>
+      </div>
 
       <div className="card mb-4">
         <div className="card-header">
@@ -172,8 +274,9 @@ export default function Execution({ connected, status }: Props) {
         <button
           className="btn btn-primary"
           onClick={handleFullCycle}
-          disabled={loading || status?.panic_stop}
+          disabled={loading || status?.panic_stop || killSwitchActive}
           style={{ fontSize: 14, padding: '10px 24px' }}
+          title={killSwitchActive ? killSwitchReason : undefined}
         >
           {loading ? (
             <>
@@ -297,17 +400,34 @@ export default function Execution({ connected, status }: Props) {
                   <td className="font-mono">{p.volume}</td>
                   <td className="font-mono">{p.price_open.toFixed(5)}</td>
                   <td className="font-mono">{p.price_current.toFixed(5)}</td>
-                  <td className="font-mono">{p.stop_loss > 0 ? p.stop_loss.toFixed(5) : '-'}</td>
-                  <td className="font-mono">{p.take_profit > 0 ? p.take_profit.toFixed(5) : '-'}</td>
+                  <td>
+                    <div className="font-mono">{p.stop_loss > 0 ? p.stop_loss.toFixed(5) : '-'}</div>
+                    <div className="text-muted" style={{ fontSize: 10 }}>
+                      {p.target_management_mode === 'manual' ? 'Manual' : p.target_management_mode === 'pending_auto' ? 'Auto pending' : 'Auto'}
+                    </div>
+                  </td>
+                  <td>
+                    <div className="font-mono">{p.take_profit > 0 ? p.take_profit.toFixed(5) : '-'}</div>
+                    <div className="text-muted" style={{ fontSize: 10 }}>
+                      {p.target_management_mode === 'manual' ? 'Manual' : p.target_management_mode === 'pending_auto' ? 'Auto pending' : 'Auto'}
+                    </div>
+                  </td>
                   <td className={`font-mono ${p.profit >= 0 ? 'text-green' : 'text-red'}`}>
                     {p.profit >= 0 ? '+' : ''}{p.profit.toFixed(2)}
                   </td>
                   <td>
                     <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => handleModifyPosition(p)}
+                      style={{ marginRight: 8 }}
+                    >
+                      <Pencil size={12} /> Edit
+                    </button>
+                    <button
                       className="btn btn-danger btn-sm"
                       onClick={() => handleClosePosition(p.ticket)}
                     >
-                      <X size={12} /> Close
+                      <X size={12} /> {p.close_pending ? 'Cancel Close' : 'Close'}
                     </button>
                   </td>
                 </tr>

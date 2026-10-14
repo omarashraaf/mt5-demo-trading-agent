@@ -10,7 +10,19 @@ from services.symbol_profile_service import SymbolProfileService
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    if not math.isfinite(value):
+        return minimum
     return max(minimum, min(maximum, value))
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+    if not math.isfinite(parsed):
+        return float(default)
+    return parsed
 
 
 class PortfolioRiskService:
@@ -28,12 +40,25 @@ class PortfolioRiskService:
         recent_outcomes: list[dict] | None = None,
         is_auto_trade: bool = False,
     ) -> PortfolioRiskAssessment:
-        equity = max(context.account_equity, 0.0)
-        current_margin = max(context.account_margin, 0.0)
-        free_margin = max(context.account_free_margin, 0.0)
+        raw_equity = _safe_float(context.account_equity, 0.0)
+        raw_margin = _safe_float(context.account_margin, 0.0)
+        raw_free_margin = _safe_float(context.account_free_margin, 0.0)
+        proposed_volume = _safe_float(proposed_volume, 0.0)
+        entry_price = _safe_float(entry_price, 0.0)
+        equity = max(raw_equity, 0.0)
+        current_margin = max(raw_margin, 0.0)
+        free_margin = max(raw_free_margin, 0.0)
+        budget_equity, budget_margin, budget_free_margin = self._budget_scope(
+            equity=equity,
+            current_margin=current_margin,
+            free_margin=free_margin,
+            settings=settings,
+            is_auto_trade=is_auto_trade,
+        )
         positions = context.all_open_positions
         symbol_info = context.symbol_info
         profile = context.profile
+        signal_direction = str(signal.action or "").upper()
 
         margin_required = self._estimate_margin(
             symbol_info=symbol_info,
@@ -41,9 +66,9 @@ class PortfolioRiskService:
             price=entry_price,
             leverage=max(context.account_leverage, 1),
         )
-        projected_margin = current_margin + margin_required
-        projected_margin_util = (projected_margin / equity * 100) if equity > 0 else 0.0
-        projected_free_margin_pct = ((free_margin - margin_required) / equity * 100) if equity > 0 else 0.0
+        projected_margin = budget_margin + margin_required
+        projected_margin_util = (projected_margin / budget_equity * 100) if budget_equity > 0 else 0.0
+        projected_free_margin_pct = ((budget_free_margin - margin_required) / budget_equity * 100) if budget_equity > 0 else 0.0
 
         exposures = self._exposure_breakdown(context, positions)
         sector_exposure = exposures["by_sector"].get(symbol_info.sector if symbol_info else "Other", 0.0)
@@ -52,11 +77,62 @@ class PortfolioRiskService:
             pos for pos in positions
             if str(pos.get("symbol", "")).upper() == context.symbol.upper()
         ]
+        hedge_opposite_loser = self._has_opposite_losing_position(
+            positions=same_symbol_positions,
+            direction=signal_direction,
+        )
+        is_add_on_same_symbol = len(same_symbol_positions) > 0
         correlated_symbols = self._correlated_positions(context, positions)
+        current_margin_util = (budget_margin / budget_equity * 100) if budget_equity > 0 else 0.0
+        current_free_margin_pct = (budget_free_margin / budget_equity * 100) if budget_equity > 0 else 0.0
+        portfolio_fit_score = self._portfolio_fit_score(
+            current_margin_util,
+            current_free_margin_pct,
+            len(correlated_symbols),
+            settings.max_correlated_positions,
+        )
+
+        if signal_direction not in {"BUY", "SELL"}:
+            return PortfolioRiskAssessment(
+                status="block",
+                allow_execute=False,
+                reason="Portfolio risk skipped because the signal is HOLD.",
+                blocking_reasons=[],
+                warnings=[],
+                correlated_symbols=correlated_symbols,
+                margin_required=0.0,
+                projected_margin_utilization_pct=round(current_margin_util, 2),
+                projected_free_margin_pct=round(current_free_margin_pct, 2),
+                portfolio_fit_score=round(portfolio_fit_score, 3),
+                metrics_snapshot={
+                    "margin_utilization_pct": round(current_margin_util, 2),
+                    "projected_margin_utilization_pct": round(current_margin_util, 2),
+                    "free_margin_pct": round(current_free_margin_pct, 2),
+                    "projected_free_margin_pct": round(current_free_margin_pct, 2),
+                    "budget_mode": str(getattr(settings, "auto_trade_budget_mode", "full_margin") or "full_margin"),
+                    "budget_equity": round(budget_equity, 2),
+                    "open_positions_total": len(positions),
+                    "open_positions_same_symbol": len(same_symbol_positions),
+                    "sector_exposure_pct": round(sector_exposure, 2),
+                    "category_exposure_pct": round(category_exposure, 2),
+                    "usd_beta_exposure_pct": round(exposures["usd_beta_exposure_pct"], 2),
+                    "stocks_equity_exposure_pct": round(exposures["stocks_equity_exposure_pct"], 2),
+                    "exposure_by_symbol": exposures["by_symbol"],
+                    "exposure_by_category": exposures["by_category"],
+                    "exposure_by_sector": exposures["by_sector"],
+                    "skipped": "hold_signal",
+                },
+            )
 
         blocking_reasons: list[str] = []
         warnings: list[str] = []
 
+        if equity <= 0.0:
+            blocking_reasons.append("Portfolio risk cannot verify account equity.")
+        if proposed_volume <= 0.0:
+            blocking_reasons.append("Portfolio risk cannot verify proposed trade volume.")
+        if entry_price <= 0.0:
+            blocking_reasons.append("Portfolio risk cannot verify live entry price.")
         if projected_margin_util > settings.max_margin_utilization_pct:
             blocking_reasons.append(
                 f"Projected margin utilization {projected_margin_util:.1f}% exceeds cap {settings.max_margin_utilization_pct:.1f}%."
@@ -69,34 +145,45 @@ class PortfolioRiskService:
             blocking_reasons.append(
                 f"Open position cap reached ({len(positions)}/{settings.max_open_positions_total})."
             )
-        if len(same_symbol_positions) >= settings.max_positions_per_symbol:
+        if len(same_symbol_positions) >= settings.max_positions_per_symbol and not hedge_opposite_loser:
             blocking_reasons.append(
                 f"{context.symbol} already has {len(same_symbol_positions)} open position(s)."
             )
-        if recent_outcomes and self._recent_symbol_trade_block(context.symbol, recent_outcomes, settings.cooldown_minutes_per_symbol):
+        if recent_outcomes and self._recent_symbol_trade_block(
+            context.symbol,
+            recent_outcomes,
+            settings.cooldown_minutes_per_symbol,
+            action=signal_direction,
+            allow_opposite=hedge_opposite_loser,
+        ):
             blocking_reasons.append(
                 f"{context.symbol} is still inside the per-symbol cooldown window."
             )
-        if profile and exposures["counts_by_category"].get(profile.category, 0) >= profile.max_positions_per_category:
+        if (
+            profile
+            and not is_add_on_same_symbol
+            and exposures["counts_by_category"].get(profile.category, 0) >= profile.max_positions_per_category
+        ):
+            current_category_positions = int(exposures["counts_by_category"].get(profile.category, 0) or 0)
             blocking_reasons.append(
-                f"{profile.profile_name} category already has the configured maximum open positions."
+                f"{profile.profile_name} category already has the configured maximum open positions ({current_category_positions}/{profile.max_positions_per_category})."
             )
-        if sector_exposure + self._exposure_pct(margin_required, equity) > settings.max_sector_exposure_pct:
+        if sector_exposure + self._exposure_pct(margin_required, budget_equity) > settings.max_sector_exposure_pct:
             blocking_reasons.append(
                 f"Sector exposure would exceed {settings.max_sector_exposure_pct:.1f}% of equity."
             )
-        usd_beta_projection = exposures["usd_beta_exposure_pct"] + self._projected_usd_beta_pct(context, margin_required, equity)
+        usd_beta_projection = exposures["usd_beta_exposure_pct"] + self._projected_usd_beta_pct(context, margin_required, budget_equity)
         if abs(usd_beta_projection) > settings.max_usd_beta_exposure_pct:
             blocking_reasons.append(
                 f"USD beta exposure would reach {usd_beta_projection:.1f}%."
             )
         if profile and profile.category == "Stocks":
-            stocks_projection = exposures["stocks_equity_exposure_pct"] + self._exposure_pct(margin_required, equity)
+            stocks_projection = exposures["stocks_equity_exposure_pct"] + self._exposure_pct(margin_required, budget_equity)
             if stocks_projection > settings.max_equity_exposure_pct_for_stocks:
                 blocking_reasons.append(
                     f"Stock exposure would exceed {settings.max_equity_exposure_pct_for_stocks:.1f}% of equity."
                 )
-        if len(correlated_symbols) >= settings.max_correlated_positions:
+        if (not is_add_on_same_symbol) and len(correlated_symbols) >= settings.max_correlated_positions:
             blocking_reasons.append(
                 f"Correlated exposure already exists across {', '.join(correlated_symbols[:4])}."
             )
@@ -128,10 +215,12 @@ class PortfolioRiskService:
             projected_free_margin_pct=round(projected_free_margin_pct, 2),
             portfolio_fit_score=round(portfolio_fit_score, 3),
             metrics_snapshot={
-                "margin_utilization_pct": round((current_margin / equity * 100) if equity > 0 else 0.0, 2),
+                "margin_utilization_pct": round((budget_margin / budget_equity * 100) if budget_equity > 0 else 0.0, 2),
                 "projected_margin_utilization_pct": round(projected_margin_util, 2),
-                "free_margin_pct": round((free_margin / equity * 100) if equity > 0 else 0.0, 2),
+                "free_margin_pct": round((budget_free_margin / budget_equity * 100) if budget_equity > 0 else 0.0, 2),
                 "projected_free_margin_pct": round(projected_free_margin_pct, 2),
+                "budget_mode": str(getattr(settings, "auto_trade_budget_mode", "full_margin") or "full_margin"),
+                "budget_equity": round(budget_equity, 2),
                 "open_positions_total": len(positions),
                 "open_positions_same_symbol": len(same_symbol_positions),
                 "sector_exposure_pct": round(sector_exposure, 2),
@@ -164,13 +253,20 @@ class PortfolioRiskService:
         equity = max(context.account_equity, 0.0)
         current_margin = max(context.account_margin, 0.0)
         free_margin = max(context.account_free_margin, 0.0)
-        if equity <= 0:
+        budget_equity, budget_margin, budget_free_margin = self._budget_scope(
+            equity=equity,
+            current_margin=current_margin,
+            free_margin=free_margin,
+            settings=settings,
+            is_auto_trade=True,
+        )
+        if budget_equity <= 0:
             return 0.0, "Account equity is zero."
 
-        margin_cap_amount = equity * float(settings.max_margin_utilization_pct) / 100.0
-        min_free_margin_amount = equity * float(settings.min_free_margin_pct) / 100.0
-        allowed_by_margin_cap = margin_cap_amount - current_margin
-        allowed_by_free_margin_floor = free_margin - min_free_margin_amount
+        margin_cap_amount = budget_equity * float(settings.max_margin_utilization_pct) / 100.0
+        min_free_margin_amount = budget_equity * float(settings.min_free_margin_pct) / 100.0
+        allowed_by_margin_cap = margin_cap_amount - budget_margin
+        allowed_by_free_margin_floor = budget_free_margin - min_free_margin_amount
         margin_budget = min(allowed_by_margin_cap, allowed_by_free_margin_floor)
         if margin_budget <= 0:
             return 0.0, (
@@ -197,6 +293,17 @@ class PortfolioRiskService:
         fitted = min(proposed_volume, max_volume_by_budget, max_volume)
         fitted = self._floor_to_step(fitted, step)
         if fitted < min_volume:
+            minimum_margin_required = self._estimate_margin(
+                symbol_info=context.symbol_info,
+                volume=min_volume,
+                price=entry_price,
+                leverage=leverage,
+            )
+            if minimum_margin_required > 0 and minimum_margin_required <= (margin_budget + 1e-9):
+                return min_volume, (
+                    f"Volume raised from {proposed_volume:g} to broker minimum {min_volume:g} "
+                    "so this market can still be traded safely."
+                )
             return 0.0, (
                 f"Minimum lot {min_volume:g} exceeds safe margin budget "
                 f"under cap {settings.max_margin_utilization_pct:.1f}%."
@@ -208,6 +315,29 @@ class PortfolioRiskService:
                 "to respect margin/free-margin policy limits."
             )
         return fitted, None
+
+    def _budget_scope(
+        self,
+        *,
+        equity: float,
+        current_margin: float,
+        free_margin: float,
+        settings: Any,
+        is_auto_trade: bool,
+    ) -> tuple[float, float, float]:
+        budget_equity = max(equity, 0.0)
+        budget_margin = max(current_margin, 0.0)
+        budget_free_margin = max(free_margin, 0.0)
+        if not is_auto_trade:
+            return budget_equity, budget_margin, budget_free_margin
+        budget_mode = str(getattr(settings, "auto_trade_budget_mode", "full_margin") or "full_margin").lower()
+        raw_budget = getattr(settings, "auto_trade_budget_usd", None)
+        custom_budget = _safe_float(raw_budget, 0.0) if raw_budget is not None else 0.0
+        if budget_mode == "custom_budget" and custom_budget > 0:
+            budget_equity = custom_budget
+            budget_margin = max(current_margin, 0.0)
+            budget_free_margin = max(0.0, custom_budget - budget_margin)
+        return budget_equity, budget_margin, budget_free_margin
 
     def snapshot(self, account, positions: list[Any]) -> dict[str, Any]:
         equity = getattr(account, "equity", 0.0) if account else 0.0
@@ -236,10 +366,13 @@ class PortfolioRiskService:
         }
 
     def _estimate_margin(self, symbol_info, volume: float, price: float, leverage: int) -> float:
+        volume = _safe_float(volume, 0.0)
+        price = _safe_float(price, 0.0)
         if not symbol_info or volume <= 0 or price <= 0:
             return 0.0
-        contract_size = max(symbol_info.trade_contract_size, 1.0)
-        return volume * price * contract_size / max(leverage, 1)
+        contract_size = max(_safe_float(symbol_info.trade_contract_size, 1.0), 1.0)
+        margin = volume * price * contract_size / max(leverage, 1)
+        return margin if math.isfinite(margin) else 0.0
 
     def _floor_to_step(self, value: float, step: float) -> float:
         if step <= 0:
@@ -268,8 +401,10 @@ class PortfolioRiskService:
                 self._normalized_info(symbol, info, position),
             )
             profile = self.profile_service.resolve_profile(symbol, normalized)
-            price = float(position.get("price_current") or position.get("price_open") or 0.0)
-            volume = float(position.get("volume") or 0.0)
+            price = _safe_float(position.get("price_current") or position.get("price_open") or 0.0, 0.0)
+            volume = _safe_float(position.get("volume") or 0.0, 0.0)
+            if price <= 0.0 or volume <= 0.0:
+                continue
             leverage = max(context.account_leverage, 1)
             margin_equivalent = volume * price * max(normalized.trade_contract_size, 1.0) / leverage
             exposure_pct = self._exposure_pct(margin_equivalent, equity)
@@ -356,14 +491,44 @@ class PortfolioRiskService:
         symbol: str,
         recent_outcomes: list[dict],
         cooldown_minutes: int,
+        *,
+        action: str | None = None,
+        allow_opposite: bool = False,
     ) -> bool:
+        action_norm = str(action or "").upper()
         for outcome in recent_outcomes:
             if str(outcome.get("symbol", "")).upper() != symbol.upper():
                 continue
+            if allow_opposite and action_norm in {"BUY", "SELL"}:
+                outcome_action = str(outcome.get("action", "")).upper()
+                if outcome_action in {"BUY", "SELL"} and outcome_action != action_norm:
+                    continue
             closed_at = outcome.get("closed_at") or outcome.get("timestamp")
             if closed_at is None:
                 continue
-            minutes_since = max(0.0, (time.time() - float(closed_at)) / 60.0)
+            closed_ts = _safe_float(closed_at, 0.0)
+            if closed_ts <= 0:
+                continue
+            minutes_since = max(0.0, (time.time() - closed_ts) / 60.0)
             if minutes_since < cooldown_minutes:
                 return True
+        return False
+
+    def _has_opposite_losing_position(self, *, positions: list[dict], direction: str) -> bool:
+        direction = str(direction or "").upper()
+        if direction not in {"BUY", "SELL"}:
+            return False
+        for pos in positions:
+            pos_dir = str(pos.get("type") or pos.get("action") or "").upper()
+            if pos_dir in {"LONG"}:
+                pos_dir = "BUY"
+            elif pos_dir in {"SHORT"}:
+                pos_dir = "SELL"
+            if pos_dir and pos_dir != direction:
+                try:
+                    profit = float(pos.get("profit", pos.get("profit_usd", 0.0)) or 0.0)
+                except Exception:
+                    profit = 0.0
+                if profit < 0:
+                    return True
         return False

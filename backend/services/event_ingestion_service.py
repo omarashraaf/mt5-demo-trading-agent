@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Any
 
-from adapters.finnhub_adapter import FinnhubAdapter, FinnhubAdapterError
+from adapters.benzinga_adapter import BenzingaAdapter, BenzingaAdapterError
 from domain.models import CandidateAssetMapping, ExternalEvent, GeminiEventAssessment, NormalizedNewsItem
 from services.asset_mapping_service import AssetMappingService
 from services.event_normalization_service import EventNormalizationService
@@ -15,17 +16,34 @@ from services.symbol_universe_service import SymbolUniverseService
 logger = logging.getLogger(__name__)
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 class EventIngestionService:
     def __init__(
         self,
         *,
-        finnhub_adapter: FinnhubAdapter,
+        benzinga_adapter: BenzingaAdapter,
         normalization_service: EventNormalizationService,
         asset_mapping_service: AssetMappingService,
         db=None,
         gemini_event_classifier=None,
     ):
-        self.finnhub_adapter = finnhub_adapter
+        self.benzinga_adapter = benzinga_adapter
         self.normalization_service = normalization_service
         self.asset_mapping_service = asset_mapping_service
         self.db = db
@@ -46,7 +64,7 @@ class EventIngestionService:
     ) -> dict[str, Any]:
         started_at = time.time()
         if from_date is None or to_date is None:
-            from_date, to_date = self.finnhub_adapter.default_date_range()
+            from_date, to_date = self.benzinga_adapter.default_date_range()
 
         stored_events: list[dict[str, Any]] = []
         mapped_assets_total = 0
@@ -61,28 +79,27 @@ class EventIngestionService:
 
             try:
                 calendar_items = await asyncio.to_thread(
-                    self.finnhub_adapter.get_economic_calendar,
+                    self.benzinga_adapter.get_economic_calendar,
                     from_date,
                     to_date,
                 )
-            except FinnhubAdapterError as exc:
+            except BenzingaAdapterError as exc:
                 degraded_reasons.append(f"economic_calendar: {exc}")
 
             try:
                 news_items = await asyncio.to_thread(
-                    self.finnhub_adapter.get_market_news,
-                    news_category,
+                    self.benzinga_adapter.get_market_news,
                 )
-            except FinnhubAdapterError as exc:
+            except BenzingaAdapterError as exc:
                 degraded_reasons.append(f"market_news: {exc}")
 
             if not calendar_items and not news_items and degraded_reasons:
-                raise FinnhubAdapterError(" | ".join(degraded_reasons))
+                raise BenzingaAdapterError(" | ".join(degraded_reasons))
 
             raw_item_count = len(calendar_items) + len(news_items)
             events = [
-                *self.normalization_service.normalize_economic_calendar(calendar_items),
-                *self.normalization_service.normalize_market_news(news_items),
+                *self.normalization_service.normalize_economic_calendar(calendar_items, source="benzinga"),
+                *self.normalization_service.normalize_market_news(news_items, source="benzinga"),
             ]
 
             for event in events:
@@ -94,8 +111,8 @@ class EventIngestionService:
             success = True
             if degraded_reasons:
                 error = " | ".join(degraded_reasons)
-        except FinnhubAdapterError as exc:
-            logger.warning("Finnhub ingestion degraded: %s", exc)
+        except BenzingaAdapterError as exc:
+            logger.warning("Benzinga ingestion degraded: %s", exc)
             error = str(exc)
             success = False
         except Exception as exc:  # pragma: no cover - defensive normalization
@@ -105,7 +122,7 @@ class EventIngestionService:
 
         if self.db is not None:
             await self.db.log_event_fetch_run(
-                provider="finnhub",
+                provider="benzinga",
                 started_at=started_at,
                 finished_at=time.time(),
                 success=success,
@@ -114,7 +131,7 @@ class EventIngestionService:
             )
 
         return {
-            "provider": "finnhub",
+            "provider": "benzinga",
             "success": success,
             "error": error,
             "raw_item_count": raw_item_count,
@@ -133,16 +150,38 @@ class EventIngestionService:
             return []
         return await self.db.get_latest_external_events(limit=limit, usable_only=True)
 
+    async def latest_events(
+        self,
+        *,
+        limit: int = 25,
+        usable_only: bool = True,
+        event_type: str | None = None,
+        order_by: str = "timestamp",
+    ) -> list[dict[str, Any]]:
+        if self.db is None:
+            return []
+        return await self.db.get_latest_external_events(
+            limit=limit,
+            usable_only=usable_only,
+            event_type=event_type,
+            order_by=order_by,
+        )
+
     async def maybe_refresh_latest(
         self,
         *,
         min_interval_seconds: float = 300.0,
         classify_with_gemini: bool = True,
     ) -> dict[str, Any] | None:
-        if self.db is None or not self.finnhub_adapter.enabled:
+        if self.db is None or not self.benzinga_adapter.enabled:
             return None
         now = time.time()
         if now - self._last_refresh_started_at < min_interval_seconds:
+            return None
+        # Do not queue behind an in-flight refresh in scan/auto loops.
+        # If another task is already refreshing, skip this cycle fast and
+        # continue with existing cached events/news.
+        if self._refresh_lock.locked():
             return None
 
         async with self._refresh_lock:
@@ -160,6 +199,22 @@ class EventIngestionService:
         limit: int = 10,
         max_event_age_hours: float = 18.0,
     ) -> list[str]:
+        rankings = await self.latest_candidate_rankings(
+            universe_service=universe_service,
+            market_symbols=market_symbols,
+            limit=limit,
+            max_event_age_hours=max_event_age_hours,
+        )
+        return [item["symbol"] for item in rankings]
+
+    async def latest_candidate_rankings(
+        self,
+        *,
+        universe_service: SymbolUniverseService,
+        market_symbols: list[dict[str, Any]],
+        limit: int = 10,
+        max_event_age_hours: float = 18.0,
+    ) -> list[dict[str, Any]]:
         if self.db is None:
             return []
 
@@ -176,7 +231,7 @@ class EventIngestionService:
             if not self._is_recent_event(event, max_event_age_hours=max_event_age_hours):
                 continue
             importance_bonus = {"low": 0.0, "medium": 0.06, "high": 0.12}.get(str(event.get("importance", "low")), 0.0)
-            for mapping in mappings:
+            for mapping in self._mapping_rows(mappings):
                 if not bool(mapping.get("tradable", False)):
                     continue
                 canonical = universe_service.canonical_symbol(mapping.get("symbol"))
@@ -186,8 +241,8 @@ class EventIngestionService:
                 if not resolved:
                     continue
                 bias = self._assessment_bias_for_symbol(assessment, canonical)
-                score = float(mapping.get("mapping_score", 0.0)) + importance_bonus
-                score += max(-0.05, min(0.05, float((assessment or {}).get("confidence_adjustment", 0.0))))
+                score = _safe_float(mapping.get("mapping_score", 0.0)) + importance_bonus
+                score += max(-0.05, min(0.05, _safe_float((assessment or {}).get("confidence_adjustment", 0.0))))
                 if bias != "neutral":
                     score += 0.05
                 if (assessment or {}).get("event_risk") == "high" and bias == "neutral":
@@ -196,12 +251,16 @@ class EventIngestionService:
                 existing = candidates.get(canonical)
                 if existing is None or score > float(existing["score"]):
                     candidates[canonical] = {
-                        "raw_symbol": resolved[0],
+                        "symbol": resolved[0],
                         "score": round(score, 3),
+                        "event_title": str(event.get("title", "")).strip(),
+                        "event_type": str(event.get("event_type", "")).strip(),
+                        "bias": bias,
+                        "event_risk": str((assessment or {}).get("event_risk", "low")).lower(),
                     }
 
         ordered = sorted(candidates.values(), key=lambda item: item["score"], reverse=True)
-        return [item["raw_symbol"] for item in ordered[:limit] if item["score"] >= 0.65]
+        return [item for item in ordered[:limit] if item["score"] >= 0.65]
 
     async def recent_symbol_news(
         self,
@@ -235,30 +294,14 @@ class EventIngestionService:
                 assessment=assessment,
                 universe_service=universe_service,
             )
-            summary_parts = []
-            if event.get("summary"):
-                summary_parts.append(str(event["summary"]).strip())
-            if (assessment or {}).get("summary_reason"):
-                summary_parts.append(f"Gemini: {str(assessment['summary_reason']).strip()}")
-
             items.append(
-                NormalizedNewsItem(
-                    source=str(event.get("source", "finnhub")),
-                    category=self._news_category_for_event(event),
-                    title=str(event.get("title", "")).strip(),
-                    summary=" ".join(part for part in summary_parts if part).strip(),
-                    published_at=float(event.get("timestamp_utc", 0.0) or time.time()),
-                    received_at=float(event.get("fetched_at", 0.0) or time.time()),
+                self._normalized_news_item_for_event(
+                    event=event,
+                    mappings=mappings,
+                    assessment=assessment,
+                    canonical_symbol=canonical,
+                    universe_service=universe_service,
                     affected_symbols=affected_symbols or [canonical],
-                    metadata={
-                        "external_event_id": event.get("id"),
-                        "event_type": event.get("event_type"),
-                        "importance": event.get("importance"),
-                        "country": event.get("country"),
-                        "gemini_event_risk": (assessment or {}).get("event_risk", "low"),
-                        "gemini_bias": self._assessment_bias_for_symbol(assessment, canonical),
-                        "gemini_confidence_adjustment": float((assessment or {}).get("confidence_adjustment", 0.0)),
-                    },
                 )
             )
 
@@ -317,16 +360,26 @@ class EventIngestionService:
 
         mappings_by_event: dict[int, list[dict[str, Any]]] = {}
         for mapping in mappings:
-            mappings_by_event.setdefault(int(mapping["external_event_id"]), []).append(mapping)
+            event_id = _safe_int(mapping.get("external_event_id"), 0)
+            if event_id <= 0:
+                continue
+            mappings_by_event.setdefault(event_id, []).append(mapping)
 
         assessments_by_event: dict[int, dict[str, Any]] = {}
         for assessment in assessments:
-            event_id = int(assessment["external_event_id"])
-            assessments_by_event.setdefault(event_id, assessment["assessment_json"])
+            event_id = _safe_int(assessment.get("external_event_id"), 0)
+            if event_id <= 0:
+                continue
+            assessment_payload = assessment.get("assessment_json")
+            if not isinstance(assessment_payload, dict):
+                continue
+            assessments_by_event.setdefault(event_id, assessment_payload)
 
         bundles: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]] = []
         for event in events:
-            event_id = int(event.get("id", 0))
+            event_id = _safe_int(event.get("id", 0), 0)
+            if event_id <= 0:
+                continue
             bundles.append(
                 (
                     event,
@@ -337,11 +390,53 @@ class EventIngestionService:
         return bundles
 
     def _is_recent_event(self, event: dict[str, Any], *, max_event_age_hours: float) -> bool:
-        timestamp = float(event.get("timestamp_utc", 0.0) or 0.0)
+        timestamp = _safe_float(event.get("timestamp_utc", 0.0), 0.0)
         if timestamp <= 0:
             return False
         age_seconds = max(0.0, time.time() - timestamp)
         return age_seconds <= max_event_age_hours * 3600.0
+
+    def _normalized_news_item_for_event(
+        self,
+        *,
+        event: dict[str, Any],
+        mappings: list[dict[str, Any]],
+        assessment: dict[str, Any] | None,
+        canonical_symbol: str,
+        universe_service: SymbolUniverseService,
+        affected_symbols: list[str] | None = None,
+    ) -> NormalizedNewsItem:
+        summary_parts = []
+        if event.get("summary"):
+            summary_parts.append(str(event["summary"]).strip())
+        if (assessment or {}).get("summary_reason"):
+            summary_parts.append(f"Gemini: {str(assessment['summary_reason']).strip()}")
+
+        return NormalizedNewsItem(
+            source=str(event.get("source", "benzinga")),
+            category=self._news_category_for_event(event),
+            title=str(event.get("title", "")).strip(),
+            summary=" ".join(part for part in summary_parts if part).strip(),
+            published_at=_safe_float(event.get("timestamp_utc"), time.time()),
+            received_at=_safe_float(event.get("fetched_at"), time.time()),
+            affected_symbols=affected_symbols
+            or self._affected_symbols_for_event(
+                event=event,
+                mappings=mappings,
+                assessment=assessment,
+                universe_service=universe_service,
+            )
+            or [canonical_symbol],
+            metadata={
+                "external_event_id": event.get("id"),
+                "event_type": event.get("event_type"),
+                "importance": event.get("importance"),
+                "country": event.get("country"),
+                "gemini_event_risk": (assessment or {}).get("event_risk", "low"),
+                "gemini_bias": self._assessment_bias_for_symbol(assessment, canonical_symbol),
+                "gemini_confidence_adjustment": _safe_float((assessment or {}).get("confidence_adjustment", 0.0)),
+            },
+        )
 
     def _event_relevant_to_symbol(
         self,
@@ -354,22 +449,22 @@ class EventIngestionService:
     ) -> bool:
         affected = {
             universe_service.canonical_symbol(symbol)
-            for symbol in event.get("affected_assets", []) or []
+            for symbol in self._symbol_list(event.get("affected_assets"))
             if universe_service.canonical_symbol(symbol)
         }
         mapped = {
             universe_service.canonical_symbol(mapping.get("symbol"))
-            for mapping in mappings
+            for mapping in self._mapping_rows(mappings)
             if universe_service.canonical_symbol(mapping.get("symbol"))
         }
         assessed = {
             universe_service.canonical_symbol(symbol)
-            for symbol in (assessment or {}).get("affected_assets", []) or []
+            for symbol in self._symbol_list((assessment or {}).get("affected_assets"))
             if universe_service.canonical_symbol(symbol)
         }
         bias_by_asset = {
             universe_service.canonical_symbol(symbol): bias
-            for symbol, bias in ((assessment or {}).get("bias_by_asset", {}) or {}).items()
+            for symbol, bias in self._bias_by_asset(assessment).items()
             if universe_service.canonical_symbol(symbol)
         }
         return (
@@ -390,12 +485,12 @@ class EventIngestionService:
         ordered: list[str] = []
         seen: set[str] = set()
         sources = [
-            *(event.get("affected_assets", []) or []),
-            *(mapping.get("symbol") for mapping in mappings),
-            *((assessment or {}).get("affected_assets", []) or []),
+            *self._symbol_list(event.get("affected_assets")),
+            *(mapping.get("symbol") for mapping in self._mapping_rows(mappings)),
+            *self._symbol_list((assessment or {}).get("affected_assets")),
             *(
                 symbol
-                for symbol, bias in ((assessment or {}).get("bias_by_asset", {}) or {}).items()
+                for symbol, bias in self._bias_by_asset(assessment).items()
                 if bias != "neutral"
             ),
         ]
@@ -408,8 +503,22 @@ class EventIngestionService:
         return ordered
 
     def _assessment_bias_for_symbol(self, assessment: dict[str, Any] | None, canonical_symbol: str) -> str:
-        bias = str(((assessment or {}).get("bias_by_asset", {}) or {}).get(canonical_symbol, "neutral")).lower()
+        bias = str(self._bias_by_asset(assessment).get(canonical_symbol, "neutral")).lower()
         return bias if bias in {"bullish", "bearish", "neutral"} else "neutral"
+
+    def _bias_by_asset(self, assessment: dict[str, Any] | None) -> dict[str, Any]:
+        bias_by_asset = (assessment or {}).get("bias_by_asset", {})
+        return bias_by_asset if isinstance(bias_by_asset, dict) else {}
+
+    def _symbol_list(self, value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return []
+
+    def _mapping_rows(self, mappings: list[Any]) -> list[dict[str, Any]]:
+        return [mapping for mapping in mappings if isinstance(mapping, dict)]
 
     def _news_category_for_event(self, event: dict[str, Any]) -> str:
         event_type = str(event.get("event_type", "unknown")).lower()

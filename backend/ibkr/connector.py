@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import math
+import os
 import socket
 import sys
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 import re
 from typing import Optional
@@ -43,6 +46,7 @@ class IBKRConnectionParams(BaseModel):
     client_id: int = 1
     account_id: Optional[str] = None
     readonly: bool = False
+    environment: str = "paper"
 
 
 class IBKRConnector:
@@ -55,9 +59,107 @@ class IBKRConnector:
         self._host = "127.0.0.1"
         self._port = 7497
         self._client_id = 1
+        self._environment = "paper"
         self._ib = None
         self._ib_class = None
         self._contract_cache: dict[str, object] = {}
+        self._snapshot_cache: dict[str, tuple[float, dict[str, float | str]]] = {}
+        self._position_targets: dict[int, dict[str, object]] = {}
+        try:
+            mdt = int(os.getenv("IBKR_MARKET_DATA_TYPE", "3") or 3)
+        except Exception:
+            mdt = 1
+        # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed Frozen.
+        self._market_data_type = mdt if mdt in {1, 2, 3, 4} else 1
+
+    def _position_ticket_for_contract(self, contract, account: str = "", symbol: str = "") -> int:
+        con_id = int(getattr(contract, "conId", 0) or 0) if contract is not None else 0
+        if con_id > 0:
+            return con_id
+        sym = str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "") or symbol or "").upper()
+        return abs(hash(f"{account}:{sym}")) % 10_000_000
+
+    def _position_order_ref(self, ticket: int, role: str) -> str:
+        return f"TA:{int(ticket)}:{role}"[:32]
+
+    def _cancel_position_exit_orders(self, ticket: int) -> None:
+        if not self._connected or self._ib is None or not self._ib.isConnected():
+            return
+        prefix = f"TA:{int(ticket)}:"
+        try:
+            open_trades = list(self._ib.openTrades() or [])
+        except Exception:
+            open_trades = []
+        for trade in open_trades:
+            order = getattr(trade, "order", None)
+            if order is None:
+                continue
+            ref = str(getattr(order, "orderRef", "") or "")
+            if not ref.startswith(prefix):
+                continue
+            status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+            if status in {"Cancelled", "Filled", "Inactive", "ApiCancelled"}:
+                continue
+            try:
+                self._ib.cancelOrder(order)
+            except Exception:
+                continue
+
+    def _submit_position_exit_orders(
+        self,
+        *,
+        contract,
+        ticket: int,
+        position_side: str,
+        quantity: float,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+    ) -> None:
+        if not self._connected or self._ib is None or not self._ib.isConnected():
+            return
+        qty = float(quantity or 0.0)
+        if qty <= 0:
+            return
+        exit_side = "SELL" if str(position_side or "").upper() == "BUY" else "BUY"
+        orders = []
+        oca_group = f"TA-OCA-{int(ticket)}"
+        try:
+            from ib_insync import StopOrder, LimitOrder  # type: ignore
+        except Exception:
+            return
+
+        if stop_loss is not None and float(stop_loss or 0.0) > 0:
+            stop_order = StopOrder(exit_side, qty, float(stop_loss))
+            stop_order.tif = "GTC"
+            stop_order.outsideRth = True
+            stop_order.ocaGroup = oca_group
+            stop_order.ocaType = 1
+            stop_order.orderRef = self._position_order_ref(ticket, "SL")
+            if self._active_account_id:
+                stop_order.account = self._active_account_id
+            orders.append(stop_order)
+
+        if take_profit is not None and float(take_profit or 0.0) > 0:
+            tp_order = LimitOrder(exit_side, qty, float(take_profit))
+            tp_order.tif = "GTC"
+            tp_order.outsideRth = True
+            tp_order.ocaGroup = oca_group
+            tp_order.ocaType = 1
+            tp_order.orderRef = self._position_order_ref(ticket, "TP")
+            if self._active_account_id:
+                tp_order.account = self._active_account_id
+            orders.append(tp_order)
+
+        for order in orders:
+            self._ib.placeOrder(contract, order)
+
+        if orders:
+            deadline = time.time() + 4.0
+            while time.time() < deadline:
+                try:
+                    self._ib.sleep(0.1)
+                except Exception:
+                    break
 
     @property
     def connected(self) -> bool:
@@ -90,9 +192,27 @@ class IBKRConnector:
             except Exception:
                 pass
         except Exception as exc:
-            raise RuntimeError(
-                "ib_insync is required for IBKR integration. Install backend requirements."
-            ) from exc
+            # Fallback: when backend is launched with system python instead of
+            # backend venv, try loading venv site-packages dynamically.
+            venv_site = Path(__file__).resolve().parents[1] / "venv" / "Lib" / "site-packages"
+            if venv_site.exists():
+                venv_site_str = str(venv_site)
+                if venv_site_str not in sys.path:
+                    sys.path.insert(0, venv_site_str)
+                try:
+                    from ib_insync import IB, util  # type: ignore
+                    try:
+                        util.patchAsyncio()
+                    except Exception:
+                        pass
+                except Exception:
+                    raise RuntimeError(
+                        "ib_insync is required for IBKR integration. Install backend requirements."
+                    ) from exc
+            else:
+                raise RuntimeError(
+                    "ib_insync is required for IBKR integration. Install backend requirements."
+                ) from exc
         self._ib_class = IB
         self._ib = IB()
 
@@ -102,6 +222,9 @@ class IBKRConnector:
             self._host = params.host
             self._port = params.port
             self._client_id = params.client_id
+            self._environment = str(params.environment or "paper").strip().lower()
+            if self._environment not in {"paper", "live"}:
+                raise ValueError("IBKR environment must be paper or live")
             self._active_account_id = (params.account_id or "").strip()
 
             if self._ib.isConnected():
@@ -145,6 +268,7 @@ class IBKRConnector:
                             port=candidate_port,
                             clientId=candidate_client_id,
                             readonly=bool(params.readonly),
+                            account=self._active_account_id,
                             timeout=3,
                         )
                         if self._ib.isConnected():
@@ -170,6 +294,7 @@ class IBKRConnector:
                         port=params.port,
                         clientId=params.client_id,
                         readonly=bool(params.readonly),
+                        account=self._active_account_id,
                         timeout=3,
                     )
                     connected = bool(self._ib.isConnected())
@@ -191,25 +316,34 @@ class IBKRConnector:
                 self._last_error = "IBKR connection failed."
                 return False
             try:
-                # Prefer delayed stream when live subscriptions are missing.
-                # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed Frozen.
-                self._ib.reqMarketDataType(3)
+                # Default to live feed for MT5-like responsiveness.
+                # Can be overridden by IBKR_MARKET_DATA_TYPE env var.
+                self._ib.reqMarketDataType(self._market_data_type)
             except Exception:
                 pass
 
             self._connected = True
             self._last_error = None
-            trade_mode = 0 if (self._active_account_id or "").upper().startswith("DU") else 2
+            refreshed_account = self.refresh_account()
+            if refreshed_account is None:
+                raise RuntimeError(self._last_error or "IBKR connected, but account details could not be loaded")
+            detected_environment = "paper" if self.is_demo() else "live"
+            if detected_environment != self._environment:
+                raise RuntimeError(
+                    f"Connected IBKR account is {detected_environment}, but {self._environment} was selected. "
+                    "Log in to the matching TWS / IB Gateway session and use its configured API port."
+                )
+            trade_mode = refreshed_account.trade_mode
             self._account_info = AccountInfo(
-                login=0,
-                name=f"IBKR {(self._active_account_id or '').strip() or 'Account'}",
+                login=refreshed_account.login,
+                name=refreshed_account.name,
                 server=f"{self._host}:{self._port}",
-                balance=0.0,
-                equity=0.0,
-                margin=0.0,
-                free_margin=0.0,
-                leverage=1,
-                currency="USD",
+                balance=refreshed_account.balance,
+                equity=refreshed_account.equity,
+                margin=refreshed_account.margin,
+                free_margin=refreshed_account.free_margin,
+                leverage=refreshed_account.leverage,
+                currency=refreshed_account.currency,
                 trade_mode=trade_mode,
             )
             self._terminal_info = TerminalInfo(
@@ -229,6 +363,11 @@ class IBKRConnector:
             )
             return True
         except Exception as exc:
+            try:
+                if self._ib is not None and self._ib.isConnected():
+                    self._ib.disconnect()
+            except Exception:
+                pass
             self._connected = False
             self._account_info = None
             self._terminal_info = None
@@ -264,6 +403,7 @@ class IBKRConnector:
             self._last_error = None
             self._active_account_id = ""
             self._contract_cache.clear()
+            self._position_targets.clear()
             logger.info("Disconnected from IBKR")
             return True
         except Exception as exc:
@@ -416,6 +556,13 @@ class IBKRConnector:
             return False
         return self._account_info.trade_mode == 0
 
+    def trade_server_connected(self) -> bool:
+        return bool(
+            self._connected
+            and self._ib is not None
+            and self._ib.isConnected()
+        )
+
     def _normalize_symbol_for_ibkr(self, symbol: str) -> str:
         raw = (symbol or "").upper().strip()
         if not raw:
@@ -456,15 +603,23 @@ class IBKRConnector:
             return cached
 
         try:
-            from ib_insync import Contract, Stock  # type: ignore
+            from ib_insync import Contract, Crypto, Forex, Stock  # type: ignore
         except Exception:
             return None
 
         candidates = []
-        is_stock_like = bool(re.fullmatch(r"[A-Z]{1,6}", key))
+        forex_currencies = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"}
+        is_forex = len(key) == 6 and key[:3] in forex_currencies and key[3:] in forex_currencies
+        is_crypto = key in {"BTCUSD", "ETHUSD"}
+        is_stock_like = bool(re.fullmatch(r"[A-Z]{1,6}", key)) and not is_forex
         try:
-            # Fast path for common US stocks/ETFs.
-            candidates.append(Stock(key, "SMART", "USD"))
+            if is_forex:
+                candidates.append(Forex(key))
+            elif is_crypto:
+                candidates.append(Crypto(key[:3], "PAXOS", "USD"))
+            else:
+                # Fast path for common US stocks/ETFs.
+                candidates.append(Stock(key, "SMART", "USD"))
         except Exception:
             pass
 
@@ -546,46 +701,140 @@ class IBKRConnector:
 
         return None
 
+    def _finalize_snapshot_fields(self, bid: float, ask: float, last: float, close: float) -> tuple[float, float, float]:
+        if not math.isfinite(bid):
+            bid = 0.0
+        if not math.isfinite(ask):
+            ask = 0.0
+        if not math.isfinite(last):
+            last = 0.0
+        if not math.isfinite(close):
+            close = 0.0
+        base = last or close
+        if bid <= 0 and base > 0:
+            bid = base
+        if ask <= 0 and base > 0:
+            ask = base
+        if bid <= 0 and ask > 0:
+            bid = ask
+        if ask <= 0 and bid > 0:
+            ask = bid
+        return bid, ask, (last or close or ((bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0))
+
+    def get_snapshots(
+        self,
+        symbols: list[str],
+        max_wait_seconds: float = 0.22,
+        allow_data_type_fallback: bool = True,
+    ) -> dict[str, dict]:
+        """
+        Batch quote snapshots to reduce per-symbol API overhead and UI latency.
+        Returns payload keyed by the requested symbol token.
+        """
+        if not self._connected or self._ib is None or not self._ib.isConnected():
+            return {}
+        requested = [str(s or "").strip().upper() for s in (symbols or []) if str(s or "").strip()]
+        if not requested:
+            return {}
+
+        now = time.time()
+        out: dict[str, dict] = {}
+        pending: list[tuple[str, object]] = []
+        for req_sym in requested:
+            cached = self._snapshot_cache.get(req_sym)
+            if cached and (now - float(cached[0])) <= 0.9:
+                out[req_sym] = dict(cached[1])
+                continue
+            contract = self._resolve_contract(req_sym)
+            if contract is None:
+                continue
+            try:
+                ticker = self._ib.reqMktData(contract, "", True, False)
+                pending.append((req_sym, ticker))
+            except Exception:
+                continue
+
+        if pending:
+            wait_seconds = max(0.08, min(float(max_wait_seconds or 0.22), 0.4))
+            wait_seconds = max(wait_seconds, min(0.35, 0.08 + (0.01 * len(pending))))
+            self._ib.sleep(wait_seconds)
+
+        for req_sym, ticker in pending:
+            try:
+                bid = float(getattr(ticker, "bid", 0.0) or 0.0)
+                ask = float(getattr(ticker, "ask", 0.0) or 0.0)
+                last = float(getattr(ticker, "last", 0.0) or 0.0)
+                close = float(getattr(ticker, "close", 0.0) or 0.0)
+                try:
+                    market_price = float(ticker.marketPrice() or 0.0)
+                except Exception:
+                    market_price = 0.0
+                if not math.isfinite(market_price):
+                    market_price = 0.0
+                if last <= 0 and market_price > 0:
+                    last = market_price
+                if close <= 0 and market_price > 0:
+                    close = market_price
+                bid, ask, last_px = self._finalize_snapshot_fields(bid, ask, last, close)
+                if bid > 0 and ask > 0:
+                    now_msc = int(time.time() * 1000)
+                    payload = {
+                        "symbol": req_sym,
+                        "bid": bid,
+                        "ask": ask,
+                        "last": last_px,
+                        "time": int(now_msc / 1000),
+                        "time_msc": now_msc,
+                        "market_data_type": int(getattr(ticker, "marketDataType", 0) or self._market_data_type),
+                    }
+                    out[req_sym] = payload
+                    self._snapshot_cache[req_sym] = (now_msc / 1000.0, dict(payload))
+                else:
+                    cached = self._snapshot_cache.get(req_sym)
+                    if cached and (now - float(cached[0])) <= 20.0:
+                        out[req_sym] = dict(cached[1])
+            except Exception:
+                cached = self._snapshot_cache.get(req_sym)
+                if cached and (time.time() - float(cached[0])) <= 20.0:
+                    out[req_sym] = dict(cached[1])
+        if not out and allow_data_type_fallback and self._market_data_type != 3:
+            # If live/frozen feed returns nothing (missing entitlement or competing session),
+            # degrade to delayed stream so dashboard prices still move.
+            try:
+                self._ib.reqMarketDataType(3)
+                self._market_data_type = 3
+                return self.get_snapshots(
+                    requested,
+                    max_wait_seconds=max_wait_seconds,
+                    allow_data_type_fallback=False,
+                )
+            except Exception:
+                pass
+        return out
+
     def get_snapshot(self, symbol: str) -> Optional[dict]:
         """Best-effort quote snapshot for any supported contract type."""
-        if not self._connected or self._ib is None or not self._ib.isConnected():
+        cache_key = str(symbol or "").strip().upper()
+        if not cache_key:
             return None
-        contract = self._resolve_contract(symbol)
-        if contract is None:
-            return None
+        now = time.time()
+        cached = self._snapshot_cache.get(cache_key)
+        if cached and (now - float(cached[0])) <= 1.2:
+            return dict(cached[1])
         try:
-            ticker = self._ib.reqMktData(contract, "", True, False)
-            # Delayed streams can take a bit longer to populate.
-            self._ib.sleep(1.4)
-            bid = float(getattr(ticker, "bid", 0.0) or 0.0)
-            ask = float(getattr(ticker, "ask", 0.0) or 0.0)
-            last = float(getattr(ticker, "last", 0.0) or 0.0)
-            close = float(getattr(ticker, "close", 0.0) or 0.0)
-            if not math.isfinite(bid):
-                bid = 0.0
-            if not math.isfinite(ask):
-                ask = 0.0
-            if not math.isfinite(last):
-                last = 0.0
-            if not math.isfinite(close):
-                close = 0.0
-            self._ib.cancelMktData(contract)
-            base = last or close
-            if bid <= 0 and base > 0:
-                bid = base
-            if ask <= 0 and base > 0:
-                ask = base
-            if bid <= 0 or ask <= 0:
-                return None
-            return {
-                "symbol": symbol.upper(),
-                "bid": bid,
-                "ask": ask,
-                "last": last or close or ((bid + ask) / 2.0),
-            }
+            snap = self.get_snapshots([cache_key], max_wait_seconds=0.2)
+            if cache_key in snap:
+                return dict(snap[cache_key])
+            cached = self._snapshot_cache.get(cache_key)
+            if cached and (time.time() - float(cached[0])) <= 20.0:
+                return dict(cached[1])
+            return None
         except Exception as exc:
             self._last_error = f"IBKR snapshot failed for {symbol}: {exc}"
             logger.debug(self._last_error)
+            cached = self._snapshot_cache.get(cache_key)
+            if cached and (time.time() - float(cached[0])) <= 20.0:
+                return dict(cached[1])
             return None
 
     def get_stock_snapshot(self, symbol: str) -> Optional[dict]:
@@ -655,32 +904,15 @@ class IBKRConnector:
             return None
         try:
             ticker = self._ib.reqMktData(contract, "", True, False)
-            self._ib.sleep(0.6)
+            self._ib.sleep(0.12)
             bid = float(getattr(ticker, "bid", 0.0) or 0.0)
             ask = float(getattr(ticker, "ask", 0.0) or 0.0)
             last = float(getattr(ticker, "last", 0.0) or 0.0)
             close = float(getattr(ticker, "close", 0.0) or 0.0)
-            self._ib.cancelMktData(contract)
-            if not math.isfinite(bid):
-                bid = 0.0
-            if not math.isfinite(ask):
-                ask = 0.0
-            if not math.isfinite(last):
-                last = 0.0
-            if not math.isfinite(close):
-                close = 0.0
-            base = last or close
-            if bid <= 0 and base > 0:
-                bid = base
-            if ask <= 0 and base > 0:
-                ask = base
+            bid, ask, last_px = self._finalize_snapshot_fields(bid, ask, last, close)
             if bid <= 0 and ask <= 0:
                 return None
-            if bid <= 0:
-                bid = ask
-            if ask <= 0:
-                ask = bid
-            return {"bid": bid, "ask": ask, "last": last or close or ((bid + ask) / 2.0)}
+            return {"bid": bid, "ask": ask, "last": last_px}
         except Exception:
             return None
 
@@ -713,6 +945,7 @@ class IBKRConnector:
 
         try:
             order = MarketOrder("BUY" if side == "BUY" else "SELL", qty)
+            order.outsideRth = True
             if self._active_account_id:
                 order.account = self._active_account_id
             if comment:
@@ -732,13 +965,37 @@ class IBKRConnector:
                 except Exception:
                     avg_fill = 0.0
             ticket = int(getattr(trade.order, "permId", 0) or getattr(trade.order, "orderId", 0) or 0)
+            position_ticket = self._position_ticket_for_contract(
+                contract,
+                account=self._active_account_id,
+                symbol=symbol,
+            )
 
             success = status in {"Filled", "Submitted", "PreSubmitted"} and (filled_qty > 0 or status != "Filled")
+            if success:
+                self._position_targets[int(position_ticket)] = {
+                    "stop_loss": float(stop_loss or 0.0),
+                    "take_profit": float(take_profit or 0.0),
+                    "comment": comment or "",
+                }
+                if float(stop_loss or 0.0) > 0 or float(take_profit or 0.0) > 0:
+                    try:
+                        self._cancel_position_exit_orders(position_ticket)
+                        self._submit_position_exit_orders(
+                            contract=contract,
+                            ticket=position_ticket,
+                            position_side=side,
+                            quantity=qty,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                        )
+                    except Exception as exc:
+                        logger.warning("IBKR protective exit order submission failed for %s: %s", symbol, exc)
             return {
                 "success": success,
                 "retcode": 0 if success else -1,
                 "retcode_desc": status or "Order rejected",
-                "ticket": ticket if ticket > 0 else None,
+                "ticket": position_ticket if position_ticket > 0 else (ticket if ticket > 0 else None),
                 "volume": filled_qty if filled_qty > 0 else qty,
                 "price": avg_fill if avg_fill > 0 else None,
                 "stop_loss": stop_loss,
@@ -754,19 +1011,37 @@ class IBKRConnector:
         if not self._connected or self._ib is None or not self._ib.isConnected():
             return []
         try:
-            rows = self._ib.positions() or []
+            # PortfolioItem is account-scoped and carries IBKR's own market mark
+            # and unrealized P/L. Do not recompute P/L from delayed snapshots.
+            rows = self._ib.portfolio(account=self._active_account_id) or []
         except Exception as exc:
-            self._last_error = f"IBKR positions failed: {exc}"
+            self._last_error = f"IBKR portfolio failed: {exc}"
             return []
 
+        pending_closes: dict[int, dict[str, object]] = {}
+        try:
+            for trade in list(self._ib.openTrades() or []):
+                order = getattr(trade, "order", None)
+                ref = str(getattr(order, "orderRef", "") or "") if order is not None else ""
+                match = re.fullmatch(r"Close (\d+)", ref)
+                if not match:
+                    continue
+                status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+                if status in {"Cancelled", "Filled", "Inactive", "ApiCancelled"}:
+                    continue
+                pending_closes[int(match.group(1))] = {
+                    "order_id": int(getattr(order, "orderId", 0) or 0),
+                    "status": status or "PendingSubmit",
+                }
+        except Exception:
+            pending_closes = {}
+
         result: list[dict] = []
-        added_tickets: set[int] = set()
         now_ts = int(time.time())
         symbol_filter = (symbol or "").upper().strip()
-        strict_filtering = bool(self._active_account_id)
         for row in rows:
             account = str(getattr(row, "account", "") or "")
-            if strict_filtering and account and account != self._active_account_id:
+            if self._active_account_id and account != self._active_account_id:
                 continue
             contract = getattr(row, "contract", None)
             if contract is None:
@@ -777,19 +1052,12 @@ class IBKRConnector:
             sym = str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "") or "").upper()
             if symbol_filter and sym != symbol_filter:
                 continue
-            avg_cost = _safe_float(getattr(row, "avgCost", 0.0), 0.0)
-            snap = self._snapshot_for_contract(contract)
-            current_price = _safe_float((snap or {}).get("last", 0.0), 0.0)
-            multiplier_raw = getattr(contract, "multiplier", None)
-            try:
-                multiplier = float(multiplier_raw) if multiplier_raw else 1.0
-            except Exception:
-                multiplier = 1.0
-            if not math.isfinite(multiplier) or multiplier <= 0:
-                multiplier = 1.0
-            profit = (current_price - avg_cost) * pos_qty * multiplier if current_price > 0 else 0.0
-            ticket = int(getattr(contract, "conId", 0) or 0)
-            normalized_ticket = ticket if ticket > 0 else abs(hash(f"{account}:{sym}")) % 10_000_000
+            avg_cost = _safe_float(getattr(row, "averageCost", 0.0), 0.0)
+            current_price = _safe_float(getattr(row, "marketPrice", 0.0), avg_cost)
+            profit = _safe_float(getattr(row, "unrealizedPNL", 0.0), 0.0)
+            normalized_ticket = self._position_ticket_for_contract(contract, account=account, symbol=sym)
+            target_meta = self._position_targets.get(int(normalized_ticket), {})
+            pending_close = pending_closes.get(int(normalized_ticket))
             result.append(
                 {
                     "ticket": normalized_ticket,
@@ -798,64 +1066,49 @@ class IBKRConnector:
                     "volume": abs(pos_qty),
                     "price_open": avg_cost,
                     "price_current": current_price or avg_cost,
-                    "stop_loss": 0.0,
-                    "take_profit": 0.0,
+                    "stop_loss": _safe_float(target_meta.get("stop_loss", 0.0), 0.0),
+                    "take_profit": _safe_float(target_meta.get("take_profit", 0.0), 0.0),
                     "profit": profit,
                     "time": now_ts,
-                    "comment": "IBKR",
+                    "comment": str(target_meta.get("comment") or f"IBKR {account}"),
+                    "close_pending": bool(pending_close),
+                    "close_order_id": int((pending_close or {}).get("order_id") or 0) or None,
+                    "close_order_status": str((pending_close or {}).get("status") or "") or None,
                 }
-            )
-            added_tickets.add(int(normalized_ticket))
-
-        # If the selected account filter produced no positions, fall back to all
-        # managed-account positions to avoid hiding valid active trades.
-        if strict_filtering and not result:
-            for row in rows:
-                contract = getattr(row, "contract", None)
-                if contract is None:
-                    continue
-                pos_qty = _safe_float(getattr(row, "position", 0.0), 0.0)
-                if abs(pos_qty) < 1e-9:
-                    continue
-                sym = str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "") or "").upper()
-                if symbol_filter and sym != symbol_filter:
-                    continue
-                avg_cost = _safe_float(getattr(row, "avgCost", 0.0), 0.0)
-                snap = self._snapshot_for_contract(contract)
-                current_price = _safe_float((snap or {}).get("last", 0.0), 0.0)
-                multiplier_raw = getattr(contract, "multiplier", None)
-                try:
-                    multiplier = float(multiplier_raw) if multiplier_raw else 1.0
-                except Exception:
-                    multiplier = 1.0
-                if not math.isfinite(multiplier) or multiplier <= 0:
-                    multiplier = 1.0
-                account = str(getattr(row, "account", "") or "")
-                profit = (current_price - avg_cost) * pos_qty * multiplier if current_price > 0 else 0.0
-                ticket = int(getattr(contract, "conId", 0) or 0)
-                normalized_ticket = ticket if ticket > 0 else abs(hash(f"{account}:{sym}")) % 10_000_000
-                result.append(
-                    {
-                        "ticket": normalized_ticket,
-                        "symbol": sym,
-                        "type": "BUY" if pos_qty > 0 else "SELL",
-                        "volume": abs(pos_qty),
-                        "price_open": avg_cost,
-                        "price_current": current_price or avg_cost,
-                        "stop_loss": 0.0,
-                        "take_profit": 0.0,
-                        "profit": profit,
-                        "time": now_ts,
-                        "comment": f"IBKR ({account or 'managed'})",
-                    }
-                )
-                added_tickets.add(int(normalized_ticket))
-            logger.info(
-                "IBKR positions fallback used: active account %s had no rows, showing managed-account positions instead.",
-                self._active_account_id or "auto",
             )
 
         return result
+
+    def cancel_position_close(self, ticket: int) -> dict:
+        if not self._connected or self._ib is None or not self._ib.isConnected():
+            return {"success": False, "retcode": -1, "retcode_desc": "IBKR not connected"}
+        close_ref = f"Close {int(ticket)}"[:32]
+        cancelled = 0
+        matched = 0
+        for trade in list(self._ib.openTrades() or []):
+            order = getattr(trade, "order", None)
+            if order is None or str(getattr(order, "orderRef", "") or "") != close_ref:
+                continue
+            status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+            if status in {"Cancelled", "Filled", "Inactive", "ApiCancelled"}:
+                continue
+            matched += 1
+            self._ib.cancelOrder(order)
+            cancelled += 1
+        if cancelled:
+            self._ib.sleep(0.5)
+            return {
+                "success": True, "retcode": 0,
+                "retcode_desc": f"Cancellation sent to IBKR for {cancelled} pending close order(s)",
+                "ticket": int(ticket), "volume": None, "price": None,
+                "comment": "Cancel pending close",
+            }
+        return {
+            "success": False, "retcode": -1,
+            "retcode_desc": "No cancellable LinkTrade close order found at IBKR",
+            "ticket": int(ticket), "volume": None, "price": None,
+            "comment": "Cancel pending close",
+        }
 
     def close_position(self, ticket: int) -> dict:
         if not self._connected or self._ib is None or not self._ib.isConnected():
@@ -897,17 +1150,59 @@ class IBKRConnector:
 
         side = "SELL" if matched_qty > 0 else "BUY"
         qty = abs(matched_qty)
+
+        # A regular-hours market close can remain PreSubmitted until the US
+        # session opens. Repeated clicks must not stack additional opposite
+        # orders while that first close is still working at IBKR.
+        close_ref = f"Close {ticket}"[:32]
+        try:
+            open_trades = list(self._ib.openTrades() or [])
+        except Exception:
+            open_trades = []
+        for existing_trade in open_trades:
+            existing_order = getattr(existing_trade, "order", None)
+            if existing_order is None:
+                continue
+            if str(getattr(existing_order, "orderRef", "") or "") != close_ref:
+                continue
+            existing_status = str(
+                getattr(getattr(existing_trade, "orderStatus", None), "status", "") or ""
+            )
+            if existing_status in {"Cancelled", "Filled", "Inactive", "ApiCancelled"}:
+                continue
+            existing_ticket = int(
+                getattr(existing_order, "permId", 0) or getattr(existing_order, "orderId", 0) or 0
+            )
+            return {
+                "success": True,
+                "retcode": 0,
+                "retcode_desc": f"{existing_status or 'PendingSubmit'} — close order already pending at IBKR",
+                "ticket": existing_ticket if existing_ticket > 0 else None,
+                "volume": qty,
+                "price": None,
+                "comment": f"Close {matched_symbol} pending",
+            }
         try:
             from ib_insync import MarketOrder  # type: ignore
         except Exception:
             return {"success": False, "retcode": -1, "retcode_desc": "ib_insync not available"}
 
         try:
+            self._cancel_position_exit_orders(int(ticket))
             order = MarketOrder(side, qty)
+            # Be explicit so TWS presets do not modify and cancel API orders
+            # (error 10349). Stock exits should use SMART instead of the
+            # position's reporting exchange, which may trigger direct-route
+            # precautionary rejection 10311.
+            order.tif = "DAY"
+            order.outsideRth = False
             if self._active_account_id:
                 order.account = self._active_account_id
-            order.orderRef = f"Close {ticket}"[:32]
-            trade = self._ib.placeOrder(matched_contract, order)
+            order.orderRef = close_ref
+            routed_contract = copy.deepcopy(matched_contract)
+            if str(getattr(routed_contract, "secType", "") or "").upper() == "STK":
+                routed_contract.exchange = "SMART"
+            trade = self._ib.placeOrder(routed_contract, order)
             deadline = time.time() + 8.0
             while not trade.isDone() and time.time() < deadline:
                 self._ib.sleep(0.2)
@@ -921,10 +1216,18 @@ class IBKRConnector:
                     avg_fill = 0.0
             success = status in {"Filled", "Submitted", "PreSubmitted"} and (filled_qty > 0 or status != "Filled")
             ticket_out = int(getattr(trade.order, "permId", 0) or getattr(trade.order, "orderId", 0) or 0)
+            if success:
+                self._position_targets.pop(int(ticket), None)
             return {
                 "success": success,
                 "retcode": 0 if success else -1,
-                "retcode_desc": status or "Close order rejected",
+                "retcode_desc": (
+                    "Filled"
+                    if status == "Filled"
+                    else f"{status} — accepted by IBKR and waiting to fill"
+                    if success
+                    else status or "Close order rejected"
+                ),
                 "ticket": ticket_out if ticket_out > 0 else None,
                 "volume": filled_qty if filled_qty > 0 else qty,
                 "price": avg_fill if avg_fill > 0 else None,
@@ -934,6 +1237,47 @@ class IBKRConnector:
             self._last_error = f"IBKR close_position failed: {exc}"
             logger.exception(self._last_error)
             return {"success": False, "retcode": -1, "retcode_desc": str(exc)}
+
+    def modify_position(self, ticket: int, stop_loss: float, take_profit: float) -> dict:
+        positions = self.get_positions()
+        matched = next((row for row in positions if int(row.get("ticket") or 0) == int(ticket)), None)
+        if matched is None:
+            return {
+                "success": False,
+                "retcode": -1,
+                "retcode_desc": f"Position {ticket} not found for modification",
+            }
+        self._position_targets[int(ticket)] = {
+            "stop_loss": float(stop_loss or 0.0),
+            "take_profit": float(take_profit or 0.0),
+            "comment": str(matched.get("comment") or "IBKR"),
+        }
+        contract = self._resolve_contract(str(matched.get("symbol") or ""))
+        if contract is not None:
+            try:
+                self._cancel_position_exit_orders(int(ticket))
+                self._submit_position_exit_orders(
+                    contract=contract,
+                    ticket=int(ticket),
+                    position_side=str(matched.get("type") or "BUY"),
+                    quantity=float(matched.get("volume") or 0.0),
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                )
+            except Exception as exc:
+                self._last_error = f"IBKR modify_position protective update failed: {exc}"
+                logger.warning(self._last_error)
+        return {
+            "success": True,
+            "retcode": 0,
+            "retcode_desc": "IBKR risk targets updated",
+            "ticket": int(ticket),
+            "volume": float(matched.get("volume") or 0.0),
+            "price": float(matched.get("price_open") or 0.0) or None,
+            "stop_loss": float(stop_loss or 0.0) or None,
+            "take_profit": float(take_profit or 0.0) or None,
+            "comment": str(matched.get("comment") or "IBKR"),
+        }
 
     def get_recent_executions(self, limit: int = 100) -> list[dict]:
         """Return recent executed fills from IBKR for the active account.

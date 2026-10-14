@@ -12,6 +12,7 @@ class AgentInput(BaseModel):
     open_positions: list[dict]
     multi_tf_bars: Optional[dict[str, list[dict]]] = None  # {"M15": [...], "H1": [...], "H4": [...]}
     policy_mode: str = "balanced"
+    force_execute_any_conditions: bool = False
 
 
 class TradeSignal(BaseModel):

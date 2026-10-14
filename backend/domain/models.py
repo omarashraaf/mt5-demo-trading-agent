@@ -129,6 +129,7 @@ class MarketContext(BaseModel):
     requested_timeframe: str = "H1"
     evaluation_mode: str = "manual"
     user_policy: Optional[dict[str, Any]] = None
+    strategy_context: dict[str, Any] = Field(default_factory=dict)
     symbol_info: Optional[NormalizedSymbolInfo] = None
     profile: Optional[SymbolProfile] = None
     tick: Optional[dict[str, Any]] = None
@@ -360,7 +361,9 @@ class ExecutionPreflightAssessment(BaseModel):
     reason: str
     entry_price: float = 0.0
     current_spread: float = 0.0
+    spread_cost: float = 0.0
     reward_risk: float = 0.0
+    required_reward_risk: float = 0.0
     margin_required: float = 0.0
     tradeability: dict[str, Any] = Field(default_factory=dict)
     risk_approval: Optional[RiskApprovalDecision] = None

@@ -1,4 +1,4 @@
-from agent.interface import TradingAgent, AgentInput, TradeSignal
+﻿from agent.interface import TradingAgent, AgentInput, TradeSignal
 from typing import Optional
 
 # Asset classification for mixed strategy
@@ -65,7 +65,7 @@ def get_trade_params(asset_class: str) -> dict:
     else:  # forex
         return {
             "sl_mult_entry": 1.2,    # Tight SL for day trades
-            "tp_mult_entry": 2.4,    # 2:1 R:R — closer TP = hit faster
+            "tp_mult_entry": 2.4,    # 2:1 R:R Ã¢â‚¬â€ closer TP = hit faster
             "sl_mult_no_entry": 1.0,  # Even tighter without entry
             "tp_mult_no_entry": 2.0,  # 2:1 R:R
             "max_hold_minutes": 360,  # 6 hours
@@ -90,6 +90,7 @@ class SmartAgent(TradingAgent):
 
     def evaluate(self, input_data: AgentInput) -> TradeSignal:
         policy_mode = str(getattr(input_data, "policy_mode", "balanced") or "balanced").lower()
+        force_execute = bool(getattr(input_data, "force_execute_any_conditions", False))
         mtf = input_data.multi_tf_bars or {}
         h4_bars = mtf.get("H4", [])
         h1_bars = mtf.get("H1", [])
@@ -180,22 +181,10 @@ class SmartAgent(TradingAgent):
         confidence = round(max(0.0, min(0.95, confidence)), 2)
         trend_conflict = h1_trend != h4_trend and h1_trend != "flat" and h4_trend != "flat"
 
-        # Position awareness — don't stack same-direction trades
-        for pos in input_data.open_positions:
-            pos_type = pos.get("type", "")
-            if pos.get("symbol") == input_data.symbol:
-                if trend == "bullish" and pos_type == "BUY":
-                    return TradeSignal(
-                        action="HOLD", confidence=confidence, strategy="trend_follow",
-                        reason=f"Already have a BUY position on {input_data.symbol}. Monitoring existing trade.",
-                    )
-                if trend == "bearish" and pos_type == "SELL":
-                    return TradeSignal(
-                        action="HOLD", confidence=confidence, strategy="trend_follow",
-                        reason=f"Already have a SELL position on {input_data.symbol}. Monitoring existing trade.",
-                    )
+        # Allow add-on entries on the same symbol when a fresh setup appears.
+        # Exposure and category caps are enforced later by risk/portfolio gates.
 
-        # Determine action — BUY and SELL
+        # Determine action Ã¢â‚¬â€ BUY and SELL
         # With entry trigger: trade only when confidence clears a stricter bar.
         has_entry = entry_signal not in ("none", "")
 
@@ -225,13 +214,17 @@ class SmartAgent(TradingAgent):
         }
 
         if trend_conflict and policy_mode != "aggressive":
-            return TradeSignal(
-                action="HOLD",
-                confidence=max(0.0, confidence - 0.08),
-                strategy="trend_follow",
-                reason="No trade. H1 and H4 trend structure disagree, so the setup is too noisy.",
-                metadata=metadata,
-            )
+            if not force_execute:
+                return TradeSignal(
+                    action="HOLD",
+                    confidence=max(0.0, confidence - 0.08),
+                    strategy="trend_follow",
+                    reason="No trade. H1 and H4 trend structure disagree, so the setup is too noisy.",
+                    metadata=metadata,
+                )
+            confidence = round(max(0.0, min(0.95, confidence - 0.03)), 2)
+            metadata["forced_execution_mode"] = True
+            metadata["forced_reason"] = "trend_conflict_override"
         if trend_conflict and policy_mode == "aggressive":
             # In aggressive mode we allow H1-led continuation attempts even with H4 disagreement.
             confidence = round(max(0.0, min(0.95, confidence - 0.03)), 2)
@@ -254,6 +247,29 @@ class SmartAgent(TradingAgent):
             sl = round(last_close + atr * sl_mult, 5)
             tp = round(last_close - atr * tp_mult, 5)
         else:
+            if force_execute and trend in {"bullish", "bearish"}:
+                forced_action = "BUY" if trend == "bullish" else "SELL"
+                metadata["forced_execution_mode"] = True
+                metadata["forced_reason"] = "threshold_override"
+                sl_mult = params["sl_mult_no_entry"]
+                tp_mult = params["tp_mult_no_entry"]
+                if forced_action == "BUY":
+                    sl = round(last_close - atr * sl_mult, 5)
+                    tp = round(last_close + atr * tp_mult, 5)
+                else:
+                    sl = round(last_close + atr * sl_mult, 5)
+                    tp = round(last_close - atr * tp_mult, 5)
+                forced_conf = round(max(0.45, confidence), 2)
+                return TradeSignal(
+                    action=forced_action,
+                    confidence=forced_conf,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    max_holding_minutes=params["max_hold_minutes"],
+                    strategy=f"{params['label'].lower().replace(' ', '_')}_{asset_class}",
+                    reason="Forced execution mode is enabled: applying strategy despite weak/unclear setup.",
+                    metadata=metadata,
+                )
             return TradeSignal(
                 action="HOLD", confidence=confidence, strategy="trend_follow",
                 reason=self._build_hold_reason(trend, momentum, current_rsi, entry_signal),
@@ -453,14 +469,14 @@ class SmartAgent(TradingAgent):
     ) -> str:
         if action == "BUY":
             parts = [
-                f"[{trade_label}] Price is trending upward — good buying opportunity.",
+                f"[{trade_label}] Price is trending upward - good buying opportunity.",
                 f"Momentum is {momentum} with RSI at {rsi:.0f}.",
             ]
             if "buy" in entry_signal:
                 parts.append("Price dipped to a good level and is starting to bounce back up.")
         else:  # SELL
             parts = [
-                f"[{trade_label}] Price is trending downward — good selling opportunity.",
+                f"[{trade_label}] Price is trending downward - good selling opportunity.",
                 f"Momentum is {momentum} with RSI at {rsi:.0f}.",
             ]
             if "sell" in entry_signal:

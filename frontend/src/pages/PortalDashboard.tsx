@@ -12,7 +12,7 @@ export default function PortalDashboard({ isAdmin }: { isAdmin: boolean }) {
           <div className="card" style={{ marginBottom: 0 }}>
             <h3 style={{ marginBottom: 10 }}>Local Runtime</h3>
             <p className="text-muted text-sm" style={{ marginBottom: 14 }}>
-              Open the local trading runtime to connect MT5/IBKR and run execution safely on your device.
+              Open the local trading runtime to connect MT5 and run execution safely on your device.
             </p>
             <a className="btn btn-primary" href={runtimeConfig.localRuntimeUrl} target="_blank" rel="noreferrer">
               Open Localhost Runtime

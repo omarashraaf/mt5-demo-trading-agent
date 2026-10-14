@@ -4,11 +4,26 @@ import statistics
 import time
 import uuid
 
-import pandas as pd
-
 from research.model_evaluator import evaluate_binary_classifier
 from research.replay_runner import _compute_metrics, _safe_float
 from research.trade_dataset_builder import TradeDatasetBuilder
+
+_pd = None
+_pd_checked = False
+
+
+def _load_pandas():
+    global _pd, _pd_checked
+    if _pd_checked:
+        return _pd
+    _pd_checked = True
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        _pd = None
+        return None
+    _pd = pd
+    return _pd
 
 
 class WalkForwardRunner:
@@ -71,6 +86,9 @@ class WalkForwardRunner:
         include_unexecuted: bool = True,
         limit: int = 200000,
     ) -> dict:
+        pd = _load_pandas()
+        if pd is None:
+            raise RuntimeError("pandas is required for walk-forward analysis but is unavailable in this runtime.")
         run_id = f"walkfwd-{uuid.uuid4().hex[:12]}"
         started_at = time.time()
         config = {
